@@ -1,0 +1,87 @@
+account:
+  gateway_host: "127.0.0.1"
+  gateway_port: 4002
+  client_id: 1
+  account_id: "UXXXXXXX"
+
+product:
+  symbol: "ETH"
+  exchange: "CME"
+  multiplier: 50
+  currency: "USD"
+  option_type: "calls_only"   # "calls_only", "puts_only", "both"
+  # Subscription/display range — wider window we receive market data for
+  strike_range_low: -5        # Strikes below ATM to subscribe (negative = below)
+  strike_range_high: 25       # Strikes above ATM to subscribe
+  # Quoting range — narrower window we actually quote
+  quote_range_low: 0          # 0 = ATM
+  quote_range_high: 20        # Number of strikes above ATM to quote
+  min_dte: 3                  # Skip options with <= 3 DTE
+  expiry: "front_month"       # "front_month" only for now
+  quote_size: 1               # Lot size per quote
+  underlying_symbol: "ETHUSDRR"
+  option_symbol: "ETH"
+  trading_class: "ETH"
+  security_type: "FOP"
+  strike_increment: 25        # ETH strike spacing
+
+constraints:
+  capital: 100000
+  margin_ceiling_pct: 0.50    # 50% of capital = $50K
+  delta_ceiling: 2.0          # |net_delta| must be <= this (contract-delta)
+  theta_floor: -400           # $/day, must be >= this value
+
+kill_switch:
+  margin_kill_pct: 0.70       # 70% of capital = $70K
+  max_daily_loss: -2000       # Dollars
+  delta_kill: 3.0             # Contract-delta per side
+
+quoting:
+  tick_size: 0.50             # ETHUSDRR minimum tick ($0.50 per point = $25 per contract)
+  penny_jump_ticks: 1         # Number of ticks inside incumbent's spread
+  refresh_interval_ms: 1000   # Periodic full-refresh fallback (event-driven path is real-time)
+  tick_batch_window_sec: 0.005       # Drain queue for 5ms after first tick (latency floor)
+  snapshot_write_interval_sec: 1.0   # Dashboard snapshot cadence
+  greek_refresh_seconds: 300  # Refresh Greeks every 5 minutes
+  # Depth-aware incumbent selection
+  depth_levels: 5                  # Subscribe to top N levels per strike per side
+  max_active_depth_subs: 5         # IBKR caps total concurrent depth subs (~5)
+  depth_rotation_interval_sec: 2   # Cycle the depth window every N seconds
+  min_incumbent_size: 2            # Min contracts at a level to be a "real" incumbent
+  max_bbo_width_dollars: 10.00     # Don't penny-jump if BBO is wider than this (ETH options typically $5-8)
+  max_quote_staleness_sec: 5       # Discard depth older than N seconds
+  filter_self_orders: true         # Exclude our own orders from incumbent search
+
+operations:
+  weekend_flatten: true
+  daily_reset_hour_ct: 17     # 5pm CT — CME daily session end
+
+pricing:
+  sabr_enabled: true
+  min_edge_points: 1.0        # Reject quote if our price is within $N of SABR theo.
+                              # SABR's structural fit residual is ~±$1 on liquid
+                              # ETH calls; combined with this $1 buffer the
+                              # effective edge from real fair value is ~$2.
+  sabr_recalibrate_seconds: 60
+  sabr_beta: 1.0              # Fixed backbone (1.0 = lognormal, matches v1)
+  sabr_max_rmse: 0.03         # Reject SABR fit if RMSE exceeds this
+  stale_iv_threshold: 0.10    # IV discrepancy threshold for stale detection
+  max_calibration_bbo_width: 10.0  # Drop strikes with wider BBOs from SABR calibration (synthetic mids on illiquid strikes)
+
+synthetic_span:
+  # Calibrated 2026-04-06 against IBKR short-side observations at F=$2,100, IV=66.6%:
+  #   short 2100C/2200C/2400C: $60,372 / $59,761 / $58,910
+  #   short 2100P/1850P:       $47,383 / $45,011
+  #   short 2400C/long 2500C vertical: $4,388 (model: $5,000)
+  # Fit is ±$3-5K per single short (<6% of notional); vertical fits within $600.
+  up_scan_pct: 0.56
+  down_scan_pct: 0.49
+  vol_scan_pct: 0.25
+  extreme_mult: 3.0
+  extreme_cover: 0.33
+  short_option_minimum: 500.0
+
+logging:
+  log_dir: "./logs"
+  log_rejections: true
+  log_quotes: true

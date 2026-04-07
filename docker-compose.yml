@@ -1,0 +1,64 @@
+services:
+  # ── IB Gateway (Paper) ──────────────────────────────────────────────
+  # IBC auto-starts IB Gateway and handles the mandatory daily restart.
+  # Host networking because IB Gateway binds API socket to IPv6 only.
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    environment:
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      TWS_ACCEPT_INCOMING: "accept"
+      READ_ONLY_API: "no"
+      TWS_PORT: "4002"
+    volumes:
+      - ib-gateway-data:/opt/ibgateway
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/4002' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+
+  # ── Corsair v2 Market Maker ─────────────────────────────────────────
+  corsair:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    network_mode: host
+    env_file: .env
+    environment:
+      CORSAIR_GATEWAY_HOST: "127.0.0.1"
+      CORSAIR_GATEWAY_PORT: "4002"
+      CORSAIR_ACCOUNT_ID: "${IBKR_ACCOUNT}"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./span_data:/app/span_data
+      - ./config:/app/config:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/logs/corsair_v2.log && test $$(( $$(date +%s) - $$(stat -c %Y /app/logs/corsair_v2.log) )) -lt 120"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── Dashboard ───────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./logs:/app/logs:ro
+      - ./data:/app/data:ro
+      - ./config:/app/config:ro
+
+volumes:
+  ib-gateway-data:
