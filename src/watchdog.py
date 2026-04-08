@@ -24,7 +24,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 WATCHDOG_INTERVAL_SEC = 10.0
-WATCHDOG_STALE_THRESHOLD_SEC = 30.0
+WATCHDOG_STALE_THRESHOLD_SEC = 120.0
 WATCHDOG_FAILURES_BEFORE_ACTION = 2
 WATCHDOG_BACKOFF_SEC = (5, 10, 30, 60, 60)  # last value repeats
 # Hard timeout on discover_and_subscribe. IB Gateway can complete connect()

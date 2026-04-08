@@ -16,13 +16,23 @@ from ib_insync import IB, LimitOrder
 
 from .utils import round_to_tick
 
-LATENCY_RING_SIZE = 500   # rolling window for TTT/RTT percentiles
-# Minimum interval between successive amends to the same (strike, right, side).
-# Without this, a flapping incumbent can produce multiple in-flight modifies
-# that race each other and trip IB error 103 (Duplicate order id). 100ms is
-# generous: it lets us react to material moves without bursting amends on
-# every micro-tick.
-MODIFY_COOLDOWN_MS = 100
+LATENCY_RING_SIZE = 500   # rolling window for TTT/RTT/AMEND percentiles
+# Soft cap on the in-flight tracking dicts (_pending_rtt, _placed_at_ns,
+# _pending_amend, _rtt_captured_oids). When any of these grows past this
+# size, we drop the oldest half. Prevents slow leaks when an order goes
+# terminal without observation (e.g., GTD-expired before next snapshot).
+TRACKING_DICT_MAX = 4_000
+
+# Minimum lifetime before a freshly-placed order is eligible for cancellation.
+# IBKR takes ~50-300ms to ack a new order; if we cancel inside that window the
+# order goes PendingSubmit → PendingCancel without ever visiting Submitted, so
+# the order is invisible on the book and we burn a place/cancel pair. Lowered
+# from 750ms to 300ms 2026-04-08 — the canonical_trade fix means we now reliably
+# observe the ack, so we don't need the 750ms safety margin we needed when
+# orders looked perpetually stuck. 300ms covers the observed amend p50 (~106ms)
+# with headroom for the long tail without artificially delaying legitimate
+# cancels on real skip conditions.
+MIN_ORDER_LIFETIME_MS = 300
 
 logger = logging.getLogger(__name__)
 
@@ -82,33 +92,105 @@ class QuoteManager:
         self.constraint_checker = constraint_checker
         self.csv_logger = csv_logger
         self.active_orders: Dict[OrderKey, int] = {}  # {(strike, right, side): order_id}
-        self._order_id_to_trade: Dict[int, object] = {}  # order_id -> Trade object
         self._account = config.account.account_id
         self._last_sabr_attempt: Optional[datetime] = None
         self._last_sabr_forward: float = 0.0  # underlying at last calibration
         # Latency rings (microseconds). TTT = tick→placeOrder. RTT = placeOrder→Submitted ack.
         self._ttt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         self._rtt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
+        # Amend RTT — separate from _rtt_us because modifies dominate steady
+        # state and they have a different latency profile than fresh places
+        # (no order-id allocation, no permission validation, just price update).
+        self._amend_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         self._pending_rtt: Dict[int, int] = {}  # order_id -> placeOrder ns
+        # Pending amend tracking: (orderId) -> (sent_lmtPrice, sent_ns)
+        # Set on every modify path. Cleared when we observe canonical Trade
+        # reflect the new price (at which point we record the amend RTT).
+        self._pending_amend: Dict[int, Tuple[float, int]] = {}
         # Order placement time per order_id, for fill latency (place→fill).
         # Cleared on fill_handler when the fill arrives. Distinct from
         # _pending_rtt which clears on Submitted ack.
         self._placed_at_ns: Dict[int, int] = {}
         # Most recent tick_received_ns per (strike, right) at decision time.
         self._decision_tick_ns: Dict[Tuple[float, str], int] = {}
-        # Last successful amend time per (strike, right, side) — for cooldown.
-        self._last_modify_ns: Dict[OrderKey, int] = {}
+        # Consecutive theo_edge skip count per key — used for hysteresis so a
+        # single tick of theo_edge violation doesn't drop a resting order
+        # that would re-qualify on the next tick. Reset on any non-theo path
+        # through _process_side (place or other gate).
+        self._theo_edge_streak: Dict[OrderKey, int] = {}
+        # orderIds we've already extracted RTT for (so we don't double-count
+        # on subsequent snapshot passes).
+        self._rtt_captured_oids: set = set()
+        # Per-cycle canonical trade index — populated by _build_our_prices_index
+        # at the top of each update_quotes / get_active_quotes call. Reading
+        # from this dict is O(1) vs an O(N) walk of openTrades, which matters
+        # at 4Hz × ~50 active orders. Cleared opportunistically; readers fall
+        # back to walking openTrades when the cache is empty (cold path).
+        self._canonical_idx: Dict[int, object] = {}
 
-    def _our_prices_at(self, strike: float, right: str) -> set:
-        """Return set of our resting limit prices at this (strike, right)
-        for self-filter use in find_incumbent."""
-        out = set()
-        for side in ("BUY", "SELL"):
-            oid = self.active_orders.get((strike, right, side))
-            if oid:
-                t = self._order_id_to_trade.get(oid)
-                if t and self._is_order_live(t):
-                    out.add(float(t.order.lmtPrice))
+    def _canonical_trade(self, order_id: int):
+        """Return the canonical (latest) Trade object for an orderId, or
+        None if it's no longer open.
+
+        Hot path: reads from `self._canonical_idx`, which is populated once
+        per cycle by `_build_our_prices_index`. The cached entry is the same
+        Trade *instance* that ib_insync mutates in place, so reading its
+        `.orderStatus.status` always returns the latest value even between
+        cache rebuilds.
+
+        Cold path: when the cache is empty (e.g., a caller outside the
+        update_quotes / get_active_quotes flow), fall back to walking
+        openTrades. This preserves correctness if the call site changes.
+
+        Why we don't cache the placeOrder return value: ib_insync sometimes
+        constructs a NEW Trade object when an openOrder callback fires
+        (notably after reqAutoOpenOrders adopts the order on clientId=0).
+        The Trade returned by placeOrder becomes an orphan that nobody
+        updates — it'd stay at PendingSubmit forever. The fix is to always
+        re-resolve from the canonical store.
+
+        Subtlety: openTrades() can return MULTIPLE Trade objects with the
+        same orderId — the original (stale) Trade and a fresh one from the
+        openOrder callback. We MUST return the LAST match in the iteration
+        (the canonical one with up-to-date status), not the first.
+        """
+        cached = self._canonical_idx.get(order_id)
+        if cached is not None:
+            return cached
+        latest = None
+        for t in self.ib.openTrades():
+            if t.order.orderId == order_id:
+                latest = t
+        return latest
+
+    def _build_our_prices_index(self) -> Dict[Tuple[float, str], set]:
+        """One-pass build of {(strike, right): set(prices)} for self-filter
+        use across an entire update_quotes cycle. Walks openTrades exactly
+        once per cycle instead of N times (one per quotable strike/right).
+
+        Two-step to handle ib_insync's multi-Trade-per-orderId quirk: first
+        build {orderId: canonical_trade} (last-write-wins picks the canonical
+        non-orphan instance), then bucket by (strike, right).
+
+        Side effect: populates `self._canonical_idx` so `_canonical_trade()`
+        can do O(1) lookups during the rest of the cycle instead of walking
+        openTrades on every call.
+        """
+        canonical: Dict[int, object] = {}
+        for t in self.ib.openTrades():
+            ref = getattr(t.order, "orderRef", "") or ""
+            if ref.startswith(ORDER_REF_PREFIX):
+                canonical[t.order.orderId] = t
+        self._canonical_idx = canonical  # cache for _canonical_trade reads
+        out: Dict[Tuple[float, str], set] = {}
+        for t in canonical.values():
+            if not self._is_order_live(t):
+                continue
+            c = t.contract
+            if c.symbol != "ETHUSDRR":
+                continue
+            key = (float(c.strike), c.right)
+            out.setdefault(key, set()).add(float(t.order.lmtPrice))
         return out
 
     def update_quotes(self, portfolio, dirty: Optional[set] = None):
@@ -155,6 +237,11 @@ class QuoteManager:
         else:
             iter_pairs = quotable
 
+        # Precompute our resting prices once per cycle. Avoids walking
+        # ib.openTrades() twice per (strike, right) pair inside the loop.
+        our_prices_idx = self._build_our_prices_index()
+        _empty_set: set = set()
+
         for strike, right in iter_pairs:
             option = state.get_option(strike, right=right)
             if option is None:
@@ -170,7 +257,7 @@ class QuoteManager:
                 except Exception:
                     theo = None
 
-            our_prices = self._our_prices_at(strike, right)
+            our_prices = our_prices_idx.get((strike, right), _empty_set)
             inc_bid_info = self.market_data.find_incumbent(strike, "BUY", our_prices, right=right)
             inc_ask_info = self.market_data.find_incumbent(strike, "SELL", our_prices, right=right)
 
@@ -211,16 +298,27 @@ class QuoteManager:
         adj = round_to_tick(jumped, tick)
 
         # Theo edge gate: reject if our price wouldn't sit min_edge_points
-        # away from theo on the favorable side.
+        # away from theo on the favorable side. Hysteresis: require N
+        # consecutive violations on the same key before cancelling so a
+        # single boundary tick doesn't churn a resting order. Default N=1
+        # (no hysteresis); set theo_edge_hysteresis_ticks: 2 in config to
+        # smooth at the cost of slightly higher behind% on stale quotes.
+        key = (strike, right, side)
         if theo is not None and config.pricing.min_edge_points > 0:
             edge = config.pricing.min_edge_points
+            hyst = int(getattr(config.pricing, "theo_edge_hysteresis_ticks", 1))
             violates = (adj > theo - edge) if side == "BUY" else (adj < theo + edge)
             if violates:
-                self._cancel_quote(strike, right, side)
+                streak = self._theo_edge_streak.get(key, 0) + 1
+                self._theo_edge_streak[key] = streak
+                if streak >= hyst:
+                    self._cancel_quote(strike, right, side)
                 self._log_quote_telemetry(strike, right, side, None,
                                           {**inc_info, "skip_reason": "theo_edge"},
                                           theo=theo)
                 return
+            else:
+                self._theo_edge_streak.pop(key, None)
 
         if adj <= 0:
             self._cancel_quote(strike, right, side)
@@ -263,25 +361,29 @@ class QuoteManager:
 
         if key in self.active_orders:
             order_id = self.active_orders[key]
-            trade = self._order_id_to_trade.get(order_id)
+            trade = self._canonical_trade(order_id)
 
             if not self._is_order_live(trade):
                 self.active_orders.pop(key, None)
-                self._order_id_to_trade.pop(order_id, None)
             elif trade.order.lmtPrice != price:
-                # Modify cooldown: refuse to amend the same key more than
-                # once per MODIFY_COOLDOWN_MS. Prevents in-flight modifies
-                # from racing each other and tripping IB error 103.
+                # Modify in place. We used to throttle this with a per-key
+                # cooldown to dodge Error 103 races, but the real amend-ack
+                # latency (~100ms p50, 460ms p90) far exceeds any client-side
+                # throttle we'd want to set, so the cooldown was protecting
+                # against nothing while adding stale-quote dwell time.
                 now_ns = time.monotonic_ns()
-                last_ns = self._last_modify_ns.get(key, 0)
-                if last_ns and (now_ns - last_ns) < MODIFY_COOLDOWN_MS * 1_000_000:
-                    return
                 trade.order.lmtPrice = price
                 trade.order.totalQuantity = qty
                 trade.order.goodTillDate = _gtd_string()
                 self._record_send_latency(strike, right, trade.order.orderId)
+                # Stash for amend-RTT capture: record the price we just sent
+                # and the timestamp. _capture_rtt_from_log will record the
+                # latency once it observes the canonical Trade reflect this
+                # new price. Bounded so it can't leak.
+                self._pending_amend[trade.order.orderId] = (price, now_ns)
+                if len(self._pending_amend) > TRACKING_DICT_MAX:
+                    self._evict_oldest_half(self._pending_amend)
                 self.ib.placeOrder(trade.contract, trade.order)
-                self._last_modify_ns[key] = now_ns
                 return
             else:
                 gtd_str = trade.order.goodTillDate or ""
@@ -299,6 +401,9 @@ class QuoteManager:
 
         # Place a new order
         action = "BUY" if side == "BUY" else "SELL"
+        # account= is REQUIRED on multi-account logins (DFP/DUP paper sub-
+        # accounts) — IBKR returns Error 436 "You must specify an allocation"
+        # if it's missing. Verified 2026-04-08.
         order = LimitOrder(
             action=action,
             totalQuantity=qty,
@@ -310,9 +415,18 @@ class QuoteManager:
         )
         trade = self.ib.placeOrder(contract, order)
         self.active_orders[key] = trade.order.orderId
-        self._order_id_to_trade[trade.order.orderId] = trade
         self._record_send_latency(strike, right, trade.order.orderId)
-        trade.statusEvent += self._on_order_status
+
+    @staticmethod
+    def _evict_oldest_half(d: dict) -> None:
+        """Drop the oldest half of a dict in place. Cheap stand-in for an
+        LRU eviction policy on the latency tracking dicts. Relies on Python
+        3.7+ insertion-order semantics: keys() returns them in insert order,
+        so the first half is the oldest. O(N) per eviction, called at most
+        once every TRACKING_DICT_MAX inserts → amortized O(1)."""
+        keys = list(d.keys())
+        for k in keys[: len(keys) // 2]:
+            d.pop(k, None)
 
     def _record_send_latency(self, strike: float, right: str, order_id: int):
         """Capture TTT (tick→placeOrder) and arm RTT/fill timers for this order.
@@ -324,6 +438,10 @@ class QuoteManager:
         Two timers are armed:
           - _pending_rtt: cleared on Submitted ack (used for RTT histogram)
           - _placed_at_ns: cleared on fill (used for fill latency in fills.csv)
+
+        Both dicts are capped at TRACKING_DICT_MAX so they can't leak when
+        an order goes terminal without an observation (GTD-expired before
+        the next snapshot, cancelled by the broker, etc).
         """
         now_ns = time.monotonic_ns()
         tick_ns = self._decision_tick_ns.get((strike, right), 0)
@@ -332,10 +450,15 @@ class QuoteManager:
             if 0 <= ttt_us < 50_000:
                 self._ttt_us.append(ttt_us)
         self._pending_rtt[order_id] = now_ns
+        if len(self._pending_rtt) > TRACKING_DICT_MAX:
+            self._evict_oldest_half(self._pending_rtt)
         # Only record the FIRST place time per order — modifies don't reset
         # the fill clock, since the same order id can fill at any moment
         # after the original submission.
-        self._placed_at_ns.setdefault(order_id, now_ns)
+        if order_id not in self._placed_at_ns:
+            self._placed_at_ns[order_id] = now_ns
+            if len(self._placed_at_ns) > TRACKING_DICT_MAX:
+                self._evict_oldest_half(self._placed_at_ns)
 
     def fill_latency_ms(self, order_id: int) -> Optional[float]:
         """Return milliseconds from first placement to now for an order, or
@@ -346,24 +469,60 @@ class QuoteManager:
             return None
         return (time.monotonic_ns() - placed_ns) / 1_000_000.0
 
-    def _on_order_status(self, trade):
-        """Capture RTT when an order first reaches Submitted/PreSubmitted."""
+    def _capture_rtt_from_log(self, trade):
+        """Capture place-RTT and amend-RTT for an order.
+
+        Two distinct measurements:
+
+        place-RTT: time from placeOrder(new) to first observation of the
+            canonical Trade past PendingSubmit. Captured once per orderId.
+
+        amend-RTT: time from placeOrder(modify) to observing the canonical
+            Trade's lmtPrice match the value we just sent. Captured once per
+            (orderId, sent_price) pair so back-to-back amends each get
+            measured independently.
+
+        We deliberately do NOT use trade.log timestamps because the canonical
+        Trade from openTrades/openOrder doesn't preserve the local
+        PendingSubmit timestamp — that only exists on the orphan Trade
+        returned by placeOrder.
+        """
         try:
-            status = trade.orderStatus.status
-            if status not in ("Submitted", "PreSubmitted"):
-                return
             oid = trade.order.orderId
-            sent_ns = self._pending_rtt.pop(oid, None)
-            if sent_ns is None:
-                return
-            rtt_us = (time.monotonic_ns() - sent_ns) // 1000
-            if 0 <= rtt_us < 5_000_000:
-                self._rtt_us.append(rtt_us)
+            now_ns = time.monotonic_ns()
+
+            # ── place-RTT ─────────────────────────────────────────
+            if oid not in self._rtt_captured_oids:
+                status = trade.orderStatus.status
+                # PendingSubmit means we haven't been acked yet.
+                if status not in ("PendingSubmit", "ApiPending", "Inactive", ""):
+                    sent_ns = self._pending_rtt.pop(oid, None)
+                    if sent_ns is not None:
+                        rtt_us = (now_ns - sent_ns) // 1000
+                        if 0 <= rtt_us < 5_000_000:
+                            self._rtt_us.append(rtt_us)
+                        self._rtt_captured_oids.add(oid)
+                        # Same bound pattern as the latency tracking dicts.
+                        if len(self._rtt_captured_oids) > TRACKING_DICT_MAX:
+                            self._rtt_captured_oids = set(
+                                list(self._rtt_captured_oids)[-(TRACKING_DICT_MAX // 2):]
+                            )
+
+            # ── amend-RTT ─────────────────────────────────────────
+            pending = self._pending_amend.get(oid)
+            if pending is not None:
+                sent_price, sent_ns = pending
+                # Has the canonical Trade caught up to the price we sent?
+                if abs(trade.order.lmtPrice - sent_price) < 1e-9:
+                    amend_us = (now_ns - sent_ns) // 1000
+                    if 0 <= amend_us < 5_000_000:
+                        self._amend_us.append(amend_us)
+                    self._pending_amend.pop(oid, None)
         except Exception:
             pass
 
     def get_latency_snapshot(self) -> dict:
-        """Return rolling p50/p90/p99 in microseconds for TTT and RTT."""
+        """Return rolling p50/p90/p99 in microseconds for TTT, RTT, and amend."""
         def stats(buf):
             if not buf:
                 return {"n": 0, "p50": None, "p90": None, "p99": None}
@@ -375,30 +534,49 @@ class QuoteManager:
                 "p90": s[min(n - 1, int(n * 0.90))],
                 "p99": s[min(n - 1, int(n * 0.99))],
             }
-        return {"ttt_us": stats(self._ttt_us), "rtt_us": stats(self._rtt_us)}
+        return {
+            "ttt_us": stats(self._ttt_us),
+            "rtt_us": stats(self._rtt_us),
+            "amend_us": stats(self._amend_us),
+        }
 
     def _cancel_quote(self, strike: float, right: str, side: str):
-        """Cancel a quote at a specific (strike, right, side)."""
+        """Cancel a quote at a specific (strike, right, side).
+
+        Skips cancellation when the order was placed less than
+        MIN_ORDER_LIFETIME_MS ago AND is still in PendingSubmit (i.e., IBKR
+        hasn't acked yet). Cancelling in that window produces a
+        PendingSubmit → PendingCancel transition that never visits Submitted,
+        so the order is invisible on the book and we burn a place/cancel pair
+        for nothing. The next quote tick will re-evaluate and cancel then if
+        the skip condition still holds.
+        """
         key = (strike, right, side)
-        if key in self.active_orders:
-            order_id = self.active_orders[key]
-            trade = self._order_id_to_trade.get(order_id)
-            if trade is not None:
-                self.ib.cancelOrder(trade.order)
-            del self.active_orders[key]
-            self._order_id_to_trade.pop(order_id, None)
+        if key not in self.active_orders:
+            return
+        order_id = self.active_orders[key]
+        trade = self._canonical_trade(order_id)
+        if trade is not None:
+            placed_ns = self._placed_at_ns.get(order_id)
+            status = trade.orderStatus.status
+            if (placed_ns is not None
+                    and status in ("PendingSubmit", "ApiPending")
+                    and (time.monotonic_ns() - placed_ns) < MIN_ORDER_LIFETIME_MS * 1_000_000):
+                # Too young to cancel — let IBKR ack first.
+                return
+            self.ib.cancelOrder(trade.order)
+        del self.active_orders[key]
 
     def cancel_all_quotes(self):
         """Kill switch: cancel everything immediately."""
         for key, order_id in list(self.active_orders.items()):
-            trade = self._order_id_to_trade.get(order_id)
+            trade = self._canonical_trade(order_id)
             if trade is not None:
                 try:
                     self.ib.cancelOrder(trade.order)
                 except Exception as e:
                     logger.warning("Failed to cancel order %d: %s", order_id, e)
         self.active_orders.clear()
-        self._order_id_to_trade.clear()
         logger.info("All quotes cancelled")
 
     def _log_quote_telemetry(self, strike: float, right: str, side: str,
@@ -432,11 +610,22 @@ class QuoteManager:
         return len(self.active_orders)
 
     def get_active_quotes(self) -> Dict:
-        """Return dict keyed by (strike, right, side) -> live quote info."""
+        """Return dict keyed by (strike, right, side) -> live quote info.
+
+        Refreshes the canonical-trade index up front so the per-order lookups
+        below are O(1) instead of O(N) per call. This is the snapshot writer's
+        4Hz hot path; without the refresh we'd walk openTrades once per
+        active order per snapshot (~50 × 200 = 10K iterations every 250ms).
+        """
+        # Side-effect: populates self._canonical_idx that _canonical_trade reads.
+        self._build_our_prices_index()
         quotes = {}
         for (strike, right, side), order_id in self.active_orders.items():
-            trade = self._order_id_to_trade.get(order_id)
+            trade = self._canonical_trade(order_id)
             if trade is not None:
+                # Opportunistically extract RTT (place + amend) the first time
+                # we observe a post-ack state for this orderId.
+                self._capture_rtt_from_log(trade)
                 quotes[(strike, right, side)] = {
                     "order_id": order_id,
                     "price": trade.order.lmtPrice,

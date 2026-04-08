@@ -131,18 +131,41 @@ async def main():
     conn.set_disconnect_callback(on_disconnect)
 
     # ── 5. Cancel any stale orders from previous runs ───────────────
+    # On clientId=0 the openTrades cache is populated asynchronously after
+    # reqAutoOpenOrders + reqOpenOrders complete during connect. Wait briefly
+    # so the cache reflects EVERY orphan that's still resting on IBKR's books
+    # — otherwise we miss most of them and the new session immediately hits
+    # IBKR's per-contract working-order limit (Error 201, "minimum of 15
+    # orders working on either the buy or sell side for this particular
+    # contract").
+    await asyncio.sleep(3)
+
     cancelled = 0
-    for trade in ib.openTrades():
+    # Only cancel orders that are actually in a cancellable state. ib_insync's
+    # openTrades() can return trades whose terminal status (Filled, Cancelled,
+    # Inactive) hasn't been pruned yet from the local cache, and blindly
+    # cancelling those produces "Error 161: Cancel attempted when order is not
+    # in a cancellable state" noise in the logs.
+    _CANCELLABLE = {"PendingSubmit", "PreSubmitted", "Submitted", "ApiPending"}
+    snapshot = list(ib.openTrades())
+    logger.info("Stale-order sweep: %d trades visible in openTrades cache", len(snapshot))
+    for trade in snapshot:
         ref = getattr(trade.order, "orderRef", "") or ""
-        if ref.startswith("corsair2"):
-            try:
-                ib.cancelOrder(trade.order)
-                cancelled += 1
-            except Exception:
-                pass
+        if not ref.startswith("corsair2"):
+            continue
+        status = getattr(getattr(trade, "orderStatus", None), "status", "") or ""
+        if status not in _CANCELLABLE:
+            continue
+        try:
+            ib.cancelOrder(trade.order)
+            cancelled += 1
+        except Exception:
+            pass
     if cancelled:
         logger.info("Cancelled %d stale orders from previous run", cancelled)
-        await asyncio.sleep(2)  # Let cancels settle
+        # Give IBKR time to actually process the cancels and free up the
+        # per-contract working-order slots before we start placing new ones.
+        await asyncio.sleep(5)
 
     # ── 6. Subscribe to market data with hard timeout + retry ─────────
     # IB Gateway can complete connect() but then hang inside the discovery
