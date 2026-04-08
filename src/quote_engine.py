@@ -86,9 +86,6 @@ class QuoteManager:
         self._account = config.account.account_id
         self._last_sabr_attempt: Optional[datetime] = None
         self._last_sabr_forward: float = 0.0  # underlying at last calibration
-        # Last-known meaningful incumbent (for snapshot/dashboard), per (strike, right).
-        self._incumbent_bid: Dict[Tuple[float, str], float] = {}
-        self._incumbent_ask: Dict[Tuple[float, str], float] = {}
         # Latency rings (microseconds). TTT = tick→placeOrder. RTT = placeOrder→Submitted ack.
         self._ttt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         self._rtt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
@@ -176,11 +173,6 @@ class QuoteManager:
             our_prices = self._our_prices_at(strike, right)
             inc_bid_info = self.market_data.find_incumbent(strike, "BUY", our_prices, right=right)
             inc_ask_info = self.market_data.find_incumbent(strike, "SELL", our_prices, right=right)
-
-            if inc_bid_info["price"] is not None:
-                self._incumbent_bid[(strike, right)] = inc_bid_info["price"]
-            if inc_ask_info["price"] is not None:
-                self._incumbent_ask[(strike, right)] = inc_ask_info["price"]
 
             self._process_side(portfolio, option, strike, right, "BUY",
                                inc_bid_info, theo)
@@ -453,27 +445,4 @@ class QuoteManager:
                 }
         return quotes
 
-    def seed_incumbents(self, market_state) -> int:
-        """Seed the tracked-incumbent cache from current market data.
-        Called at startup before any orders are placed so the dashboard
-        shows real BBOs immediately instead of zeros."""
-        n = 0
-        for strike in market_state.get_all_strikes():
-            for right in ("C", "P"):
-                opt = market_state.get_option(strike, right=right)
-                if opt is None:
-                    continue
-                if opt.bid > 0:
-                    self._incumbent_bid[(strike, right)] = opt.bid
-                    n += 1
-                if opt.ask > 0:
-                    self._incumbent_ask[(strike, right)] = opt.ask
-        return n
-
-    def get_incumbent(self, strike: float, right: str = "C") -> Tuple[float, float]:
-        """Return tracked incumbent (bid, ask) for a (strike, right)."""
-        return (
-            self._incumbent_bid.get((strike, right), 0.0),
-            self._incumbent_ask.get((strike, right), 0.0),
-        )
 

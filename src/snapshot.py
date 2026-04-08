@@ -79,14 +79,9 @@ def _build_side(state, quotes, sabr, portfolio, active_quotes,
         status = "pending"
     else:
         status = "idle"
-    inc_bid, inc_ask = quotes.get_incumbent(strike, right)
-    if inc_bid <= 0:
-        inc_bid = opt.bid
-    if inc_ask <= 0:
-        inc_ask = opt.ask
     return {
-        "market_bid": inc_bid,
-        "market_ask": inc_ask,
+        "market_bid": opt.bid,
+        "market_ask": opt.ask,
         "raw_bid": opt.bid,
         "raw_ask": opt.ask,
         "our_bid": our_bid,

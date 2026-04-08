@@ -206,9 +206,6 @@ async def main():
     # Set SABR expiry
     sabr.set_expiry(market_data.state.front_month_expiry)
 
-    # Seed incumbent tracker with clean market data (before we place any orders)
-    n_seeded = quotes.seed_incumbents(market_data.state)
-    logger.info("Incumbent tracker seeded with %d quotes", n_seeded)
 
     # ── 6. Handle graceful shutdown ───────────────────────────────────
     shutdown_event = asyncio.Event()
