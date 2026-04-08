@@ -19,3 +19,6 @@ span_data/
 
 # OS
 .DS_Store
+
+# IDE/agent local state
+.claude/
