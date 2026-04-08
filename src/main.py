@@ -207,16 +207,8 @@ async def main():
     sabr.set_expiry(market_data.state.front_month_expiry)
 
     # Seed incumbent tracker with clean market data (before we place any orders)
-    for strike in market_data.state.get_all_strikes():
-        for right in ("C", "P"):
-            opt = market_data.state.get_option(strike, right=right)
-            if opt is None:
-                continue
-            if opt.bid > 0:
-                quotes._incumbent_bid[(strike, right)] = opt.bid
-            if opt.ask > 0:
-                quotes._incumbent_ask[(strike, right)] = opt.ask
-    logger.info("Incumbent tracker seeded with %d (strike,right) pairs", len(quotes._incumbent_bid))
+    n_seeded = quotes.seed_incumbents(market_data.state)
+    logger.info("Incumbent tracker seeded with %d quotes", n_seeded)
 
     # ── 6. Handle graceful shutdown ───────────────────────────────────
     shutdown_event = asyncio.Event()

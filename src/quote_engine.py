@@ -372,22 +372,18 @@ class QuoteManager:
 
     def get_latency_snapshot(self) -> dict:
         """Return rolling p50/p90/p99 in microseconds for TTT and RTT."""
-        def pct(buf, p):
+        def stats(buf):
             if not buf:
-                return None
+                return {"n": 0, "p50": None, "p90": None, "p99": None}
             s = sorted(buf)
-            idx = min(len(s) - 1, int(len(s) * p))
-            return s[idx]
-        return {
-            "ttt_us": {"n": len(self._ttt_us),
-                       "p50": pct(self._ttt_us, 0.50),
-                       "p90": pct(self._ttt_us, 0.90),
-                       "p99": pct(self._ttt_us, 0.99)},
-            "rtt_us": {"n": len(self._rtt_us),
-                       "p50": pct(self._rtt_us, 0.50),
-                       "p90": pct(self._rtt_us, 0.90),
-                       "p99": pct(self._rtt_us, 0.99)},
-        }
+            n = len(s)
+            return {
+                "n": n,
+                "p50": s[min(n - 1, int(n * 0.50))],
+                "p90": s[min(n - 1, int(n * 0.90))],
+                "p99": s[min(n - 1, int(n * 0.99))],
+            }
+        return {"ttt_us": stats(self._ttt_us), "rtt_us": stats(self._rtt_us)}
 
     def _cancel_quote(self, strike: float, right: str, side: str):
         """Cancel a quote at a specific (strike, right, side)."""
@@ -456,6 +452,23 @@ class QuoteManager:
                     "status": trade.orderStatus.status if hasattr(trade, 'orderStatus') else "unknown",
                 }
         return quotes
+
+    def seed_incumbents(self, market_state) -> int:
+        """Seed the tracked-incumbent cache from current market data.
+        Called at startup before any orders are placed so the dashboard
+        shows real BBOs immediately instead of zeros."""
+        n = 0
+        for strike in market_state.get_all_strikes():
+            for right in ("C", "P"):
+                opt = market_state.get_option(strike, right=right)
+                if opt is None:
+                    continue
+                if opt.bid > 0:
+                    self._incumbent_bid[(strike, right)] = opt.bid
+                    n += 1
+                if opt.ask > 0:
+                    self._incumbent_ask[(strike, right)] = opt.ask
+        return n
 
     def get_incumbent(self, strike: float, right: str = "C") -> Tuple[float, float]:
         """Return tracked incumbent (bid, ask) for a (strike, right)."""

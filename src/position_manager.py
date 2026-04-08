@@ -80,14 +80,18 @@ class PortfolioState:
     # Calls and puts have independent risk budgets. These return the same
     # quantity-weighted aggregates as the net_* properties above, but
     # filtered to one option type.
+    def _aggregate_for(self, right: str, attr: str) -> float:
+        return sum(getattr(p, attr) * p.quantity
+                   for p in self.positions if p.put_call == right)
+
     def delta_for(self, right: str) -> float:
-        return sum(p.delta * p.quantity for p in self.positions if p.put_call == right)
+        return self._aggregate_for(right, "delta")
 
     def theta_for(self, right: str) -> float:
-        return sum(p.theta * p.quantity for p in self.positions if p.put_call == right)
+        return self._aggregate_for(right, "theta")
 
     def vega_for(self, right: str) -> float:
-        return sum(p.vega * p.quantity for p in self.positions if p.put_call == right)
+        return self._aggregate_for(right, "vega")
 
     def gross_for(self, right: str) -> int:
         return sum(abs(p.quantity) for p in self.positions if p.put_call == right)

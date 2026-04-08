@@ -136,18 +136,15 @@ class IBKRMarginChecker:
         return ra, base
 
     # ── Portfolio aggregate cache ──────────────────────────────────
-    def _get_portfolio_state(self, F: float) -> dict:
-        """Aggregate the entire position book (calls + puts) into
-        (portfolio_ra, nov, long_premium, short_count). Combined-budget
-        architecture: one cache entry covering ALL positions, not per-side."""
-        if self._portfolio_cache_valid(F):
-            return self._port_state
-
+    def _accumulate(self, positions, F: float) -> dict:
+        """Run a position iterable through the SPAN risk pipeline and
+        return the aggregate state dict. Shared by the cached portfolio
+        path and the uncached per-side display path."""
         portfolio_ra = np.zeros(16)
         nov = 0.0
         long_premium = 0.0
         short_count = 0
-        for p in self.portfolio.positions:
+        for p in positions:
             opt = self.market_data.state.get_option(p.strike, p.expiry, p.put_call)
             iv = self._resolve_iv(opt, p.strike, p.put_call)
             T = max(days_to_expiry(p.expiry), 0) / 365.0
@@ -160,13 +157,18 @@ class IBKRMarginChecker:
                 long_premium += base * p.quantity * self._mult
             else:
                 short_count += abs(p.quantity)
-
-        state = {
+        return {
             "portfolio_ra": portfolio_ra,
             "nov": nov,
             "long_premium": long_premium,
             "short_count": short_count,
         }
+
+    def _get_portfolio_state(self, F: float) -> dict:
+        """Cached aggregate of the entire position book (calls + puts)."""
+        if self._portfolio_cache_valid(F):
+            return self._port_state
+        state = self._accumulate(self.portfolio.positions, F)
         self._port_state = state
         self._port_F = F
         self._port_time = time.monotonic()
@@ -204,29 +206,13 @@ class IBKRMarginChecker:
         return self._margin_for_side(F, right)
 
     def _margin_for_side(self, F: float, right: str) -> float:
-        """Display-only per-side SPAN. Iterates only positions of one right
-        and runs them through the same risk pipeline. Not cached because
-        it's only called by the snapshot writer at ~1 Hz."""
-        portfolio_ra = np.zeros(16)
-        nov = 0.0
-        long_premium = 0.0
-        short_count = 0
-        for p in self.portfolio.positions:
-            if p.put_call != right:
-                continue
-            opt = self.market_data.state.get_option(p.strike, p.expiry, p.put_call)
-            iv = self._resolve_iv(opt, p.strike, p.put_call)
-            T = max(days_to_expiry(p.expiry), 0) / 365.0
-            if iv <= 0 or T <= 0 or p.quantity == 0:
-                continue
-            ra, base = self._get_strike_risk(p.strike, p.put_call, T, iv, F)
-            portfolio_ra += ra * p.quantity
-            nov += base * p.quantity * self._mult
-            if p.quantity > 0:
-                long_premium += base * p.quantity * self._mult
-            else:
-                short_count += abs(p.quantity)
-        return self._margin_from_state(portfolio_ra, nov, long_premium, short_count)
+        """Display-only per-side SPAN. Uncached; called by the snapshot
+        writer at ~1 Hz for the per-side dashboard breakdown."""
+        side_positions = (p for p in self.portfolio.positions if p.put_call == right)
+        st = self._accumulate(side_positions, F)
+        return self._margin_from_state(
+            st["portfolio_ra"], st["nov"], st["long_premium"], st["short_count"],
+        )
 
     def update_cached_margin(self):
         """Refresh IBKR's reported maintenance margin (for reconciliation)."""
