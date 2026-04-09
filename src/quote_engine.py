@@ -743,7 +743,26 @@ class QuoteManager:
             account=self._account,
             orderRef=f"{ORDER_REF_PREFIX}_{int(strike)}{right}_{side}",
         )
-        trade = self._try_place_order(contract, order)
+        # Defensive wrap: ib_insync.placeOrder asserts on
+        # `trade.orderStatus.status not in OrderStatus.DoneStates`. After a
+        # watchdog reconnect/escalation cycle, ib_insync's wrapper.trades
+        # dict can still hold stale entries from the previous session in
+        # Cancelled state, with orderIds that get recycled by IBKR's
+        # nextValidId on the new session. The next placeOrder for one of
+        # those recycled IDs trips the assertion and — without this guard
+        # — bubbles up to the quote loop's exception storm path and
+        # sticky-kills the engine. Drop the key, log, and let the next
+        # cycle allocate a fresh orderId. (The modify path at line 613
+        # already has the same guard for analogous reasons.)
+        try:
+            trade = self._try_place_order(contract, order)
+        except AssertionError:
+            logger.warning(
+                "placeOrder DoneState race on NEW order %s%s %s — "
+                "stale wrapper.trades entry; dropping and retrying next cycle",
+                int(strike), right, side,
+            )
+            return
         if trade is None:
             return  # bucket dropped — next cycle re-attempts
         self.active_orders[key] = trade.order.orderId

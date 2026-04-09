@@ -127,6 +127,34 @@ class IBKRConnection:
                 self._connected = False
                 return False
 
+            # Purge stale Done-state trades from ib_insync's wrapper dict.
+            # After a reconnect (especially watchdog escalation → gateway
+            # recreate), wrapper.trades carries entries from the previous
+            # session in Cancelled state. IBKR's nextValidId on the new
+            # session can recycle those orderIds, and the next placeOrder
+            # collides with the stale Done-state trade — ib_insync asserts
+            # `status not in DoneStates` and the assertion bubbles to our
+            # quote loop, eventually tripping the exception_storm sticky
+            # kill (observed 2026-04-09 15:41 during test 2A recovery).
+            # Live (PendingSubmit/Submitted/PreSubmitted) entries are
+            # preserved so reqOpenOrders can refresh them naturally.
+            try:
+                from ib_insync.order import OrderStatus as _OS
+                stale_ids = [
+                    oid for oid, t in list(ib.wrapper.trades.items())
+                    if getattr(t, "orderStatus", None)
+                    and t.orderStatus.status in _OS.DoneStates
+                ]
+                for oid in stale_ids:
+                    ib.wrapper.trades.pop(oid, None)
+                if stale_ids:
+                    logger.info(
+                        "Purged %d stale Done-state trade(s) from wrapper "
+                        "to prevent orderId-recycle collisions", len(stale_ids),
+                    )
+            except Exception as e:
+                logger.warning("wrapper.trades purge failed: %s", e)
+
             # Force a fresh nextValidId sync. IBKR sends one automatically
             # during the API handshake, but if a prior session on this clientId
             # left orphaned orders, the counter we got at handshake can collide
