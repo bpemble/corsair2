@@ -103,14 +103,19 @@ class QuoteManager:
         # (no order-id allocation, no permission validation, just price update).
         self._amend_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         self._pending_rtt: Dict[int, int] = {}  # order_id -> placeOrder ns
-        # Pending amend tracking: (orderId, lmtPrice) -> sent_ns
-        # Keyed by (oid, price) NOT just oid because rapid back-to-back
-        # modifies on the same orderId would otherwise overwrite each other
-        # in the stash, biasing the sample toward the slow tail (modify1's
-        # ack would pop modify2's timestamp, producing a negative delta that
-        # gets filtered out, so we only record amends with no overlapping
-        # follow-on). With (oid, price) keys, each modify is independent.
-        self._pending_amend: Dict[Tuple[int, float], int] = {}
+        # Pending amend tracking: orderId -> most-recent sent_ns.
+        # Keyed by orderId only. We tried (oid, price) to make rapid
+        # back-to-back modifies independent, but openOrder ack messages
+        # don't echo the price we just sent — they carry whatever IBKR
+        # currently has, which lags by one or two modifies on a busy
+        # order. The (oid, price) key never matched, the stash leaked,
+        # and surviving samples were biased to the rare quiet acks. With
+        # oid-only, the LATEST send wins: each ack pops the most recent
+        # timestamp and we measure send→ack on whatever was last in
+        # flight. Slightly overcounts on contiguous bursts (multiple
+        # modifies before any ack collapse to one sample) but that's
+        # honest — the user-visible ack-to-send delay IS the latest one.
+        self._pending_amend: Dict[int, int] = {}
         # Order placement time per order_id, for fill latency (place→fill).
         # Cleared on fill_handler when the fill arrives. Distinct from
         # _pending_rtt which clears on Submitted ack.
@@ -424,7 +429,7 @@ class QuoteManager:
                 self._record_send_latency(strike, right, order_id)
                 # Stash for amend-RTT capture: keyed by (oid, price) so
                 # back-to-back modifies on the same orderId don't collide.
-                self._pending_amend[(order_id, price)] = now_ns
+                self._pending_amend[order_id] = now_ns
                 if len(self._pending_amend) > TRACKING_DICT_MAX:
                     self._evict_oldest_half(self._pending_amend)
                 self.ib.placeOrder(trade.contract, clean_order)
@@ -569,7 +574,7 @@ class QuoteManager:
 
             # ── amend-RTT (one sample per modify) ─────────────────
             # Match on (oid, price) so rapid modifies are independent.
-            sent_ns = self._pending_amend.pop((oid, trade.order.lmtPrice), None)
+            sent_ns = self._pending_amend.pop(oid, None)
             if sent_ns is not None:
                 amend_us = (now_ns - sent_ns) // 1000
                 if 0 <= amend_us < 5_000_000:
