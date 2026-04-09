@@ -116,35 +116,52 @@ async def probe():
     print(f"Place RTT: {place_rtt_us/1000:.1f}ms ({canonical().orderStatus.status})")
 
     # ── Modify N times ────────────────────────────────────────────────
+    # Use ib.openOrderEvent for accurate ack measurement. Polling
+    # canonical.order.lmtPrice does NOT work because canonical() returns the
+    # SAME Trade instance whose .order.lmtPrice we'd have mutated locally
+    # before placeOrder — the polling check would fire immediately on local
+    # state, NOT on the IBKR roundtrip.
+    pending_amend_ts = {}  # (oid, price) -> sent_ns
+    amend_acked = asyncio.Event()
+    amend_results = {}  # (oid, price) -> ack_ns
+
+    def on_open_order(t):
+        key = (t.order.orderId, t.order.lmtPrice)
+        if key in pending_amend_ts:
+            amend_results[key] = time.monotonic_ns()
+            amend_acked.set()
+
+    ib.openOrderEvent += on_open_order
+
     amend_us_samples = []
     for i in range(N_AMENDS):
         await asyncio.sleep(AMEND_DELAY_S)
-        new_price = START_PRICE + (i + 1) * PRICE_STEP
-        # Get the canonical trade object (its .order is what placeOrder
-        # treats as a modify when it sees the same orderId)
+        new_price = round(START_PRICE + (i + 1) * PRICE_STEP, 2)
         c = canonical()
         if c is None:
             print(f"  amend {i}: lost canonical trade, abort")
             break
         c.order.lmtPrice = new_price
-        modify_t0 = time.monotonic_ns()
+        key = (c.order.orderId, new_price)
+        amend_acked.clear()
+        sent_ns = time.monotonic_ns()
+        pending_amend_ts[key] = sent_ns
         ib.placeOrder(c.contract, c.order)
 
-        # Wait for canonical lmtPrice to reflect the new value
-        amend_us = None
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            c2 = canonical()
-            if c2 is not None and abs(c2.order.lmtPrice - new_price) < 1e-9:
-                amend_us = (time.monotonic_ns() - modify_t0) // 1000
-                break
-            await asyncio.sleep(0.005)
-
-        if amend_us is None:
+        # Wait for openOrderEvent to fire with our (oid, price) key.
+        try:
+            await asyncio.wait_for(amend_acked.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
             print(f"  amend {i+1}: timed out @ {new_price}")
-        else:
-            amend_us_samples.append(amend_us)
-            print(f"  amend {i+1:2d}: {amend_us/1000:6.1f}ms  @ {new_price}")
+            continue
+
+        ack_ns = amend_results.get(key)
+        if ack_ns is None:
+            print(f"  amend {i+1}: ack arrived but no key match @ {new_price}")
+            continue
+        amend_us = (ack_ns - sent_ns) // 1000
+        amend_us_samples.append(amend_us)
+        print(f"  amend {i+1:2d}: {amend_us/1000:6.1f}ms  @ {new_price}")
 
     # ── Cleanup: cancel the resting order ────────────────────────────
     c = canonical()

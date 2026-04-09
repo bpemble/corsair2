@@ -103,10 +103,14 @@ class QuoteManager:
         # (no order-id allocation, no permission validation, just price update).
         self._amend_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         self._pending_rtt: Dict[int, int] = {}  # order_id -> placeOrder ns
-        # Pending amend tracking: (orderId) -> (sent_lmtPrice, sent_ns)
-        # Set on every modify path. Cleared when we observe canonical Trade
-        # reflect the new price (at which point we record the amend RTT).
-        self._pending_amend: Dict[int, Tuple[float, int]] = {}
+        # Pending amend tracking: (orderId, lmtPrice) -> sent_ns
+        # Keyed by (oid, price) NOT just oid because rapid back-to-back
+        # modifies on the same orderId would otherwise overwrite each other
+        # in the stash, biasing the sample toward the slow tail (modify1's
+        # ack would pop modify2's timestamp, producing a negative delta that
+        # gets filtered out, so we only record amends with no overlapping
+        # follow-on). With (oid, price) keys, each modify is independent.
+        self._pending_amend: Dict[Tuple[int, float], int] = {}
         # Order placement time per order_id, for fill latency (place→fill).
         # Cleared on fill_handler when the fill arrives. Distinct from
         # _pending_rtt which clears on Submitted ack.
@@ -127,6 +131,15 @@ class QuoteManager:
         # at 4Hz × ~50 active orders. Cleared opportunistically; readers fall
         # back to walking openTrades when the cache is empty (cold path).
         self._canonical_idx: Dict[int, object] = {}
+
+        # Event-driven RTT/AMEND measurement: subscribe once to the IB-level
+        # openOrderEvent, which fires whenever IBKR sends an openOrder message
+        # in response to a place or modify. The handler pops _pending_rtt /
+        # _pending_amend and records latency in their respective rings. This
+        # replaces the snapshot-quantized _capture_rtt_from_log path that was
+        # adding 0-250ms uniform quantization noise (4Hz polling cadence) on
+        # top of real ~1ms amend latency, making the metric meaningless.
+        self.ib.openOrderEvent += self._on_open_order_ack
 
     def _canonical_trade(self, order_id: int):
         """Return the canonical (latest) Trade object for an orderId, or
@@ -193,6 +206,35 @@ class QuoteManager:
             out.setdefault(key, set()).add(float(t.order.lmtPrice))
         return out
 
+    def maybe_recal_sabr(self) -> None:
+        """Recalibrate SABR if the periodic interval has elapsed OR the
+        underlying has moved more than sabr_fast_recal_dollars since the
+        last fit. Called from the main loop, NOT from update_quotes — see
+        the comment in update_quotes for why.
+        """
+        config = self.config
+        state = self.market_data.state
+        if not (config.pricing.sabr_enabled and state.underlying_price > 0):
+            return
+        now = datetime.now()
+        elapsed = 0
+        forward_move = 0.0
+        if self._last_sabr_attempt is not None:
+            elapsed = (now - self._last_sabr_attempt).total_seconds()
+            forward_move = abs(state.underlying_price - self._last_sabr_forward)
+        fast_recal_dollars = float(getattr(
+            config.pricing, "sabr_fast_recal_dollars", 10.0))
+        should_recal = (
+            self._last_sabr_attempt is None
+            or elapsed >= config.pricing.sabr_recalibrate_seconds
+            or forward_move >= fast_recal_dollars
+        )
+        if should_recal:
+            self._last_sabr_attempt = now
+            self._last_sabr_forward = state.underlying_price
+            self.sabr.set_expiry(state.front_month_expiry)
+            self.sabr.calibrate(state.underlying_price, state.options)
+
     def update_quotes(self, portfolio, dirty: Optional[set] = None):
         """Reprice and re-issue quotes.
 
@@ -204,30 +246,11 @@ class QuoteManager:
         state = self.market_data.state
         config = self.config
 
-        # Recalibrate SABR if needed.
-        # Two triggers: (a) periodic interval since last fit, (b) underlying
-        # has moved more than `sabr_fast_recal_dollars` since last fit. The
-        # fast trigger keeps theo fresh during sharp moves where the periodic
-        # interval would lag the market by tens of seconds.
-        if config.pricing.sabr_enabled and state.underlying_price > 0:
-            now = datetime.now()
-            elapsed = 0
-            forward_move = 0.0
-            if self._last_sabr_attempt is not None:
-                elapsed = (now - self._last_sabr_attempt).total_seconds()
-                forward_move = abs(state.underlying_price - self._last_sabr_forward)
-            fast_recal_dollars = float(getattr(
-                config.pricing, "sabr_fast_recal_dollars", 10.0))
-            should_recal = (
-                self._last_sabr_attempt is None
-                or elapsed >= config.pricing.sabr_recalibrate_seconds
-                or forward_move >= fast_recal_dollars
-            )
-            if should_recal:
-                self._last_sabr_attempt = now
-                self._last_sabr_forward = state.underlying_price
-                self.sabr.set_expiry(state.front_month_expiry)
-                self.sabr.calibrate(state.underlying_price, state.options)
+        # SABR recalibration is hoisted out of this hot path and runs from
+        # main.py's loop via maybe_recal_sabr() — calibration takes several ms
+        # and was inflating TTT (tick→placeOrder) by landing between the tick
+        # handler and the per-strike send. Theo for this cycle uses whatever
+        # surface was last calibrated.
 
         quotable = self.market_data.get_quotable_strikes()  # list of (strike, right)
         quotable_set = set(quotable)
@@ -366,26 +389,39 @@ class QuoteManager:
             if not self._is_order_live(trade):
                 self.active_orders.pop(key, None)
             elif trade.order.lmtPrice != price:
-                # Modify in place. We used to throttle this with a per-key
-                # cooldown to dodge Error 103 races, but the real amend-ack
-                # latency (~100ms p50, 460ms p90) far exceeds any client-side
-                # throttle we'd want to set, so the cooldown was protecting
-                # against nothing while adding stale-quote dwell time.
+                # Build a CLEAN LimitOrder for the modify rather than
+                # mutating trade.order in place. ib_insync's wrapper updates
+                # trade.order in place whenever IBKR sends an openOrder
+                # message — including openOrder messages from a TWS client
+                # logging into the same account, which carry extra fields
+                # (volatility, VOL order type defaults, etc.) that contaminate
+                # our trade.order reference. Reusing it then makes IBKR think
+                # we're sending a malformed VOL order (Error 321). Building a
+                # fresh Order with the same orderId means IBKR sees a modify
+                # of our locally-owned fields, decoupled from any TWS-side
+                # mutations.
                 now_ns = time.monotonic_ns()
-                trade.order.lmtPrice = price
-                trade.order.totalQuantity = qty
-                trade.order.goodTillDate = _gtd_string()
-                self._record_send_latency(strike, right, trade.order.orderId)
-                # Stash for amend-RTT capture: record the price we just sent
-                # and the timestamp. _capture_rtt_from_log will record the
-                # latency once it observes the canonical Trade reflect this
-                # new price. Bounded so it can't leak.
-                self._pending_amend[trade.order.orderId] = (price, now_ns)
+                action = "BUY" if side == "BUY" else "SELL"
+                clean_order = LimitOrder(
+                    action=action,
+                    totalQuantity=qty,
+                    lmtPrice=price,
+                    tif="GTD",
+                    goodTillDate=_gtd_string(),
+                    account=self._account,
+                    orderRef=trade.order.orderRef,
+                )
+                clean_order.orderId = order_id  # critical: same id == modify
+                self._record_send_latency(strike, right, order_id)
+                # Stash for amend-RTT capture: keyed by (oid, price) so
+                # back-to-back modifies on the same orderId don't collide.
+                self._pending_amend[(order_id, price)] = now_ns
                 if len(self._pending_amend) > TRACKING_DICT_MAX:
                     self._evict_oldest_half(self._pending_amend)
-                self.ib.placeOrder(trade.contract, trade.order)
+                self.ib.placeOrder(trade.contract, clean_order)
                 return
             else:
+                # GTD refresh path — same clean-rebuild rationale.
                 gtd_str = trade.order.goodTillDate or ""
                 remaining = float("inf")
                 try:
@@ -395,8 +431,18 @@ class QuoteManager:
                 except Exception:
                     remaining = 0
                 if remaining < GTD_REFRESH_THRESHOLD_SECONDS:
-                    trade.order.goodTillDate = _gtd_string()
-                    self.ib.placeOrder(trade.contract, trade.order)
+                    action = "BUY" if side == "BUY" else "SELL"
+                    refresh_order = LimitOrder(
+                        action=action,
+                        totalQuantity=qty,
+                        lmtPrice=price,
+                        tif="GTD",
+                        goodTillDate=_gtd_string(),
+                        account=self._account,
+                        orderRef=trade.order.orderRef,
+                    )
+                    refresh_order.orderId = order_id
+                    self.ib.placeOrder(trade.contract, refresh_order)
                 return
 
         # Place a new order
@@ -449,12 +495,15 @@ class QuoteManager:
             ttt_us = (now_ns - tick_ns) // 1000
             if 0 <= ttt_us < 50_000:
                 self._ttt_us.append(ttt_us)
-        self._pending_rtt[order_id] = now_ns
-        if len(self._pending_rtt) > TRACKING_DICT_MAX:
-            self._evict_oldest_half(self._pending_rtt)
-        # Only record the FIRST place time per order — modifies don't reset
-        # the fill clock, since the same order id can fill at any moment
-        # after the original submission.
+        # Place RTT is measured ONCE per orderId — from the original
+        # placeOrder to the first openOrder ack. Modifies don't overwrite
+        # this; they have their own _pending_amend stash measured per
+        # modify cycle.
+        if order_id not in self._pending_rtt and order_id not in self._rtt_captured_oids:
+            self._pending_rtt[order_id] = now_ns
+            if len(self._pending_rtt) > TRACKING_DICT_MAX:
+                self._evict_oldest_half(self._pending_rtt)
+        # Fill latency clock — also once per orderId.
         if order_id not in self._placed_at_ns:
             self._placed_at_ns[order_id] = now_ns
             if len(self._placed_at_ns) > TRACKING_DICT_MAX:
@@ -469,55 +518,50 @@ class QuoteManager:
             return None
         return (time.monotonic_ns() - placed_ns) / 1_000_000.0
 
-    def _capture_rtt_from_log(self, trade):
-        """Capture place-RTT and amend-RTT for an order.
+    def _on_open_order_ack(self, trade):
+        """Event-driven handler for IBKR's openOrder messages.
 
-        Two distinct measurements:
+        Fired by ib_insync.IB.openOrderEvent whenever IBKR sends an openOrder
+        message in response to a place or modify. Records:
+          - place-RTT: time from the FIRST placeOrder for this orderId to
+            the first openOrder ack we receive (one sample per orderId).
+          - amend-RTT: time from each modify placeOrder to the corresponding
+            ack (one sample per modify cycle).
 
-        place-RTT: time from placeOrder(new) to first observation of the
-            canonical Trade past PendingSubmit. Captured once per orderId.
+        Single-threaded asyncio means our `_pending_amend[oid] = ...` stash
+        in _send_or_update always lands BEFORE this callback fires for the
+        same modify, because the IBKR response can only arrive after the
+        send completes via the writer task and the reader task dispatches.
+        No race.
 
-        amend-RTT: time from placeOrder(modify) to observing the canonical
-            Trade's lmtPrice match the value we just sent. Captured once per
-            (orderId, sent_price) pair so back-to-back amends each get
-            measured independently.
-
-        We deliberately do NOT use trade.log timestamps because the canonical
-        Trade from openTrades/openOrder doesn't preserve the local
-        PendingSubmit timestamp — that only exists on the orphan Trade
-        returned by placeOrder.
+        Direct event dispatch (~sub-ms wrapper overhead) replaces the prior
+        snapshot-quantized polling that was adding 0-250ms uniform noise on
+        top of real ~1ms amend latency.
         """
         try:
             oid = trade.order.orderId
             now_ns = time.monotonic_ns()
 
-            # ── place-RTT ─────────────────────────────────────────
+            # ── place-RTT (one sample per orderId) ────────────────
             if oid not in self._rtt_captured_oids:
-                status = trade.orderStatus.status
-                # PendingSubmit means we haven't been acked yet.
-                if status not in ("PendingSubmit", "ApiPending", "Inactive", ""):
-                    sent_ns = self._pending_rtt.pop(oid, None)
-                    if sent_ns is not None:
-                        rtt_us = (now_ns - sent_ns) // 1000
-                        if 0 <= rtt_us < 5_000_000:
-                            self._rtt_us.append(rtt_us)
-                        self._rtt_captured_oids.add(oid)
-                        # Same bound pattern as the latency tracking dicts.
-                        if len(self._rtt_captured_oids) > TRACKING_DICT_MAX:
-                            self._rtt_captured_oids = set(
-                                list(self._rtt_captured_oids)[-(TRACKING_DICT_MAX // 2):]
-                            )
+                sent_ns = self._pending_rtt.pop(oid, None)
+                if sent_ns is not None:
+                    rtt_us = (now_ns - sent_ns) // 1000
+                    if 0 <= rtt_us < 5_000_000:
+                        self._rtt_us.append(rtt_us)
+                    self._rtt_captured_oids.add(oid)
+                    if len(self._rtt_captured_oids) > TRACKING_DICT_MAX:
+                        self._rtt_captured_oids = set(
+                            list(self._rtt_captured_oids)[-(TRACKING_DICT_MAX // 2):]
+                        )
 
-            # ── amend-RTT ─────────────────────────────────────────
-            pending = self._pending_amend.get(oid)
-            if pending is not None:
-                sent_price, sent_ns = pending
-                # Has the canonical Trade caught up to the price we sent?
-                if abs(trade.order.lmtPrice - sent_price) < 1e-9:
-                    amend_us = (now_ns - sent_ns) // 1000
-                    if 0 <= amend_us < 5_000_000:
-                        self._amend_us.append(amend_us)
-                    self._pending_amend.pop(oid, None)
+            # ── amend-RTT (one sample per modify) ─────────────────
+            # Match on (oid, price) so rapid modifies are independent.
+            sent_ns = self._pending_amend.pop((oid, trade.order.lmtPrice), None)
+            if sent_ns is not None:
+                amend_us = (now_ns - sent_ns) // 1000
+                if 0 <= amend_us < 5_000_000:
+                    self._amend_us.append(amend_us)
         except Exception:
             pass
 
@@ -623,9 +667,6 @@ class QuoteManager:
         for (strike, right, side), order_id in self.active_orders.items():
             trade = self._canonical_trade(order_id)
             if trade is not None:
-                # Opportunistically extract RTT (place + amend) the first time
-                # we observe a post-ack state for this orderId.
-                self._capture_rtt_from_log(trade)
                 quotes[(strike, right, side)] = {
                     "order_id": order_id,
                     "price": trade.order.lmtPrice,

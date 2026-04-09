@@ -315,6 +315,15 @@ async def main():
                 logger.warning("depth rotation error: %s", e)
             last_depth_rotation = now
 
+        # SABR recalibration (hoisted out of update_quotes so it doesn't
+        # land between the tick handler and placeOrder, which was inflating
+        # TTT by several ms per cycle). The method's own timer + forward-move
+        # gates decide whether to actually run.
+        try:
+            quotes.maybe_recal_sabr()
+        except Exception as e:
+            logger.warning("SABR recal error: %s", e)
+
         # ── Event-driven quote phase ─────────────────────────────────
         if risk.killed or weekend_paused:
             await asyncio.sleep(fallback_interval)
