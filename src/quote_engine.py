@@ -902,7 +902,7 @@ class QuoteManager:
         except Exception:
             pass
 
-    def _on_ib_error(self, reqId, errorCode, errorString, contract):
+    def _on_ib_error(self, *args, **kwargs):
         """Handle Error 104 (Cannot modify a filled order) by dropping the
         dead orderId from active_orders / _pending_amend so the next quote
         cycle places a fresh order instead of looping on the same modify.
@@ -913,7 +913,19 @@ class QuoteManager:
         the one error code that, without intervention, generates an unbounded
         retry storm because nothing in the existing code path clears the
         active_orders entry on it.
+
+        Signature-agnostic (*args) for the same reason as the Error 1100
+        handler in connection.py (commit 7de42c8): ib_insync's errorEvent
+        dispatches with different arity across versions — newer releases
+        add an `advancedOrderRejectJson` positional before `contract`. A
+        fixed 4-arg signature silently fails on version mismatch because
+        ib_insync's Event class swallows TypeError from callbacks, so the
+        handler never runs and 104s accumulate uncleared. Parse reqId and
+        errorCode positionally from args[:2].
         """
+        if len(args) < 2:
+            return
+        reqId, errorCode = args[0], args[1]
         if errorCode != 104:
             return
         try:
