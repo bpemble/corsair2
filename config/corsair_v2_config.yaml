@@ -62,6 +62,26 @@ kill_switch:
 quoting:
   tick_size: 0.50             # ETHUSDRR minimum tick ($0.50 per point = $25 per contract)
   penny_jump_ticks: 1         # Number of ticks inside incumbent's spread
+  # Modify dead-band: skip a re-price unless the new target differs from
+  # the resting order by at least this many ticks. Set to 1 (default) for
+  # exact-tick equality only; set to 2+ to suppress 1-tick noise driven by
+  # a flickering BBO. Cuts API message rate at the cost of slightly slower
+  # follow-up to small incumbent moves. Ported from corsair v1's tick-level
+  # short-circuit (order_manager.py:188-205).
+  min_modify_ticks: 2
+  # Outbound API token bucket (IBKR ~50 msg/sec hard throttle). 250 capacity
+  # absorbs short bursts; 250/sec refill caps sustained rate at the throttle.
+  # Modifies and cancels that exceed the bucket are silently dropped — the
+  # next quote cycle re-evaluates. Ported from corsair v1.
+  api_bucket_capacity: 250
+  api_bucket_refill_per_sec: 250
+  # Modify-storm guard (defense vector #14). Cancel-replace instead of
+  # amending if a single orderId exceeds this many modifies/sec.
+  max_modifies_per_sec_per_oid: 5
+  # Hard cap on total resting orders per side across all strikes
+  # (defense vector #11). With ~21 quotable strikes per side this is
+  # ~3x the expected steady-state and gives runaway-bug headroom.
+  max_resting_per_side: 60
   refresh_interval_ms: 1000   # Periodic full-refresh fallback (event-driven path is real-time)
   tick_batch_window_sec: 0.005       # Drain queue for 5ms after first tick (latency floor)
   snapshot_write_interval_sec: 0.25  # Dashboard snapshot cadence (4Hz for near-real-time UI)
@@ -82,6 +102,7 @@ quoting:
 operations:
   weekend_flatten: true
   daily_reset_hour_ct: 17     # 5pm CT — CME daily session end
+  reconcile_interval_sec: 60  # Periodic portfolio↔IBKR position diff (defense vector #9)
 
 pricing:
   sabr_enabled: true
@@ -91,6 +112,10 @@ pricing:
                               # is ~±$1, so the effective real-world edge floor is
                               # still ~$1.5; we're trading some model-confidence
                               # cushion for ~3x the quotable surface area.
+  # Theo-vs-incumbent sanity gate (defense vector #3). If SABR theo and
+  # the incumbent price disagree by more than this many ticks, refuse to
+  # quote — either the incumbent is stale junk or the SABR fit is broken.
+  theo_vs_incumbent_max_ticks: 6.0
   theo_edge_hysteresis_ticks: 1  # Consecutive theo_edge violations required before
                                  # cancelling a resting order. 1 = no hysteresis
                                  # (cancel on first violation, original behavior).

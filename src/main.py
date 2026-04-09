@@ -41,7 +41,88 @@ from .watchdog import (
 
 CT = ZoneInfo("America/Chicago")
 
+# Number of consecutive update_quotes() exceptions before we declare an
+# exception storm and panic-cancel + kill. Each cycle is event-driven so
+# 5 typically corresponds to ~a few seconds of zombie quoting.
+QUOTE_ERROR_STORM_THRESHOLD = 5
+
 logger = logging.getLogger(__name__)
+
+
+def _validate_safety_config(cfg) -> None:
+    """Range-check safety-critical config params at startup.
+
+    Defense vector #4 / #15: a typo in the YAML (e.g. multiplier=100 instead
+    of 50, or margin_kill_pct accidentally below margin_ceiling_pct) silently
+    corrupts every margin/PnL calc downstream. Assert at startup so we crash
+    loudly instead of trading on bad math.
+    """
+    p = cfg.product
+    c = cfg.constraints
+    k = cfg.kill_switch
+    assert p.multiplier == 50, (
+        f"FATAL: product.multiplier must be 50 (CME ETH FOP spec), got {p.multiplier}. "
+        "Wrong multiplier silently corrupts margin and P&L by 2×."
+    )
+    assert 1 <= int(p.quote_size) <= 5, (
+        f"FATAL: product.quote_size out of safe range [1,5], got {p.quote_size}"
+    )
+    assert 50_000 <= c.capital <= 2_000_000, (
+        f"FATAL: constraints.capital out of safe range, got {c.capital}"
+    )
+    assert 0.20 <= c.margin_ceiling_pct <= 0.80, (
+        f"FATAL: margin_ceiling_pct out of safe range, got {c.margin_ceiling_pct}"
+    )
+    assert 0.40 <= k.margin_kill_pct <= 0.95, (
+        f"FATAL: margin_kill_pct out of safe range, got {k.margin_kill_pct}"
+    )
+    assert k.margin_kill_pct > c.margin_ceiling_pct, (
+        f"FATAL: margin_kill_pct ({k.margin_kill_pct}) must be > "
+        f"margin_ceiling_pct ({c.margin_ceiling_pct})"
+    )
+    assert 0.5 <= float(c.delta_ceiling) <= 20.0, (
+        f"FATAL: delta_ceiling out of safe range, got {c.delta_ceiling}"
+    )
+    assert 1.0 <= float(k.delta_kill) <= 50.0, (
+        f"FATAL: delta_kill out of safe range, got {k.delta_kill}"
+    )
+    assert float(k.delta_kill) > float(c.delta_ceiling), (
+        f"FATAL: delta_kill ({k.delta_kill}) must be > delta_ceiling ({c.delta_ceiling})"
+    )
+    logger.info(
+        "✓ Safety config validated: mult=%d cap=$%d ceiling=%.0f%% kill=%.0f%% "
+        "delta_ceil=%.1f delta_kill=%.1f",
+        p.multiplier, c.capital, c.margin_ceiling_pct * 100,
+        k.margin_kill_pct * 100, c.delta_ceiling, k.delta_kill,
+    )
+
+
+def _reconcile_positions(portfolio, ib, account_id: str) -> list:
+    """Compare in-memory portfolio against IBKR's authoritative position view.
+
+    Defense vector #9: catches the 2026-04-08 failure mode where order-status
+    routing was broken and fills accumulated invisibly. Returns a list of
+    (strike, expiry, right) keys that disagree; empty list = clean.
+    """
+    ours: dict = {}
+    for p in portfolio.positions:
+        if p.quantity != 0:
+            ours[(float(p.strike), p.expiry, p.put_call)] = int(p.quantity)
+    theirs: dict = {}
+    for ib_pos in ib.positions(account_id):
+        c = ib_pos.contract
+        if c.symbol != "ETHUSDRR" or c.secType != "FOP":
+            continue
+        if not c.right or c.right not in ("C", "P"):
+            continue
+        qty = int(ib_pos.position)
+        if qty != 0:
+            theirs[(float(c.strike), c.lastTradeDateOrContractMonth, c.right)] = qty
+    mismatches = []
+    for k in set(ours.keys()) | set(theirs.keys()):
+        if ours.get(k, 0) != theirs.get(k, 0):
+            mismatches.append((k, ours.get(k, 0), theirs.get(k, 0)))
+    return mismatches
 
 
 def _session_day(now_utc: datetime, reset_hour_ct: int) -> date:
@@ -65,6 +146,7 @@ async def main():
     config_path = os.environ.get("CORSAIR_CONFIG", "config/corsair_v2_config.yaml")
     config = load_config(config_path)
     setup_logging(config.logging)
+    _validate_safety_config(config)
 
     os.makedirs("data", exist_ok=True)
 
@@ -122,8 +204,16 @@ async def main():
 
     # ── 4. Register disconnect callback ───────────────────────────────
     def on_disconnect():
-        logger.critical("GATEWAY DISCONNECT — cancelling all quotes")
-        quotes.cancel_all_quotes()
+        logger.critical("GATEWAY DISCONNECT — panic cancelling all quotes")
+        # Use panic_cancel (reqGlobalCancel) instead of the per-order
+        # walk: a single message is faster and more likely to reach
+        # IBKR before the socket fully tears down. Worst-case bad-fill
+        # exposure on disconnect is determined by how fast we can get
+        # the book empty here.
+        try:
+            quotes.panic_cancel()
+        except Exception as e:
+            logger.error("panic_cancel on disconnect failed: %s", e)
         # Tag the kill as disconnect-induced so the watchdog can clear it
         # after a successful reconnect.
         risk.kill("Gateway disconnect", source="disconnect")
@@ -243,6 +333,9 @@ async def main():
 
     # ── 7. Main loop ─────────────────────────────────────────────────
     last_greek_refresh = datetime.min
+    last_reconcile = datetime.min
+    reconcile_interval_sec = float(getattr(getattr(config, "operations", object()),
+                                           "reconcile_interval_sec", 60.0))
     last_depth_rotation = datetime.min
     last_full_refresh = _time.monotonic()
     last_snapshot_write = _time.monotonic()
@@ -306,6 +399,28 @@ async def main():
         if (now - last_greek_refresh).total_seconds() >= config.quoting.greek_refresh_seconds:
             risk.check(market_data.state)
             last_greek_refresh = now
+
+        # Periodic position reconciliation (defense vector #9). Catches the
+        # 2026-04-08 silent-fill failure mode where order-status routing
+        # broke and our portfolio diverged from IBKR's authoritative view.
+        # On any disagreement, kill — we cannot trust risk numbers computed
+        # against a stale position book.
+        if (now - last_reconcile).total_seconds() >= reconcile_interval_sec:
+            try:
+                mismatches = _reconcile_positions(portfolio, ib, config.account.account_id)
+                if mismatches:
+                    logger.critical(
+                        "POSITION RECONCILIATION MISMATCH (%d): %s — killing",
+                        len(mismatches), mismatches[:5],
+                    )
+                    try:
+                        quotes.panic_cancel()
+                    except Exception as ee:
+                        logger.error("panic_cancel after reconcile mismatch failed: %s", ee)
+                    risk.kill("Position reconciliation mismatch", source="reconciliation")
+            except Exception as e:
+                logger.warning("Position reconciliation check failed: %s", e)
+            last_reconcile = now
 
         # Rotate depth subscriptions
         if (now - last_depth_rotation).total_seconds() >= depth_rotation_interval:
@@ -392,8 +507,29 @@ async def main():
         if dirty is None or dirty:
             try:
                 quotes.update_quotes(portfolio, dirty=dirty)
+                quotes.consecutive_quote_errors = 0
             except Exception as e:
-                logger.error("Quote update error: %s", e, exc_info=True)
+                quotes.consecutive_quote_errors += 1
+                logger.error("Quote update error (#%d): %s",
+                             quotes.consecutive_quote_errors, e, exc_info=True)
+                # Storm guard: if update_quotes is throwing every cycle
+                # we are zombie-quoting (the AssertionError / Error 103
+                # mode hit on 2026-04-09 morning). Cancel everything via
+                # reqGlobalCancel and kill the engine — the watchdog will
+                # pick up the kill and try a recovery cycle. Threshold is
+                # deliberately low (5 cycles ~ a few seconds) so we don't
+                # bleed bad fills while erroring on every modify.
+                if quotes.consecutive_quote_errors >= QUOTE_ERROR_STORM_THRESHOLD:
+                    logger.critical(
+                        "Quote loop exception storm (#%d) — panic cancelling and killing",
+                        quotes.consecutive_quote_errors,
+                    )
+                    try:
+                        quotes.panic_cancel()
+                    except Exception as ee:
+                        logger.error("panic_cancel after storm failed: %s", ee)
+                    risk.kill("Quote loop exception storm", source="exception_storm")
+                    quotes.consecutive_quote_errors = 0
 
         # Throttled snapshot write for dashboard
         if (mono - last_snapshot_write) >= snapshot_interval:

@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, Optional, Tuple
 
 from ib_insync import IB, LimitOrder
+from ib_insync.order import OrderStatus
+from ib_insync.util import UNSET_DOUBLE, UNSET_INTEGER
 
 from .utils import round_to_tick
 
@@ -35,6 +37,49 @@ TRACKING_DICT_MAX = 4_000
 MIN_ORDER_LIFETIME_MS = 750
 
 logger = logging.getLogger(__name__)
+
+
+class TokenBucket:
+    """Simple monotonic-clock token bucket for outbound API rate limiting.
+
+    Capacity = max burst, refill = sustained rate (tokens/sec). `try_consume`
+    refills lazily on each call (no background task), returns True if a
+    token was available and consumed, False if the bucket was empty.
+
+    Single-asyncio-loop only — no thread safety. That matches our runtime
+    (ib_insync runs everything on one event loop).
+
+    Ported from corsair v1's order_manager.py rate limiter. Used to keep us
+    under IBKR's documented ~50 msg/sec API throttle.
+    """
+
+    __slots__ = ("_capacity", "_refill", "_tokens", "_last_ns", "_drops")
+
+    def __init__(self, capacity: float, refill_per_sec: float):
+        self._capacity = float(capacity)
+        self._refill = float(refill_per_sec)
+        self._tokens = float(capacity)
+        self._last_ns = time.monotonic_ns()
+        self._drops = 0
+
+    def try_consume(self, n: float = 1.0) -> bool:
+        now_ns = time.monotonic_ns()
+        elapsed = (now_ns - self._last_ns) / 1e9
+        self._last_ns = now_ns
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._refill)
+        if self._tokens >= n:
+            self._tokens -= n
+            return True
+        self._drops += 1
+        return False
+
+    @property
+    def drops(self) -> int:
+        return self._drops
+
+    @property
+    def tokens(self) -> float:
+        return self._tokens
 
 OrderKey = Tuple[float, str, str]  # (strike, right, side)
 ORDER_REF_PREFIX = "corsair2"
@@ -92,13 +137,35 @@ class QuoteManager:
         self.constraint_checker = constraint_checker
         self.csv_logger = csv_logger
         self.active_orders: Dict[OrderKey, int] = {}  # {(strike, right, side): order_id}
+        # Consecutive update_quotes() exception counter — incremented by
+        # main.py's catch block, reset on a successful cycle. The
+        # watchdog reads this to detect quote-loop exception storms
+        # (the failure mode where update_quotes throws every cycle but
+        # the snapshot writer still runs, so the docker healthcheck
+        # never trips and the system silently zombies).
+        self.consecutive_quote_errors: int = 0
+        # Outbound API token bucket — see TokenBucket docstring and
+        # config.quoting.api_bucket_*. Wraps placeOrder and cancelOrder
+        # only; reqGlobalCancel (panic path) is intentionally NOT gated
+        # so the kill switch always reaches the wire.
+        bucket_cap = float(getattr(config.quoting, "api_bucket_capacity", 250))
+        bucket_refill = float(getattr(config.quoting, "api_bucket_refill_per_sec", 250))
+        self._tb = TokenBucket(bucket_cap, bucket_refill)
         self._account = config.account.account_id
         self._last_sabr_attempt: Optional[datetime] = None
         self._last_sabr_forward: float = 0.0  # underlying at last calibration
         # Latency rings (microseconds). TTT = tick→placeOrder. RTT = placeOrder→Submitted ack.
         self._ttt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
-        self._rtt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
-        # Amend RTT — separate from _rtt_us because modifies dominate steady
+        # Place RTT: time from placeOrder() send to the first openOrder
+        # echo from IBKR. Measured against openOrderEvent. We verified
+        # 2026-04-09 that openOrder and orderStatus(Submitted/PreSubmitted)
+        # arrive within ~100µs of each other on this paper gateway, so
+        # measuring against openOrder is equivalent to v1's status-based
+        # measurement. (Diagnostic ran a parallel rtt_status_us ring for
+        # several minutes; both rings produced identical numbers and the
+        # parallel ring was removed.)
+        self._place_rtt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
+        # Amend RTT — separate from _place_rtt_us because modifies dominate steady
         # state and they have a different latency profile than fresh places
         # (no order-id allocation, no permission validation, just price update).
         self._amend_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
@@ -130,6 +197,29 @@ class QuoteManager:
         # orderIds we've already extracted RTT for (so we don't double-count
         # on subsequent snapshot passes).
         self._rtt_captured_oids: set = set()
+        # Modify-storm guard (defense vector #14): per-orderId rolling
+        # window of recent modify send timestamps (monotonic ns). When a
+        # single order receives more than max_modifies_per_sec_per_oid
+        # modifies in 1s we cancel-replace instead of issuing more amends.
+        # Without this guard a tight reprice loop on a flickering BBO can
+        # generate Error 103 cascades and zombie the order.
+        self._modify_times_per_oid: Dict[int, Deque[int]] = {}
+        self._max_modifies_per_sec_per_oid = int(getattr(
+            config.quoting, "max_modifies_per_sec_per_oid", 5))
+        # Global per-side resting-order cap (defense vector #11). Hard
+        # ceiling on total active BUY or SELL orders across all strikes.
+        # Belt-and-suspenders against a logic bug that would queue orders
+        # without bound; the rate-limit token bucket bounds messages/sec
+        # but not steady-state outstanding count.
+        self._max_resting_per_side = int(getattr(
+            config.quoting, "max_resting_per_side", 60))
+        # Theo-vs-incumbent sanity gate (defense vector #3): if SABR theo
+        # disagrees with the market mid by more than this many ticks, treat
+        # the incumbent as garbage and refuse to quote against it. Catches
+        # stale incumbents AND broken SABR fits that slipped past the
+        # quality gate.
+        self._theo_vs_mid_max_ticks = float(getattr(
+            config.pricing, "theo_vs_incumbent_max_ticks", 6.0))
         # Per-cycle canonical trade index — populated by _build_our_prices_index
         # at the top of each update_quotes / get_active_quotes call. Reading
         # from this dict is O(1) vs an O(N) walk of openTrades, which matters
@@ -194,6 +284,15 @@ class QuoteManager:
         can do O(1) lookups during the rest of the cycle instead of walking
         openTrades on every call.
         """
+        # Last-write-wins per CLAUDE.md §2: when openTrades() returns
+        # multiple Trades for the same orderId, the canonical (live)
+        # instance is whichever one ib_insync's openOrder callback
+        # constructed most recently — that's the one receiving real
+        # status updates. The placeOrder-return Trade is the orphan and
+        # gets stuck at PendingSubmit. Don't try to be clever with a
+        # clientId tiebreak: on FA logins the canonical entry can carry
+        # clientId=-1 (master adoption), so a "prefer my clientId"
+        # tiebreak would pick exactly the orphan we want to avoid.
         canonical: Dict[int, object] = {}
         for t in self.ib.openTrades():
             ref = getattr(t.order, "orderRef", "") or ""
@@ -318,6 +417,27 @@ class QuoteManager:
             self._log_quote_telemetry(strike, right, side, None, inc_info, theo=theo)
             return
 
+        # Theo-vs-incumbent sanity gate (defense vector #3). If SABR theo
+        # and the incumbent price disagree by more than _theo_vs_mid_max_ticks,
+        # SOMETHING is wrong — either the incumbent is stale/junk or our
+        # SABR fit is broken (despite passing quality checks). Either way
+        # we should not penny-jump it. Refuse to quote and cancel any
+        # resting order on this side. This is the cheapest defense against
+        # bad-theo runaway.
+        if theo is not None:
+            inc_price = inc_info.get("price")
+            if inc_price is not None and inc_price > 0:
+                divergence = abs(theo - inc_price)
+                max_div = self._theo_vs_mid_max_ticks * tick
+                if divergence > max_div:
+                    self._cancel_quote(strike, right, side)
+                    self._log_quote_telemetry(
+                        strike, right, side, None,
+                        {**inc_info, "skip_reason": "theo_vs_inc_divergence"},
+                        theo=theo,
+                    )
+                    return
+
         # Penny-jump the incumbent
         if side == "BUY":
             jumped = inc_info["price"] + (tick * config.quoting.penny_jump_ticks)
@@ -370,12 +490,96 @@ class QuoteManager:
                                       {**inc_info, "skip_reason": reason},
                                       theo=theo)
 
+    def _try_place_order(self, contract, order):
+        """Token-bucketed wrapper around `ib.placeOrder`.
+
+        Returns the Trade on success, None if the bucket was empty (call
+        was dropped). Callers that need to track Trade state must handle
+        the None case — typically by leaving `active_orders` untouched
+        so the next quote cycle re-attempts naturally.
+        """
+        if not self._tb.try_consume(1.0):
+            if self._tb.drops % 100 == 1:
+                logger.warning(
+                    "API token bucket empty — dropping placeOrder (drops=%d, tokens=%.1f)",
+                    self._tb.drops, self._tb.tokens,
+                )
+            return None
+        return self.ib.placeOrder(contract, order)
+
+    def _try_cancel_order(self, order_obj) -> bool:
+        """Token-bucketed wrapper around `ib.cancelOrder`. Returns True if
+        the cancel was sent, False if the bucket was empty (dropped)."""
+        if not self._tb.try_consume(1.0):
+            if self._tb.drops % 100 == 1:
+                logger.warning(
+                    "API token bucket empty — dropping cancelOrder (drops=%d, tokens=%.1f)",
+                    self._tb.drops, self._tb.tokens,
+                )
+            return False
+        try:
+            self.ib.cancelOrder(order_obj)
+            return True
+        except Exception as e:
+            logger.warning("cancelOrder failed: %s", e)
+            return False
+
+    @staticmethod
+    def _strip_contamination_fields(order) -> None:
+        """Reset VOL / delta-neutral / algo / reference fields to ib_insync's
+        UNSET sentinels before a modify-path placeOrder.
+
+        Background: ib_insync's wrapper mutates `trade.order` in place from
+        every `openOrder` callback. If a TWS client logs into the same
+        account, IBKR sends openOrder messages that include populated VOL
+        fields, which contaminate our reference. The next placeOrder then
+        looks like a malformed VOL order to IBKR and we get Error 321
+        ("VOL order requires non-negative floating point value for
+        volatility") plus an AssertionError on the way out.
+
+        The clean-LimitOrder rebuild approach (commits 3a391d2 / fa2fb16)
+        avoided contamination but produced Error 103 cascades on FA logins
+        (see d54e60d for the symptom list). The right answer is in-place
+        mutation — which preserves ib_insync's clientId association in
+        wrapper.trades — combined with explicit field stripping.
+        """
+        # VOL order fields
+        order.volatility = UNSET_DOUBLE
+        order.volatilityType = UNSET_INTEGER
+        order.continuousUpdate = False
+        order.referencePriceType = UNSET_INTEGER
+        # Delta-neutral fields
+        order.deltaNeutralOrderType = ""
+        order.deltaNeutralAuxPrice = UNSET_DOUBLE
+        order.deltaNeutralConId = 0
+        order.deltaNeutralOpenClose = ""
+        order.deltaNeutralShortSale = False
+        order.deltaNeutralShortSaleSlot = 0
+        order.deltaNeutralDesignatedLocation = ""
+        order.deltaNeutralSettlingFirm = ""
+        order.deltaNeutralClearingAccount = ""
+        order.deltaNeutralClearingIntent = ""
+        # Algo / reference contract fields
+        order.algoStrategy = ""
+        order.algoParams = []
+        order.algoId = ""
+        order.referenceContractId = 0
+        order.referenceExchangeId = ""
+        order.referenceChangeAmount = 0.0
+
     def _is_order_live(self, trade) -> bool:
-        """Check if an order is still active (not dead/cancelled/filled)."""
+        """Check if an order is still active (not dead/cancelled/filled).
+
+        Reads `trade.orderStatus.status` directly. The caller is expected
+        to have resolved `trade` via `_canonical_trade` (last-write-wins
+        over openTrades) so this is the same instance ib_insync mutates
+        on every status event. We can't safely indirect through
+        `wrapper.trades[(my_cid, oid)]`: on FA logins the canonical entry
+        is keyed under clientId=-1 (master adoption), not under our own.
+        """
         if trade is None:
             return False
-        status = trade.orderStatus.status
-        return status in ("PendingSubmit", "PreSubmitted", "Submitted")
+        return trade.orderStatus.status not in OrderStatus.DoneStates
 
     def _send_or_update(self, strike: float, right: str, side: str,
                         price: float, qty: int, option):
@@ -394,45 +598,97 @@ class QuoteManager:
             if not self._is_order_live(trade):
                 self.active_orders.pop(key, None)
             elif trade.order.lmtPrice != price:
-                # Build a CLEAN LimitOrder for the modify and preserve the
-                # orderId / permId / clientId from the canonical Trade.
+                # Modify-storm guard (defense vector #14). If we've already
+                # sent more than N modifies on this orderId in the last
+                # second, stop amending and force a cancel-replace on the
+                # next cycle. Bounds blast radius of any future regression
+                # in the modify hot path (the area touched by fa2fb16 /
+                # 3a391d2 / d54e60d) without needing to reason about why
+                # the loop is hot.
+                now_ns_storm = time.monotonic_ns()
+                window = self._modify_times_per_oid.get(order_id)
+                if window is None:
+                    window = deque(maxlen=16)
+                    self._modify_times_per_oid[order_id] = window
+                cutoff = now_ns_storm - 1_000_000_000
+                while window and window[0] < cutoff:
+                    window.popleft()
+                if len(window) >= self._max_modifies_per_sec_per_oid:
+                    logger.warning(
+                        "Modify storm on %s%s %s oid=%d (%d modifies/sec) — "
+                        "cancel-replace",
+                        int(strike), right, side, order_id, len(window),
+                    )
+                    self._cancel_quote(strike, right, side)
+                    self._modify_times_per_oid.pop(order_id, None)
+                    return
+                window.append(now_ns_storm)
+                # Dead-band: skip a re-price unless the new target moves
+                # the resting order by at least min_modify_ticks. This
+                # suppresses 1-tick noise from a flickering BBO without
+                # giving up the leading position. Combined with the
+                # token bucket, this is the main lever cutting our API
+                # message rate below the IBKR throttle. Ported from v1.
+                tick = self.config.quoting.tick_size
+                min_dt = float(getattr(self.config.quoting, "min_modify_ticks", 1))
+                if abs(price - trade.order.lmtPrice) < (min_dt * tick - 1e-9):
+                    return  # within dead-band, leave the resting order alone
+                # Modify-too-soon guard: don't amend an order that IBKR
+                # hasn't acknowledged yet. If we send a modify while the
+                # original placeOrder is still in flight, the server sees
+                # two placeOrders for the same orderId and rejects the
+                # second with Error 103 (Duplicate order id), which then
+                # cascades into a Cancelled order. Same MIN_ORDER_LIFETIME
+                # window we already enforce on cancels (see _cancel_quote).
+                placed_ns = self._placed_at_ns.get(order_id)
+                status = trade.orderStatus.status
+                if (placed_ns is not None
+                        and status in ("PendingSubmit", "ApiPending")
+                        and (time.monotonic_ns() - placed_ns)
+                                < MIN_ORDER_LIFETIME_MS * 1_000_000):
+                    return  # let IBKR ack first; next cycle will retry
+                # In-place mutation of the canonical trade.order. The
+                # clean-LimitOrder rebuild approach (commits 3a391d2 /
+                # fa2fb16) breaks ib_insync's clientId association in
+                # wrapper.trades on FA logins and produces Error 103
+                # (Duplicate order id) cascades — see d54e60d for the
+                # symptom list. In-place mutation preserves the wrapper
+                # state IBKR's modify path needs.
                 #
-                # Why not mutate trade.order in place: ib_insync's wrapper
-                # mutates trade.order from openOrder callbacks and at some
-                # point picks up volatility-related fields that turn the
-                # next placeOrder into a malformed VOL order — IBKR returns
-                # Error 321 ("VOL order requires non-negative floating
-                # point value for volatility"), and our placeOrder hits an
-                # AssertionError on the way out.
-                #
-                # Why preserve permId: IBKR identifies an order across
-                # modifies by permId (its server-side permanent id), not
-                # just orderId. A clean LimitOrder with permId=0 looks
-                # like a NEW order with a duplicate orderId → Error 103.
-                # Copying permId from the canonical Trade tells IBKR "this
-                # is the same order, just with new fields" — modify path,
-                # no duplicate.
+                # Defensively strip VOL / delta-neutral / algo fields
+                # before placeOrder: ib_insync's wrapper picks those up
+                # from openOrder callbacks (e.g. when a TWS client logs
+                # into the same account), which would otherwise turn the
+                # next placeOrder into a malformed VOL order (Error 321).
+                # That's the failure mode the clean-rebuild was trying
+                # to avoid; stripping the contaminated fields gives us
+                # the same protection without losing wrapper routing.
                 now_ns = time.monotonic_ns()
-                action = "BUY" if side == "BUY" else "SELL"
-                clean_order = LimitOrder(
-                    action=action,
-                    totalQuantity=qty,
-                    lmtPrice=price,
-                    tif="GTD",
-                    goodTillDate=_gtd_string(),
-                    account=self._account,
-                    orderRef=trade.order.orderRef,
-                )
-                clean_order.orderId = order_id
-                clean_order.permId = trade.order.permId
-                clean_order.clientId = trade.order.clientId
+                self._strip_contamination_fields(trade.order)
+                trade.order.lmtPrice = price
+                trade.order.totalQuantity = qty
+                trade.order.tif = "GTD"
+                trade.order.goodTillDate = _gtd_string()
                 self._record_send_latency(strike, right, order_id)
-                # Stash for amend-RTT capture: keyed by (oid, price) so
-                # back-to-back modifies on the same orderId don't collide.
                 self._pending_amend[order_id] = now_ns
                 if len(self._pending_amend) > TRACKING_DICT_MAX:
                     self._evict_oldest_half(self._pending_amend)
-                self.ib.placeOrder(trade.contract, clean_order)
+                try:
+                    if self._try_place_order(trade.contract, trade.order) is None:
+                        # Bucket dropped the modify; back out the amend
+                        # tracking entry so the latency ring isn't
+                        # poisoned. The next cycle will retry.
+                        self._pending_amend.pop(order_id, None)
+                except AssertionError:
+                    # Race: wrapper.trades flipped to a DoneState between
+                    # our liveness check and placeOrder. Drop tracking
+                    # and let the next cycle place a fresh order.
+                    logger.warning(
+                        "placeOrder DoneState race on modify %s%s %s oid=%d — dropping",
+                        int(strike), right, side, order_id,
+                    )
+                    self.active_orders.pop(key, None)
+                    self._pending_amend.pop(order_id, None)
                 return
             else:
                 gtd_str = trade.order.goodTillDate or ""
@@ -444,23 +700,34 @@ class QuoteManager:
                 except Exception:
                     remaining = 0
                 if remaining < GTD_REFRESH_THRESHOLD_SECONDS:
-                    # Same clean-rebuild + permId rationale as the modify
-                    # path above.
-                    action = "BUY" if side == "BUY" else "SELL"
-                    refresh_order = LimitOrder(
-                        action=action,
-                        totalQuantity=qty,
-                        lmtPrice=price,
-                        tif="GTD",
-                        goodTillDate=_gtd_string(),
-                        account=self._account,
-                        orderRef=trade.order.orderRef,
-                    )
-                    refresh_order.orderId = order_id
-                    refresh_order.permId = trade.order.permId
-                    refresh_order.clientId = trade.order.clientId
-                    self.ib.placeOrder(trade.contract, refresh_order)
+                    # Same in-place + strip rationale as the modify path.
+                    self._strip_contamination_fields(trade.order)
+                    trade.order.goodTillDate = _gtd_string()
+                    try:
+                        self._try_place_order(trade.contract, trade.order)
+                    except AssertionError:
+                        logger.warning(
+                            "placeOrder DoneState race on GTD refresh %s%s %s oid=%d — dropping",
+                            int(strike), right, side, order_id,
+                        )
+                        self.active_orders.pop(key, None)
                 return
+
+        # Per-side resting-order cap (defense vector #11). Belt-and-
+        # suspenders ceiling on total active orders for this side. The
+        # token bucket rate-limits API messages but not steady-state
+        # outstanding count, so a logic bug that kept calling
+        # update_quotes against an ever-growing strike set could otherwise
+        # accumulate unbounded resting size.
+        resting_on_side = sum(1 for (_s, _r, sd) in self.active_orders if sd == side)
+        if resting_on_side >= self._max_resting_per_side:
+            logger.warning(
+                "Per-side resting cap reached (%s=%d ≥ %d) — refusing new "
+                "order on %s%s",
+                side, resting_on_side, self._max_resting_per_side,
+                int(strike), right,
+            )
+            return
 
         # Place a new order
         action = "BUY" if side == "BUY" else "SELL"
@@ -476,7 +743,9 @@ class QuoteManager:
             account=self._account,
             orderRef=f"{ORDER_REF_PREFIX}_{int(strike)}{right}_{side}",
         )
-        trade = self.ib.placeOrder(contract, order)
+        trade = self._try_place_order(contract, order)
+        if trade is None:
+            return  # bucket dropped — next cycle re-attempts
         self.active_orders[key] = trade.order.orderId
         self._record_send_latency(strike, right, trade.order.orderId)
 
@@ -565,7 +834,7 @@ class QuoteManager:
                 if sent_ns is not None:
                     rtt_us = (now_ns - sent_ns) // 1000
                     if 0 <= rtt_us < 5_000_000:
-                        self._rtt_us.append(rtt_us)
+                        self._place_rtt_us.append(rtt_us)
                     self._rtt_captured_oids.add(oid)
                     if len(self._rtt_captured_oids) > TRACKING_DICT_MAX:
                         self._rtt_captured_oids = set(
@@ -597,7 +866,7 @@ class QuoteManager:
             }
         return {
             "ttt_us": stats(self._ttt_us),
-            "rtt_us": stats(self._rtt_us),
+            "place_rtt_us": stats(self._place_rtt_us),
             "amend_us": stats(self._amend_us),
         }
 
@@ -625,20 +894,60 @@ class QuoteManager:
                     and (time.monotonic_ns() - placed_ns) < MIN_ORDER_LIFETIME_MS * 1_000_000):
                 # Too young to cancel — let IBKR ack first.
                 return
-            self.ib.cancelOrder(trade.order)
+            # Bucket-gated. If the cancel is dropped here we still pop
+            # from active_orders so we don't keep retrying — the next
+            # quote cycle will see no resting order and re-place if it
+            # still wants to. Worst case: a stale order rests until its
+            # GTD expires, which is the same outcome as v1's drop.
+            self._try_cancel_order(trade.order)
         del self.active_orders[key]
 
     def cancel_all_quotes(self):
-        """Kill switch: cancel everything immediately."""
+        """Soft kill switch: cancel everything via per-order cancels.
+
+        For HARD kill switch / panic paths use `panic_cancel()` instead —
+        it sends one `reqGlobalCancel` (server-side cancel-all in one
+        message) and bypasses the token bucket so it always reaches the
+        wire. Use this method only on graceful shutdown / cycle-end.
+        """
         for key, order_id in list(self.active_orders.items()):
             trade = self._canonical_trade(order_id)
             if trade is not None:
-                try:
-                    self.ib.cancelOrder(trade.order)
-                except Exception as e:
-                    logger.warning("Failed to cancel order %d: %s", order_id, e)
+                self._try_cancel_order(trade.order)
         self.active_orders.clear()
         logger.info("All quotes cancelled")
+
+    def panic_cancel(self) -> None:
+        """Fast cancel-all for graceful degradation paths.
+
+        Sends a single `reqGlobalCancel` to IBKR — server-side it nukes
+        every working order on the connection in one message, which is
+        both faster and more reliable than walking active_orders one by
+        one (especially when the API is sluggish, half-disconnected, or
+        the local view is desynced from the book). Then clears local
+        state so a recovery cycle starts from a clean slate.
+
+        Use this for: socket disconnect, exception storms, watchdog
+        fast-cancel tier, anywhere "the book is unsafe and I want it
+        empty *now*". For nominal shutdown / cycle-end cancels keep
+        using cancel_all_quotes / _cancel_quote.
+        """
+        try:
+            self.ib.reqGlobalCancel()
+        except Exception as e:
+            logger.error("PANIC CANCEL: reqGlobalCancel failed: %s", e)
+            # Fall back to per-order cancel walk so we still try to
+            # clear the book even if the global path is broken.
+            try:
+                self.cancel_all_quotes()
+            except Exception as ee:
+                logger.error("PANIC CANCEL: fallback cancel_all_quotes failed: %s", ee)
+        # Clear local state regardless of API success — the next quote
+        # cycle (if any) should not believe it has live orders.
+        n = len(self.active_orders)
+        self.active_orders.clear()
+        self._pending_amend.clear()
+        logger.critical("PANIC CANCEL: reqGlobalCancel sent, cleared %d local order refs", n)
 
     def _log_quote_telemetry(self, strike: float, right: str, side: str,
                              our_price: Optional[float], info: dict,

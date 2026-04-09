@@ -23,10 +23,28 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-WATCHDOG_INTERVAL_SEC = 10.0
-WATCHDOG_STALE_THRESHOLD_SEC = 120.0
+WATCHDOG_INTERVAL_SEC = 2.0
+# Two-tier staleness:
+#   FAST_CANCEL: short threshold; on hit we immediately panic_cancel
+#     (single reqGlobalCancel + clear local state) WITHOUT tearing down
+#     the connection. Goal: minimize bad-fill exposure when the gateway
+#     freezes (TWS login race, IBC restart, transient network blip)
+#     while quotes are still resting on the book.
+#   RECONNECT: longer threshold; on hit we tear down the socket and run
+#     the full reconnect+rediscovery cycle.
+# 30s GTD on each order is a backstop, but 30s of stale quotes during a
+# fast move is a lot of risk — we want detect-to-cancel in single-digit
+# seconds.
+WATCHDOG_FAST_CANCEL_STALE_SEC = 5.0
+WATCHDOG_STALE_THRESHOLD_SEC = 30.0
 WATCHDOG_FAILURES_BEFORE_ACTION = 2
 WATCHDOG_BACKOFF_SEC = (5, 10, 30, 60, 60)  # last value repeats
+# Quote-loop exception storm: if QuoteManager.consecutive_quote_errors
+# exceeds this, the watchdog treats it as an unhealthy state and runs
+# the recovery cycle. main.py also independently panic-cancels at its
+# own (lower) threshold, so by the time the watchdog sees this the book
+# should already be empty — this just kicks the recovery path.
+WATCHDOG_QUOTE_ERROR_STORM_THRESHOLD = 10
 # Hard timeout on discover_and_subscribe. IB Gateway can complete connect()
 # but then hang inside reqSecDefOptParams/reqContractDetails indefinitely.
 DISCOVERY_TIMEOUT_SEC = 30.0
@@ -41,7 +59,7 @@ GATEWAY_CONTAINER_NAME = os.environ.get(
 )
 # Seconds to wait after a container restart before resuming watchdog
 # health checks (gives the gateway JVM time to come up + IBC to log in).
-GATEWAY_RESTART_SETTLE_SEC = 60.0
+GATEWAY_RESTART_SETTLE_SEC = 90.0  # 60s wasn't enough — JVM cold-start of fresh container leaves the gateway not-quite-ready and the immediate next reconnect attempt fails
 
 
 # ── Gateway escalation ────────────────────────────────────────────────
@@ -197,29 +215,59 @@ async def safe_discover_and_subscribe(market_data) -> bool:
         return False
 
 
-def _check_health(ib, market_data) -> tuple:
-    """Return (healthy: bool, reasons: list[str])."""
+def _check_health(ib, market_data, quotes=None) -> tuple:
+    """Return (healthy, fast_cancel_needed, reasons).
+
+    Two tiers:
+      - fast_cancel_needed: feed has been stale for FAST_CANCEL_STALE_SEC
+        but not yet RECONNECT-stale. Triggers a panic_cancel WITHOUT
+        tearing down the connection. Brief blips heal themselves; the
+        book stays empty until ticks resume.
+      - healthy=False: full reconnect tier (longer staleness, hard
+        disconnect, exception storm, etc.).
+    """
     now = datetime.now()
     state = market_data.state
     reasons = []
+    fast_cancel = False
 
     if not ib.isConnected():
         reasons.append("disconnected")
 
+    # "Freshest signal" semantics: take the MIN age across underlying and
+    # any option. If literally nothing has ticked in WATCHDOG_FAST_CANCEL
+    # seconds, the feed is dead. As long as ANY market data is flowing
+    # we're fine — ETH futures don't tick every 5s on a quiet market, so
+    # using max() (every signal must be fresh) produces a false-positive
+    # storm that nukes the book every fast-cancel interval.
+    ages = []
     if state.underlying_price > 0:
-        underlying_age = (now - state.underlying_last_update).total_seconds()
-        if underlying_age >= WATCHDOG_STALE_THRESHOLD_SEC:
-            reasons.append(f"underlying stale {underlying_age:.0f}s")
-
+        ages.append((now - state.underlying_last_update).total_seconds())
     if state.options:
-        any_fresh = any(
-            (now - opt.last_update).total_seconds() < WATCHDOG_STALE_THRESHOLD_SEC
+        ages.append(min(
+            (now - opt.last_update).total_seconds()
             for opt in state.options.values()
-        )
-        if not any_fresh:
-            reasons.append("no fresh option ticks")
+        ))
+    freshest_signal_age = min(ages) if ages else 0.0
 
-    return (len(reasons) == 0, reasons)
+    if freshest_signal_age >= WATCHDOG_STALE_THRESHOLD_SEC:
+        reasons.append(f"no fresh ticks ({freshest_signal_age:.0f}s)")
+
+    # Fast-cancel tier: feed stale but not yet at reconnect threshold.
+    # Only meaningful while still connected — a real disconnect already
+    # routes through the reconnect path below.
+    if (ib.isConnected()
+            and freshest_signal_age >= WATCHDOG_FAST_CANCEL_STALE_SEC
+            and not reasons):
+        fast_cancel = True
+
+    # Quote-loop exception storm — see WATCHDOG_QUOTE_ERROR_STORM_THRESHOLD.
+    if quotes is not None:
+        n_errs = getattr(quotes, "consecutive_quote_errors", 0)
+        if n_errs >= WATCHDOG_QUOTE_ERROR_STORM_THRESHOLD:
+            reasons.append(f"quote loop exception storm ({n_errs})")
+
+    return (len(reasons) == 0, fast_cancel, reasons)
 
 
 async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
@@ -227,6 +275,7 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
     """Periodic health check + auto-recovery. See module docstring."""
     consecutive_failures = 0
     consecutive_recovery_failures = 0
+    consecutive_fast_cancel = 0
     backoff_idx = 0
     ib = conn.ib
 
@@ -234,7 +283,7 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
         try:
             await asyncio.sleep(WATCHDOG_INTERVAL_SEC)
 
-            healthy, reasons = _check_health(ib, market_data)
+            healthy, fast_cancel, reasons = _check_health(ib, market_data, quotes)
             if healthy:
                 if consecutive_failures > 0:
                     logger.info("WATCHDOG: health restored after %d failed cycles",
@@ -242,6 +291,26 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                 consecutive_failures = 0
                 consecutive_recovery_failures = 0
                 backoff_idx = 0
+                # Fast-cancel tier: feed has been stale long enough to be
+                # risky (>5s) but not long enough to warrant a reconnect.
+                # Require 2 consecutive fast-cancel observations so a
+                # single quiet tick gap doesn't nuke the book — and only
+                # actually fire once per stale period (not every cycle
+                # while still stale), so we don't churn place→cancel.
+                if fast_cancel:
+                    consecutive_fast_cancel += 1
+                    if (consecutive_fast_cancel == 2
+                            and quotes.active_orders):
+                        logger.warning(
+                            "WATCHDOG: feed stale ≥%.0fs (2 cycles) — fast panic_cancel (no reconnect)",
+                            WATCHDOG_FAST_CANCEL_STALE_SEC,
+                        )
+                        try:
+                            quotes.panic_cancel()
+                        except Exception as e:
+                            logger.error("WATCHDOG: fast panic_cancel failed: %s", e)
+                else:
+                    consecutive_fast_cancel = 0
                 continue
 
             consecutive_failures += 1
@@ -254,9 +323,9 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
             logger.critical("WATCHDOG: triggering reconnect after %d unhealthy cycles",
                             consecutive_failures)
             try:
-                quotes.cancel_all_quotes()
+                quotes.panic_cancel()
             except Exception as e:
-                logger.warning("WATCHDOG: cancel_all_quotes failed: %s", e)
+                logger.warning("WATCHDOG: panic_cancel failed: %s", e)
             try:
                 await conn.disconnect()
             except Exception as e:
@@ -307,6 +376,9 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                             risk.kill_reason,
                         )
 
+                    # Reset the quote-loop exception counter so a stale
+                    # storm flag doesn't immediately re-trip us next cycle.
+                    quotes.consecutive_quote_errors = 0
                     logger.info("WATCHDOG: recovery complete")
                     recovery_succeeded = True
             except Exception as e:

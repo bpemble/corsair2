@@ -143,16 +143,19 @@ latency_pill = ""
 if snapshot is not None:
     lat = snapshot.get("latency") or {}
     ttt = (lat.get("ttt_us") or {})
-    rtt = (lat.get("rtt_us") or {})
-    amend = (lat.get("amend_us") or {})
+    # RTT here is the steady-state metric: amend (modify→ack) round-trip,
+    # which dominates once a quote is resting. The engine also tracks
+    # place RTT (placeOrder→ack) under `place_rtt_us` for debugging, but
+    # it's not surfaced on the dashboard — places happen rarely (only on
+    # GTD expiry or after a fill) and have a structurally higher floor
+    # because IBKR runs full validation/routing on a fresh order.
+    rtt = (lat.get("amend_us") or {})
     ttt_p50 = _fmt_us(ttt.get("p50")); ttt_p99 = _fmt_us(ttt.get("p99"))
     rtt_p50 = _fmt_us(rtt.get("p50")); rtt_p99 = _fmt_us(rtt.get("p99"))
-    amend_p50 = _fmt_us(amend.get("p50")); amend_p99 = _fmt_us(amend.get("p99"))
     latency_pill = (
-        f'<span class="latency-pill" title="rolling p50/p99 — TTT samples: {ttt.get("n",0)}, RTT samples: {rtt.get("n",0)}, AMEND samples: {amend.get("n",0)}">'
+        f'<span class="latency-pill" title="rolling p50/p99 — TTT (tick→placeOrder) samples: {ttt.get("n",0)}, RTT (modify→ack) samples: {rtt.get("n",0)}">'
         f'<span class="lat-row"><span class="lat-key">TTT</span>{ttt_p50} / {ttt_p99}</span>'
         f'<span class="lat-row"><span class="lat-key">RTT</span>{rtt_p50} / {rtt_p99}</span>'
-        f'<span class="lat-row"><span class="lat-key">AMD</span>{amend_p50} / {amend_p99}</span>'
         f'</span>'
     )
 

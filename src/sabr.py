@@ -8,9 +8,10 @@ Reused from Corsair v1. Provides:
 
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -198,6 +199,34 @@ def implied_forward_from_parity(
     return forwards[len(forwards) // 2]
 
 
+def _worst_strike_residual(
+    result, forward: float, strikes: List[float], market_ivs: List[float], tte: float,
+) -> Tuple[Optional[float], float]:
+    """Find the strike with the largest model-vs-market IV residual.
+
+    Used in the rejection log path to surface which strike is poisoning
+    the fit. A 5-vol residual on a single deep-wing strike is invisible
+    from the aggregate RMSE, but it can pull the entire surface — knowing
+    the offending strike lets us decide whether the issue is data quality
+    (a stale tick) or genuine smile dislocation.
+    """
+    try:
+        worst_strike = None
+        worst_resid = 0.0
+        for k, mkt_iv in zip(strikes, market_ivs):
+            model_iv = sabr_implied_vol(
+                forward, k, tte,
+                result.alpha, result.beta, result.rho, result.nu,
+            )
+            resid = abs(model_iv - mkt_iv)
+            if resid > worst_resid:
+                worst_resid = resid
+                worst_strike = k
+        return worst_strike, worst_resid
+    except Exception:
+        return None, 0.0
+
+
 def _sabr_quality_ok(result, min_strikes: int) -> Tuple[bool, str]:
     """Structural sanity check on a SABR fit result. Returns (ok, reason).
 
@@ -241,6 +270,12 @@ class SABRSurface:
         # 100ms TTL — quote loop ticks faster than this so we hit warm cache often
         self._theo_cache: dict = {}
         self._theo_cache_ttl_sec: float = 0.1
+        # Rolling RMSE history for drift detection. We log a single RMSE
+        # number per calibration today, but a slow walk from 0.007 → 0.020
+        # → 0.028 sits comfortably under the 0.03 hard gate the whole time
+        # and we'd never get a warning. The deque + median check below
+        # turns the existing single-number log into a real drift detector.
+        self._rmse_history: Deque[float] = deque(maxlen=20)
 
     def set_expiry(self, expiry: str):
         """Set the front month expiry for TTE calculations."""
@@ -309,11 +344,38 @@ class SABRSurface:
             min_strikes = int(getattr(self.config.pricing, "sabr_min_strikes", 8))
             quality_ok, quality_reason = _sabr_quality_ok(result, min_strikes)
             if not quality_ok:
+                # On rejection, surface the worst per-strike residual so
+                # the operator can see WHICH strike is poisoning the fit
+                # — a single deep-wing strike with a 5-vol residual is
+                # invisible from the aggregate RMSE alone.
+                worst_strike, worst_resid = _worst_strike_residual(
+                    result, forward, strikes, ivs, tte,
+                )
+                worst_str = (
+                    f" worst_strike={worst_strike:.0f} resid={worst_resid:.4f}"
+                    if worst_strike is not None else ""
+                )
                 logger.warning(
                     "SABR fit rejected (%s): alpha=%.4f rho=%.3f nu=%.3f "
-                    "RMSE=%.4f n=%d — keeping previous parameters",
+                    "RMSE=%.4f n=%d%s — keeping previous parameters",
                     quality_reason, result.alpha, result.rho, result.nu,
-                    result.rmse, result.n_points,
+                    result.rmse, result.n_points, worst_str,
+                )
+                return
+
+            # Relative quality gate: only accept a new fit if its RMSE is
+            # not much worse than the prior fit. Without this, a fit with
+            # RMSE=0.029 (just under the 0.03 hard ceiling) would replace
+            # a fit with RMSE=0.007, and we'd silently start pricing on a
+            # 4× worse surface. The 1.5× headroom permits legitimate vol
+            # regime shifts but blocks slow degradation.
+            if (self.params is not None
+                    and result.rmse > max(self.params.rmse * 1.5, 0.005)):
+                logger.warning(
+                    "SABR fit rejected (rmse_regression %.4f > 1.5x prior %.4f): "
+                    "alpha=%.4f rho=%.3f nu=%.3f n=%d — keeping previous parameters",
+                    result.rmse, self.params.rmse,
+                    result.alpha, result.rho, result.nu, result.n_points,
                 )
                 return
 
@@ -323,6 +385,22 @@ class SABRSurface:
             self.params = result
             self.last_calibration = datetime.now()
             self._theo_cache.clear()  # parameters changed; flush stale theo
+
+            # Drift detection: track the last 20 accepted RMSEs and warn
+            # if the current sample is materially worse than the rolling
+            # median. Catches slow degradation (0.007 → 0.020 → 0.028)
+            # before it hits the absolute 0.03 ceiling.
+            self._rmse_history.append(result.rmse)
+            if len(self._rmse_history) >= 5:
+                median_rmse = float(np.median(self._rmse_history))
+                if (median_rmse > 0
+                        and result.rmse > max(median_rmse * 1.5, 0.005)):
+                    logger.warning(
+                        "SABR RMSE drift: current=%.4f vs rolling median=%.4f "
+                        "(%.1fx) — surface may be destabilizing",
+                        result.rmse, median_rmse, result.rmse / median_rmse,
+                    )
+
             logger.info(
                 "SABR calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
                 result.alpha, result.rho, result.nu, result.rmse, result.n_points,

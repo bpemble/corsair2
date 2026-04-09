@@ -47,11 +47,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:rw
     healthcheck:
       # Snapshot file is written by the main loop every ~1s in steady state.
-      # If it's >30s old the loop is hung even if the process is still alive
+      # If it's >60s old the loop is hung even if the process is still alive
       # — that's the failure mode log-mtime healthchecks miss because the
       # ib_insync stderr keeps the log file fresh during silent hangs.
       # Triggers `restart: unless-stopped` after 3 consecutive failures.
-      test: ["CMD-SHELL", "test -f /app/data/chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/chain_snapshot.json) )) -lt 30"]
+      #
+      # Threshold is 60s (not 30s) to decouple it from the 30s discovery
+      # timeout in src/watchdog.py — at 30s a discovery that legitimately
+      # takes 31s would get the container nuked mid-recovery, even though
+      # the watchdog would have succeeded a second later.
+      test: ["CMD-SHELL", "test -f /app/data/chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/chain_snapshot.json) )) -lt 60"]
       interval: 15s
       timeout: 5s
       retries: 3

@@ -88,7 +88,9 @@ CUSTOM_CSS = f"""
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        padding: 6px 12px;
+        /* Vertical padding bumped to match the two-row latency-pill below
+           — both pills sit in the same header row and need to line up. */
+        padding: 11px 12px;
         border-radius: 8px;
         background: rgba(255,255,255,0.025);
         border: 1px solid {BG_CARD_BORDER};
