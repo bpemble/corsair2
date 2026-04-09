@@ -128,6 +128,7 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     # nonsensical "compared to zero mark" number.
     mult = config.product.multiplier
     positions_detail = []
+    options_unrealized_total = 0.0
     for p in portfolio.positions:
         opt = state.get_option(p.strike, p.expiry, p.put_call)
         if opt and opt.bid > 0 and opt.ask > 0:
@@ -137,6 +138,7 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         else:
             mark = p.avg_fill_price  # no live mark yet; show zero P&L
         unrealized = (mark - p.avg_fill_price) * p.quantity * mult
+        options_unrealized_total += unrealized
         positions_detail.append({
             "strike": p.strike,
             "expiry": p.expiry,
@@ -169,12 +171,33 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     _margin_calls = margin.get_current_margin("C")
     _margin_puts = margin.get_current_margin("P")
 
+    # Account block: header Unrealized P&L is rewritten to be the sum of
+    # the options-only positions table (so the header and the table agree —
+    # IBKR's account-level UnrealizedPnL also folds in any non-options
+    # holdings, which don't appear in the table). Realized P&L is sourced
+    # from portfolio.realized_pnl_persisted so it survives a process restart;
+    # we update that field here from IBKR whenever IBKR returns a non-zero
+    # value (zero usually means the account-values stream hasn't repopulated
+    # yet after a reconnect).
+    account = _read_account_state(ib, account_id)
+    # Sum the SAME whole-dollar-rounded values the per-row table displays,
+    # not the unrounded mid-precision sum, so the header and the visual sum
+    # of the rows agree to the dollar. (Sum-of-rounds ≠ round-of-sum; the
+    # difference is sub-dollar but visible in the `:,.0f` formatting.)
+    account["unrealized_pnl"] = float(
+        sum(round(d["unrealized_pnl"]) for d in positions_detail)
+    )
+    _ibkr_realized = account.get("realized_pnl", 0.0)
+    if _ibkr_realized != 0.0:
+        portfolio.realized_pnl_persisted = _ibkr_realized
+    account["realized_pnl"] = round(portfolio.realized_pnl_persisted, 2)
+
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "underlying_price": state.underlying_price,
         "atm_strike": state.atm_strike,
         "front_month_expiry": state.front_month_expiry,
-        "account": _read_account_state(ib, account_id),
+        "account": account,
         "latency": quotes.get_latency_snapshot(),
         "limits": limits,
         "portfolio": {

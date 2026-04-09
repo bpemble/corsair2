@@ -235,6 +235,17 @@ class QuoteManager:
         # adding 0-250ms uniform quantization noise (4Hz polling cadence) on
         # top of real ~1ms amend latency, making the metric meaningless.
         self.ib.openOrderEvent += self._on_open_order_ack
+        # Error 104 ("Cannot modify a filled order") cleanup. ib_insync
+        # surfaces every TWS error via errorEvent(reqId, code, msg, contract).
+        # Without this hook, after a fill races our modify the active_orders
+        # entry keeps pointing at the dead orderId and every subsequent quote
+        # cycle re-attempts the same modify, which IBKR rejects with another
+        # 104 — generating tens of thousands of log lines per session and
+        # leaving stale state for that strike/right/side until something else
+        # cleans it. Drop the entry on the first 104 so the next cycle places
+        # a fresh order. Counter is for telemetry / sanity-check.
+        self._error_104_count: int = 0
+        self.ib.errorEvent += self._on_ib_error
 
     def _canonical_trade(self, order_id: int):
         """Return the canonical (latest) Trade object for an orderId, or
@@ -417,23 +428,34 @@ class QuoteManager:
             self._log_quote_telemetry(strike, right, side, None, inc_info, theo=theo)
             return
 
-        # Theo-vs-incumbent sanity gate (defense vector #3). If SABR theo
-        # and the incumbent price disagree by more than _theo_vs_mid_max_ticks,
-        # SOMETHING is wrong — either the incumbent is stale/junk or our
-        # SABR fit is broken (despite passing quality checks). Either way
-        # we should not penny-jump it. Refuse to quote and cancel any
-        # resting order on this side. This is the cheapest defense against
-        # bad-theo runaway.
+        # Theo-vs-mid sanity gate (defense vector #3). If SABR theo and the
+        # market mid disagree by more than _theo_vs_mid_max_ticks, SOMETHING
+        # is wrong — either the market is stale/junk or our SABR fit is
+        # broken (despite passing quality checks). Either way we should not
+        # penny-jump it. Refuse to quote and cancel any resting order on
+        # this side. This is the cheapest defense against bad-theo runaway.
+        #
+        # Note: this used to compare theo against the per-side incumbent
+        # (inc_price), which had a subtle but expensive bug — on a wide
+        # market (e.g. $5+ spread on ETH wing strikes), a correctly-fit
+        # theo near the mid would systematically fail the gate on whichever
+        # side was further from theo, while the closer side passed. The
+        # symptom was every wide-market OTM strike quoting one side only
+        # (typically bid for OTM calls and puts), which roughly halved the
+        # active quoting surface for no real safety benefit. The variable
+        # name `_theo_vs_mid_max_ticks` documents the original intent. Now
+        # the comparison actually uses mid.
         if theo is not None:
-            inc_price = inc_info.get("price")
-            if inc_price is not None and inc_price > 0:
-                divergence = abs(theo - inc_price)
+            mkt_bid, mkt_ask = self.market_data.get_clean_bbo(strike, right)
+            if mkt_bid > 0 and mkt_ask > 0:
+                mid = (mkt_bid + mkt_ask) / 2.0
+                divergence = abs(theo - mid)
                 max_div = self._theo_vs_mid_max_ticks * tick
                 if divergence > max_div:
                     self._cancel_quote(strike, right, side)
                     self._log_quote_telemetry(
                         strike, right, side, None,
-                        {**inc_info, "skip_reason": "theo_vs_inc_divergence"},
+                        {**inc_info, "skip_reason": "theo_vs_mid_divergence"},
                         theo=theo,
                     )
                     return
@@ -597,6 +619,16 @@ class QuoteManager:
 
             if not self._is_order_live(trade):
                 self.active_orders.pop(key, None)
+            elif getattr(trade.orderStatus, "filled", 0) > 0:
+                # Defense vector: orderStatus.filled increments on every
+                # partial/full fill BEFORE the status field necessarily
+                # transitions to "Filled" and BEFORE execDetails has
+                # propagated to fill_handler. _is_order_live alone misses
+                # this race window because it only checks the status string.
+                # Treating any non-zero filled count as terminal here is
+                # what stopped the Error 104 storm.
+                self.active_orders.pop(key, None)
+                self._pending_amend.pop(order_id, None)
             elif trade.order.lmtPrice != price:
                 # Modify-storm guard (defense vector #14). If we've already
                 # sent more than N modifies on this orderId in the last
@@ -869,6 +901,43 @@ class QuoteManager:
                     self._amend_us.append(amend_us)
         except Exception:
             pass
+
+    def _on_ib_error(self, reqId, errorCode, errorString, contract):
+        """Handle Error 104 (Cannot modify a filled order) by dropping the
+        dead orderId from active_orders / _pending_amend so the next quote
+        cycle places a fresh order instead of looping on the same modify.
+
+        Other error codes are handled (or ignored) elsewhere — ib_insync's
+        wrapper logs them and the per-event paths (orderStatus, openOrder)
+        handle the state transitions. We only special-case 104 because it's
+        the one error code that, without intervention, generates an unbounded
+        retry storm because nothing in the existing code path clears the
+        active_orders entry on it.
+        """
+        if errorCode != 104:
+            return
+        try:
+            self._error_104_count += 1
+            # active_orders is keyed by (strike, right, side); the value is
+            # the orderId. Reverse-lookup is O(N) but N <= ~100, so this is
+            # cheap and only fires on actual races.
+            dead_key = None
+            for key, oid in self.active_orders.items():
+                if oid == reqId:
+                    dead_key = key
+                    break
+            if dead_key is not None:
+                self.active_orders.pop(dead_key, None)
+            self._pending_amend.pop(reqId, None)
+            # Log the first few and then every 100th to keep the noise
+            # bounded but still surface the rate.
+            if self._error_104_count <= 5 or self._error_104_count % 100 == 0:
+                logger.info(
+                    "Error 104 cleanup: oid=%d key=%s (total 104s seen: %d)",
+                    reqId, dead_key, self._error_104_count,
+                )
+        except Exception as e:
+            logger.warning("_on_ib_error cleanup failed: %s", e)
 
     def get_latency_snapshot(self) -> dict:
         """Return rolling p50/p90/p99 in microseconds for TTT, RTT, and amend."""

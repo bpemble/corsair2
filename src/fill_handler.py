@@ -5,7 +5,9 @@ and triggers immediate quote re-evaluation.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+
+from ib_insync import ExecutionFilter
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +59,17 @@ class FillHandler:
 
         # Capture place→fill latency BEFORE recording the fill (the order id
         # mapping in QuoteManager survives until we explicitly pop it).
+        # Replayed fills (from reqExecutionsAsync after a restart) pass
+        # trade=None — for those, latency capture is meaningless because the
+        # placeOrder happened in a prior process lifetime.
         fill_latency_ms = None
-        try:
-            order_id = trade.order.orderId
-            if hasattr(self.quotes, "fill_latency_ms"):
-                fill_latency_ms = self.quotes.fill_latency_ms(order_id)
-        except Exception:
-            pass
+        if trade is not None:
+            try:
+                order_id = trade.order.orderId
+                if hasattr(self.quotes, "fill_latency_ms"):
+                    fill_latency_ms = self.quotes.fill_latency_ms(order_id)
+            except Exception:
+                pass
 
         # Compute realized edge two ways:
         #   theo-based: signed distance from our SABR theo (model PnL view)
@@ -71,35 +77,58 @@ class FillHandler:
         # Theo is the headline metric; mid is logged as a reality check.
         # Both are in dollars (multiplier applied) and signed — negatives mean
         # we paid above theo / above mid (bought) or sold below.
+        #
+        # IMPORTANT: both metrics depend on theo/mid AT THE MOMENT OF FILL.
+        # For LIVE fills, "now" ≈ fill time, so reading the current values
+        # is correct. For REPLAYED fills (trade is None — backfilled by
+        # replay_missed_executions hours after the original execution), the
+        # current theo/mid have moved and reading them produces meaningless
+        # numbers. Skip spread capture entirely on the replay path so we
+        # don't pollute the running totals with a fake number; fills_today
+        # still increments so the count is right, only the per-fill edge is
+        # absent. Users can backfill manually from fills.csv if needed.
         mult = self.portfolio._multiplier
         sign = 1 if quantity > 0 else -1  # buy: want fill < ref; sell: want fill > ref
 
         spread_captured_theo = 0.0
-        try:
-            theo = self.quotes.sabr.get_theo(strike, put_call)
-            if theo and theo > 0:
-                edge_theo = (theo - fill_price) * sign
-                spread_captured_theo = edge_theo * mult * abs(quantity)
-        except Exception:
-            pass
-
         spread_captured_mid = 0.0
-        try:
-            bid, ask = self.market_data.get_clean_bbo(strike, put_call)
-            if bid > 0 and ask > 0 and ask > bid:
-                mid = (bid + ask) / 2.0
-                edge_mid = (mid - fill_price) * sign
-                spread_captured_mid = edge_mid * mult * abs(quantity)
-        except Exception:
-            pass
+        if trade is not None:
+            try:
+                theo = self.quotes.sabr.get_theo(strike, put_call)
+                if theo and theo > 0:
+                    edge_theo = (theo - fill_price) * sign
+                    spread_captured_theo = edge_theo * mult * abs(quantity)
+            except Exception:
+                pass
 
-        # Record the fill
-        self.portfolio.add_fill(
-            strike=strike, expiry=expiry, put_call=put_call,
-            quantity=quantity, fill_price=fill_price,
-            spread_captured=spread_captured_theo,
-            spread_captured_mid=spread_captured_mid,
-        )
+            try:
+                bid, ask = self.market_data.get_clean_bbo(strike, put_call)
+                if bid > 0 and ask > 0 and ask > bid:
+                    mid = (bid + ask) / 2.0
+                    edge_mid = (mid - fill_price) * sign
+                    spread_captured_mid = edge_mid * mult * abs(quantity)
+            except Exception:
+                pass
+
+        # Record the fill. For LIVE fills (trade is not None) we call
+        # add_fill which both modifies the position book AND increments
+        # analytics counters. For REPLAYED fills (trade is None, called from
+        # replay_missed_executions) we ONLY increment analytics counters
+        # because the position book was already brought up to the post-fill
+        # state by seed_from_ibkr at startup. Calling add_fill on a replayed
+        # fill double-counts the position effect (e.g. -1 short becomes -2)
+        # and the reconciler immediately kills on the resulting mismatch.
+        if trade is not None:
+            self.portfolio.add_fill(
+                strike=strike, expiry=expiry, put_call=put_call,
+                quantity=quantity, fill_price=fill_price,
+                spread_captured=spread_captured_theo,
+                spread_captured_mid=spread_captured_mid,
+            )
+        else:
+            self.portfolio._record_fill(
+                quantity, spread_captured_theo, spread_captured_mid,
+            )
         # Invalidate the synthetic SPAN portfolio cache — the position book
         # just changed, so the cached aggregate is stale.
         if hasattr(self.margin, "invalidate_portfolio"):
@@ -140,5 +169,73 @@ class FillHandler:
             fill_latency_ms=fill_latency_ms,
         )
 
-        # Immediately re-evaluate all quotes (fill changes portfolio state)
-        self.quotes.update_quotes(self.portfolio)
+        # Immediately re-evaluate all quotes (fill changes portfolio state).
+        # For replayed fills (trade=None), the quote loop is not yet running
+        # — skip this to avoid running update_quotes before the main loop has
+        # initialized the per-cycle canonical trade index.
+        if trade is not None:
+            self.quotes.update_quotes(self.portfolio)
+
+    async def replay_missed_executions(self, session_start_utc: datetime) -> int:
+        """Backfill any executions that happened while we were disconnected.
+
+        ib_insync's `execDetailsEvent` only fires for executions that occur
+        WHILE WE'RE CONNECTED — IBKR does not replay missed events on
+        reconnect. Without this method, every fill that lands during a
+        bootstrap window, restart, or watchdog reconnect is silently invisible
+        to fill_handler: the position appears (because seed_from_ibkr pulls
+        the post-fill book) but `fills_today`, `spread_capture_today`, and
+        the realized-P&L attribution are all dark for that fill.
+
+        Called once after FillHandler construction (in main.py) and after
+        each successful watchdog reseed (in watchdog.py). Dedup by execId
+        against `_seen_exec_ids`, which is itself persisted across restarts
+        via daily_state.json — so calling this multiple times within a
+        session is safe and idempotent.
+
+        Returns the number of new fills replayed (for logging).
+        """
+        try:
+            fills = await self.ib.reqExecutionsAsync(ExecutionFilter())
+        except Exception as e:
+            logger.warning("replay_missed_executions: reqExecutions failed: %s", e)
+            return 0
+
+        replayed = 0
+        for fill in fills:
+            try:
+                # Filter to current CME session only. ib_insync surfaces the
+                # execution time as a tz-aware datetime in UTC.
+                exec_time = getattr(fill.execution, "time", None)
+                if exec_time is None:
+                    continue
+                if exec_time.tzinfo is None:
+                    exec_time = exec_time.replace(tzinfo=timezone.utc)
+                if exec_time < session_start_utc:
+                    continue
+                # Skip if we already saw this execId in a prior process or
+                # via the live event path in the current process.
+                if fill.execution.execId in self._seen_exec_ids:
+                    continue
+                self._on_exec_details(None, fill)
+                replayed += 1
+            except Exception as e:
+                logger.warning("replay_missed_executions: skip one fill: %s", e)
+        if replayed:
+            logger.warning(
+                "replay_missed_executions: backfilled %d missed fill(s) "
+                "from current session — these would otherwise be invisible "
+                "to fills_today / spread_capture / daily_pnl",
+                replayed,
+            )
+        else:
+            logger.info(
+                "replay_missed_executions: 0 missed fills (checked %d "
+                "executions in current session window)",
+                sum(1 for f in fills
+                    if getattr(f.execution, "time", None)
+                    and (f.execution.time.replace(tzinfo=timezone.utc)
+                         if f.execution.time.tzinfo is None
+                         else f.execution.time) >= session_start_utc),
+            )
+        return replayed

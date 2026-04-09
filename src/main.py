@@ -30,6 +30,7 @@ from .risk_monitor import RiskMonitor
 from .logging_utils import CSVLogger
 from .weekend import friday_shutdown, monday_startup
 from .snapshot import write_chain_snapshot
+from . import daily_state
 from .watchdog import (
     safe_discover_and_subscribe,
     watchdog_loop,
@@ -131,6 +132,23 @@ def _session_day(now_utc: datetime, reset_hour_ct: int) -> date:
     if now_ct.hour >= reset_hour_ct:
         return (now_ct + timedelta(days=1)).date()
     return now_ct.date()
+
+
+def _session_start_utc(now_utc: datetime, reset_hour_ct: int) -> datetime:
+    """Return the wall-clock start of the current CME session as a UTC datetime.
+
+    The CME session that contains `now_utc` runs from reset_hour_ct CT on
+    one day to reset_hour_ct CT on the next. This is the lower bound for
+    the replay-missed-executions filter.
+    """
+    now_ct = now_utc.astimezone(CT)
+    if now_ct.hour >= reset_hour_ct:
+        start_ct = now_ct.replace(hour=reset_hour_ct, minute=0, second=0, microsecond=0)
+    else:
+        start_ct = (now_ct - timedelta(days=1)).replace(
+            hour=reset_hour_ct, minute=0, second=0, microsecond=0,
+        )
+    return start_ct.astimezone(timezone.utc)
 
 
 
@@ -319,6 +337,15 @@ async def main():
     # Set SABR expiry
     sabr.set_expiry(market_data.state.front_month_expiry)
 
+    # Force-subscribe market data for any seeded position whose strike sits
+    # outside the initial ATM±N discovery window. Without this, off-window
+    # positions get delta=theta=0 in refresh_greeks() forever and silently
+    # understate header risk.
+    try:
+        await market_data.ensure_position_subscribed(portfolio.positions)
+    except Exception as e:
+        logger.warning("ensure_position_subscribed at startup failed: %s", e)
+
 
     # ── 6. Handle graceful shutdown ───────────────────────────────────
     shutdown_event = asyncio.Event()
@@ -341,6 +368,7 @@ async def main():
     last_snapshot_write = _time.monotonic()
     depth_rotation_interval = float(getattr(config.quoting, "depth_rotation_interval_sec", 2.0))
     last_session_day: Optional[date] = None
+    last_daily_state_save = 0.0
     last_friday_shutdown_date: Optional[date] = None
     weekend_paused = False
     reset_hour_ct = int(getattr(getattr(config, "operations", object()),
@@ -350,6 +378,45 @@ async def main():
     fallback_interval = config.quoting.refresh_interval_ms / 1000.0
     batch_window_sec = float(getattr(config.quoting, "tick_batch_window_sec", 0.005))
     snapshot_interval = float(getattr(config.quoting, "snapshot_write_interval_sec", 1.0))
+
+    # Restore daily counters from disk if the persisted session day still
+    # matches the current CME session. This is what makes Spread Capture and
+    # Realized P&L survive a `docker compose up -d --build corsair`.
+    _startup_session_day = _session_day(datetime.now(tz=timezone.utc), reset_hour_ct)
+    _persisted = daily_state.load(_startup_session_day)
+    if _persisted is not None:
+        portfolio.fills_today = int(_persisted.get("fills_today", 0))
+        portfolio.spread_capture_today = float(_persisted.get("spread_capture_today", 0.0))
+        portfolio.spread_capture_mid_today = float(_persisted.get("spread_capture_mid_today", 0.0))
+        portfolio.daily_pnl = float(_persisted.get("daily_pnl", 0.0))
+        portfolio.realized_pnl_persisted = float(_persisted.get("realized_pnl", 0.0))
+        # Restore the dedup set so the replay path doesn't double-count
+        # fills already attributed in a prior process within the same session.
+        for eid in _persisted.get("seen_exec_ids", []):
+            fills._seen_exec_ids.add(eid)
+        # Suppress the first-iteration reset_daily() that would otherwise
+        # wipe what we just restored.
+        last_session_day = _startup_session_day
+        logger.info(
+            "daily_state restored: fills=%d spread=$%.2f spread_mid=$%.2f "
+            "realized=$%.2f seen_execs=%d (session %s)",
+            portfolio.fills_today, portfolio.spread_capture_today,
+            portfolio.spread_capture_mid_today, portfolio.realized_pnl_persisted,
+            len(fills._seen_exec_ids), _startup_session_day,
+        )
+
+    # Replay any executions that happened during a downtime window in the
+    # current CME session. Without this, every fill that lands while
+    # corsair is restarting / reconnecting is silently invisible to
+    # fill_handler — the position appears (via seed_from_ibkr) but
+    # fills_today / spread_capture / daily_pnl never reflect it. This is
+    # what was happening before 2026-04-09 ~17:00: ~95k Error 104s and a
+    # session of fills with fills_today=0.
+    _session_start = _session_start_utc(datetime.now(tz=timezone.utc), reset_hour_ct)
+    try:
+        await fills.replay_missed_executions(_session_start)
+    except Exception as e:
+        logger.warning("replay_missed_executions at startup failed: %s", e)
 
     logger.info(
         "Entering event-driven quote loop (batch=%.0fms, fallback=%.1fs, snapshot=%.1fs)",
@@ -361,7 +428,11 @@ async def main():
     # lifetime of the main loop and is cancelled on shutdown.
     watchdog_task = asyncio.create_task(
         watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
-                      sabr, config.account.account_id, shutdown_event),
+                      sabr, config.account.account_id, shutdown_event,
+                      fills=fills,
+                      session_start_fn=lambda: _session_start_utc(
+                          datetime.now(tz=timezone.utc), reset_hour_ct
+                      )),
         name="watchdog",
     )
 
@@ -374,6 +445,7 @@ async def main():
         # Daily reset at 5pm CT (CME daily session boundary)
         if last_session_day != session_day:
             portfolio.reset_daily()
+            daily_state.clear()
             last_session_day = session_day
             logger.info("New CME session day: %s (5pm CT rollover)", session_day)
             for expiry in _get_todays_expiries(portfolio.positions):
@@ -539,6 +611,23 @@ async def main():
             except Exception as e:
                 logger.warning("Snapshot write error: %s", e)
             last_snapshot_write = mono
+
+        # Persist daily counters at most once per second so they survive
+        # a process restart within the same CME session day.
+        if (mono - last_daily_state_save) >= 1.0:
+            try:
+                daily_state.save(
+                    session_day,
+                    fills_today=portfolio.fills_today,
+                    spread_capture_today=portfolio.spread_capture_today,
+                    spread_capture_mid_today=portfolio.spread_capture_mid_today,
+                    daily_pnl=portfolio.daily_pnl,
+                    realized_pnl=portfolio.realized_pnl_persisted,
+                    seen_exec_ids=list(fills._seen_exec_ids),
+                )
+            except Exception as e:
+                logger.warning("daily_state save error: %s", e)
+            last_daily_state_save = mono
 
     # ── 8. Shutdown ──────────────────────────────────────────────────
     logger.info("Shutting down...")

@@ -364,6 +364,68 @@ class MarketDataManager:
 
         logger.info("Subscribed to %d option contracts", len(self._option_tickers))
 
+    async def ensure_position_subscribed(self, positions) -> int:
+        """Force-subscribe market data for any held position whose option
+        contract isn't already in our subscription set.
+
+        Without this, positions whose strike is outside the initial ATM±N
+        discovery window (e.g. an old leg from a prior session, or a fill
+        that drifted out of range as the underlying moved) will permanently
+        report delta=theta=0 in the dashboard because refresh_greeks() can't
+        find a market_state entry to compute against. Returns the number of
+        new subscriptions added.
+        """
+        if not positions:
+            return 0
+        p = self.config.product
+        new_keys: List[OptionKey] = []
+        new_contracts: List[FuturesOption] = []
+        for pos in positions:
+            key: OptionKey = (float(pos.strike), pos.expiry, pos.put_call)
+            if key in self._option_contracts:
+                continue
+            contract = FuturesOption(
+                symbol=p.option_symbol,
+                lastTradeDateOrContractMonth=pos.expiry,
+                strike=float(pos.strike),
+                right=pos.put_call,
+                exchange=p.exchange,
+                currency=p.currency,
+                tradingClass=p.trading_class,
+            )
+            new_keys.append(key)
+            new_contracts.append(contract)
+        if not new_contracts:
+            return 0
+        try:
+            qualified = await self.ib.qualifyContractsAsync(*new_contracts)
+        except Exception as e:
+            logger.warning("ensure_position_subscribed: qualify failed: %s", e)
+            return 0
+        added = 0
+        for key, contract in zip(new_keys, qualified):
+            if contract is None or getattr(contract, "conId", 0) == 0:
+                logger.warning("ensure_position_subscribed: failed to qualify %s", key)
+                continue
+            self._option_contracts[key] = contract
+            self.state.options[key] = OptionQuote(
+                strike=key[0], expiry=key[1], put_call=key[2], contract=contract,
+            )
+            try:
+                ticker = self.ib.reqMktData(contract, genericTickList="100,101", snapshot=False)
+            except Exception as e:
+                logger.warning("ensure_position_subscribed: reqMktData %s failed: %s", key, e)
+                continue
+            self._option_tickers[key] = ticker
+            ticker.updateEvent += lambda t, k=key: self._on_option_tick(t, k)
+            added += 1
+        if added:
+            logger.info(
+                "ensure_position_subscribed: force-subscribed %d off-window position(s)",
+                added,
+            )
+        return added
+
     def rotate_depth_subscriptions(self):
         """Cycle the depth-book window forward by one batch.
 

@@ -94,6 +94,17 @@ class RiskMonitor:
             )
             return
 
+        # Daily P&L = realized (from IBKR's RealizedPnL tag, mirrored into
+        # portfolio.realized_pnl_persisted by snapshot.py so it survives
+        # process restarts within the session) + unrealized (mark-to-market
+        # of currently-open positions). Including MTM is what makes this
+        # kill *useful*: a fast move that crushes resting shorts should stop
+        # the engine before realized has caught up. Realized-only would let
+        # you sit through arbitrarily large MTM drawdowns until something
+        # closes — by which time it's too late to "stop today".
+        self.portfolio.daily_pnl = (
+            self.portfolio.realized_pnl_persisted + self.portfolio.compute_mtm_pnl()
+        )
         if self.portfolio.daily_pnl < self.config.kill_switch.max_daily_loss:
             self.kill(
                 f"P&L KILL: ${self.portfolio.daily_pnl:,.0f} < "

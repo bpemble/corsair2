@@ -278,7 +278,8 @@ def _check_health(ib, market_data, quotes=None) -> tuple:
 
 
 async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
-                        sabr, account_id: str, shutdown_event: asyncio.Event):
+                        sabr, account_id: str, shutdown_event: asyncio.Event,
+                        fills=None, session_start_fn=None):
     """Periodic health check + auto-recovery. See module docstring."""
     consecutive_failures = 0
     consecutive_recovery_failures = 0
@@ -360,6 +361,18 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                     logger.info("WATCHDOG: reseeded %d position(s) after reconnect", seeded)
                     margin.invalidate_portfolio()
                     sabr.set_expiry(market_data.state.front_month_expiry)
+                    try:
+                        await market_data.ensure_position_subscribed(portfolio.positions)
+                    except Exception as e:
+                        logger.warning("WATCHDOG: ensure_position_subscribed failed: %s", e)
+                    # Replay any executions that landed during the gap. The
+                    # disconnect → reconnect window is exactly when fills go
+                    # silently missing if not backfilled.
+                    if fills is not None and session_start_fn is not None:
+                        try:
+                            await fills.replay_missed_executions(session_start_fn())
+                        except Exception as e:
+                            logger.warning("WATCHDOG: replay_missed_executions failed: %s", e)
 
                     cancelled = 0
                     for trade in ib.openTrades():
@@ -436,6 +449,15 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                             )
                             margin.invalidate_portfolio()
                             sabr.set_expiry(market_data.state.front_month_expiry)
+                            try:
+                                await market_data.ensure_position_subscribed(portfolio.positions)
+                            except Exception as e:
+                                logger.warning("WATCHDOG: post-escalation ensure_position_subscribed failed: %s", e)
+                            if fills is not None and session_start_fn is not None:
+                                try:
+                                    await fills.replay_missed_executions(session_start_fn())
+                                except Exception as e:
+                                    logger.warning("WATCHDOG: post-escalation replay_missed_executions failed: %s", e)
                             quotes.consecutive_quote_errors = 0
                             if risk.clear_disconnect_kill():
                                 logger.info(

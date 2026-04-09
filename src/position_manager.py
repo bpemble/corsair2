@@ -42,6 +42,11 @@ class PortfolioState:
         self.spread_capture_today: float = 0.0       # theo-based, headline
         self.spread_capture_mid_today: float = 0.0   # mid-based, reality check
         self.daily_pnl: float = 0.0
+        # Realized P&L for the current CME session, persisted across process
+        # restarts via daily_state.json. IBKR's RealizedPnL account tag can
+        # read 0 briefly after a reconnect; we hold the last non-zero value
+        # so the dashboard shows a stable running total.
+        self.realized_pnl_persisted: float = 0.0
         self._greeks_calc = GreeksCalculator()
         self._multiplier = config.product.multiplier
 
@@ -252,7 +257,9 @@ class PortfolioState:
         """Reset daily counters at start of each trading day."""
         self.fills_today = 0
         self.spread_capture_today = 0.0
+        self.spread_capture_mid_today = 0.0
         self.daily_pnl = 0.0
+        self.realized_pnl_persisted = 0.0
         logger.info("Daily counters reset")
 
     def get_summary(self) -> Dict:

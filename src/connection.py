@@ -48,9 +48,20 @@ class IBKRConnection:
         Skipped vs the stock bootstrap:
           - reqCompletedOrdersAsync         (we never read completed orders;
                                              openTrades comes from reqOpenOrders)
-          - reqExecutionsAsync              (we use execDetailsEvent for new fills)
+          - reqExecutionsAsync              (deferred — see note below)
           - reqAccountUpdatesMultiAsync × N (we trade in exactly one account)
           - reqAutoOpenOrders               (we match orders by orderRef, not bind)
+
+        IMPORTANT — reqExecutions backfill happens AFTER bootstrap, not as
+        part of it. We can't skip it entirely: `execDetailsEvent` only fires
+        for executions that occur while we're connected, and IBKR does not
+        replay missed events on reconnect. Any fill that lands during a
+        bootstrap window, restart, or watchdog reconnect would otherwise be
+        invisible to fill_handler — the position appears via reqPositions
+        but fills_today / spread_capture / daily_pnl are all dark for it.
+        FillHandler.replay_missed_executions() does the backfill from
+        main.py and the watchdog reseed paths, dedup'd against a persisted
+        seen-execId set in daily_state.json. **Do not delete it.**
 
         This brings the connect from ~33-90s down to ~3-5s in the steady state
         and eliminates the failure modes where any single bloat request times
