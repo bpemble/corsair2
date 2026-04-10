@@ -453,7 +453,7 @@ class QuoteManager:
         # (avoids a full SPAN portfolio walk per-strike).
         self._cycle_margin_ceiling = (float(config.constraints.capital)
                                       * float(config.constraints.margin_ceiling_pct))
-        self._cycle_cur_margin = self.constraint_checker.margin_checker.get_current_margin()
+        self._cycle_cur_margin = self.constraint_checker.margin.get_current_margin()
 
         for exp, pairs in per_expiry_quotable.items():
             if dirty is not None:
