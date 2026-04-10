@@ -596,7 +596,9 @@ class SABRSurface:
         if any_updated:
             self.last_calibration = datetime.now()
             self._theo_cache.clear()
-            self.params = sp.get("svi_params") or sp.get("params")
+            # Back-compat: .params exposes the put-side result (primary quoting side)
+            pp = self._side_params["P"]
+            self.params = pp.get("svi_params") or pp.get("params")
 
     def get_vol(self, strike: float, put_call: str = "C") -> float:
         """Return implied vol for a given strike using per-side params."""

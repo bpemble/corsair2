@@ -16,7 +16,7 @@ from ib_insync import IB, LimitOrder
 from ib_insync.order import OrderStatus
 from ib_insync.util import UNSET_DOUBLE, UNSET_INTEGER
 
-from .utils import round_to_tick
+from .utils import ceil_to_tick, floor_to_tick, round_to_tick
 
 LATENCY_RING_SIZE = 500   # rolling window for TTT/RTT/AMEND percentiles
 # Soft cap on the in-flight tracking dicts (_pending_rtt, _placed_at_ns,
@@ -110,13 +110,6 @@ def resolve_enabled_expiries(tokens, subscribed: list) -> list:
         elif t.startswith("front+"):
             try:
                 idx = int(t.split("+", 1)[1])
-                if 0 <= idx < len(subscribed):
-                    resolved = subscribed[idx]
-            except ValueError:
-                pass
-        elif t.startswith("back"):
-            try:
-                idx = int(t[4:])
                 if 0 <= idx < len(subscribed):
                     resolved = subscribed[idx]
             except ValueError:
@@ -459,6 +452,12 @@ class QuoteManager:
         our_prices_idx = self._build_our_prices_index()
         _empty_set: set = set()
 
+        # Cache margin state once per cycle for the wide_market bypass gate
+        # (avoids a full SPAN portfolio walk per-strike).
+        self._cycle_margin_ceiling = (float(config.constraints.capital)
+                                      * float(config.constraints.margin_ceiling_pct))
+        self._cycle_cur_margin = self.constraint_checker.margin_checker.get_current_margin()
+
         for exp, pairs in per_expiry_quotable.items():
             if dirty is not None:
                 # Dirty may be either (strike, right) or (strike, exp, right).
@@ -481,15 +480,9 @@ class QuoteManager:
                 # Theo from SABR (per expiry × right)
                 theo = None
                 if config.pricing.sabr_enabled:
-                    _cal = (self.sabr.get_last_calibration(exp)
-                            if hasattr(self.sabr, "get_last_calibration")
-                            else self.sabr.last_calibration)
-                    if _cal is not None:
+                    if self.sabr.get_last_calibration(exp) is not None:
                         try:
                             theo = self.sabr.get_theo(strike, right, expiry=exp)
-                        except TypeError:
-                            # Legacy single-expiry SABR fallback
-                            theo = self.sabr.get_theo(strike, right)
                         except Exception:
                             theo = None
 
@@ -553,10 +546,7 @@ class QuoteManager:
         _bypass_wide_market = False
         if (inc_info["skip_reason"] == "wide_market"
                 and theo is not None and theo > 0):
-            margin_ceiling = (float(config.constraints.capital)
-                              * float(config.constraints.margin_ceiling_pct))
-            cur_margin = self.constraint_checker.margin_checker.get_current_margin()
-            if cur_margin > margin_ceiling:
+            if self._cycle_cur_margin > self._cycle_margin_ceiling:
                 pos_qty = 0
                 for _p in portfolio.positions:
                     if (_p.strike == strike and _p.expiry == expiry
@@ -571,7 +561,7 @@ class QuoteManager:
                         "wide_market bypass: closing %+d %s %s%.0f via mid anchor "
                         "(margin=$%.0f > $%.0f ceiling, spread=%.2f, theo=%.2f)",
                         pos_qty, expiry[-4:], right, strike,
-                        cur_margin, margin_ceiling,
+                        self._cycle_cur_margin, self._cycle_margin_ceiling,
                         inc_info.get("bbo_width") or 0.0, theo,
                     )
 
@@ -590,7 +580,7 @@ class QuoteManager:
         # adverse fills where we think we have edge but are actually
         # on the wrong side of fair.
         if _bypass_wide_market:
-            import math as _math
+
             edge_floor = float(config.pricing.min_edge_points or 0.0)
             mkt_bid, mkt_ask = self.market_data.get_clean_bbo(
                 strike, right, expiry=expiry)
@@ -600,10 +590,10 @@ class QuoteManager:
                 mid = theo  # fall back to theo if no BBO
             if side == "BUY":
                 anchor = mid - edge_floor
-                adj = _math.floor(anchor / tick) * tick
+                adj = floor_to_tick(anchor, tick)
             else:  # SELL
                 anchor = mid + edge_floor
-                adj = _math.ceil(anchor / tick) * tick
+                adj = ceil_to_tick(anchor, tick)
         else:
             if side == "BUY":
                 jumped = inc_info["price"] + (tick * config.quoting.penny_jump_ticks)
@@ -631,16 +621,16 @@ class QuoteManager:
         # we want the lowest tick at or above (theo + edge). round_to_tick
         # is nearest-tick and could land on the wrong side by one tick.
         if theo is not None and config.pricing.min_edge_points > 0:
-            import math as _math
+
             edge_floor = config.pricing.min_edge_points
             if side == "BUY":
                 cap_raw = theo - edge_floor
-                capped = _math.floor(cap_raw / tick) * tick
+                capped = floor_to_tick(cap_raw, tick)
                 if adj > capped:
                     adj = capped
             else:  # SELL
                 cap_raw = theo + edge_floor
-                capped = _math.ceil(cap_raw / tick) * tick
+                capped = ceil_to_tick(cap_raw, tick)
                 if adj < capped:
                     adj = capped
 

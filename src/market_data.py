@@ -325,12 +325,12 @@ class MarketDataManager:
                     per_expiry_strikes.setdefault(exp_val, set()).add(k_val)
             self._per_expiry_strikes = per_expiry_strikes
 
-            class _Params:
-                pass
-            params = _Params()
-            params.expirations = expirations
-            params.strikes = strikes_set
-            params.exchange = p.exchange
+            from types import SimpleNamespace
+            params = SimpleNamespace(
+                expirations=expirations,
+                strikes=strikes_set,
+                exchange=p.exchange,
+            )
         else:
             params_list = await self.ib.reqSecDefOptParamsAsync(
                 underlyingSymbol=self._underlying_contract.symbol,
@@ -360,8 +360,7 @@ class MarketDataManager:
         # fans out the chain + SABR + snapshot across multiple months.
         # Quoting is gated separately via quoting.enabled_expiries.
         sorted_expiries = sorted(params.expirations)
-        n_subscribe = int(getattr(self.config.product, "subscribed_expiries", 1))
-        n_subscribe = max(1, n_subscribe)
+        n_subscribe = n_subscribe_probe  # Already computed above
         chosen: List[str] = []
         for exp in sorted_expiries:
             if days_to_expiry(exp) <= self.config.product.min_dte:

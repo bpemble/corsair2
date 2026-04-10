@@ -71,7 +71,7 @@ def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
     bid_live = bid_info["status"] in _LIVE if bid_info else False
     ask_live = ask_info["status"] in _LIVE if ask_info else False
     theo = None
-    _last_cal = sabr.get_last_calibration(expiry) if hasattr(sabr, "get_last_calibration") else sabr.last_calibration
+    _last_cal = sabr.get_last_calibration(expiry)
     if _last_cal is not None:
         try:
             theo = round(sabr.get_theo(strike, right, expiry=expiry), 2)

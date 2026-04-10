@@ -44,3 +44,15 @@ def time_to_expiry_years(expiry: str) -> float:
 def round_to_tick(price: float, tick_size: float) -> float:
     """Round a price to the nearest valid tick."""
     return round(round(price / tick_size) * tick_size, 10)
+
+
+def floor_to_tick(price: float, tick_size: float) -> float:
+    """Round a price DOWN to the nearest valid tick."""
+    import math
+    return math.floor(price / tick_size) * tick_size
+
+
+def ceil_to_tick(price: float, tick_size: float) -> float:
+    """Round a price UP to the nearest valid tick."""
+    import math
+    return math.ceil(price / tick_size) * tick_size
