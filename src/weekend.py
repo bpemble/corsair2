@@ -5,7 +5,6 @@ Monday: Check margin, refresh Greeks, validate before resuming.
 """
 
 import logging
-from datetime import datetime
 
 from .utils import days_to_expiry
 

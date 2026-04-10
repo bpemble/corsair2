@@ -12,7 +12,7 @@ import time as _time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares

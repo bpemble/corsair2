@@ -18,7 +18,7 @@ from . import ib_insync_patch as _ib_insync_patch
 _ib_insync_patch.apply()  # must run before any IB instance is created
 
 from .config import load_config
-from .utils import setup_logging, days_to_expiry
+from .utils import setup_logging
 from .connection import IBKRConnection
 from .market_data import MarketDataManager
 from .position_manager import PortfolioState

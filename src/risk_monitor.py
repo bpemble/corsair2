@@ -10,7 +10,6 @@ Kill switch cancels all quotes immediately on breach.
 """
 
 import logging
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
