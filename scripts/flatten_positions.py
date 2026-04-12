@@ -1,6 +1,6 @@
-"""One-shot script to flatten all ETHUSDRR option positions in the configured
-account using market orders. Use when corsair is stopped — it grabs its own
-client_id so it won't conflict with a running engine.
+"""One-shot script to flatten all option positions for the configured product
+in the configured account using market orders. Use when corsair is stopped —
+it grabs its own client_id so it won't conflict with a running engine.
 
 Usage (from inside the corsair container with ib_insync available):
     python3 /app/scripts/flatten_positions.py
@@ -14,7 +14,13 @@ import asyncio
 import os
 import sys
 
+import yaml
 from ib_insync import IB, FuturesOption, MarketOrder
+
+# Read product symbol from config so scripts stay in sync with the engine.
+_cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "corsair_v2_config.yaml")
+with open(_cfg_path) as _f:
+    SYMBOL = yaml.safe_load(_f)["product"]["underlying_symbol"]
 
 GATEWAY_HOST = os.environ.get("CORSAIR_GATEWAY_HOST", "127.0.0.1")
 GATEWAY_PORT = int(os.environ.get("CORSAIR_GATEWAY_PORT", "4002"))
@@ -40,7 +46,7 @@ async def main():
         c = p.contract
         if p.account != ACCOUNT_ID:
             continue
-        if c.symbol != "ETHUSDRR" or c.secType != "FOP":
+        if c.symbol != SYMBOL or c.secType != "FOP":
             continue
         if c.right not in ("C", "P"):
             continue
@@ -49,7 +55,7 @@ async def main():
         eth_options.append((c, int(p.position), p.account))
 
     if not eth_options:
-        print("No ETHUSDRR option positions to flatten.")
+        print(f"No {SYMBOL} option positions to flatten.")
         ib.disconnect()
         return 0
 
@@ -104,7 +110,7 @@ async def main():
     print("\nFinal positions check:")
     raw_positions = ib.positions(ACCOUNT_ID) if ACCOUNT_ID else ib.positions()
     remaining = [p for p in raw_positions
-                 if p.contract.symbol == "ETHUSDRR"
+                 if p.contract.symbol == SYMBOL
                  and p.contract.secType == "FOP"
                  and int(p.position) != 0]
     if not remaining:

@@ -22,6 +22,7 @@ import statistics
 import sys
 import time
 
+import yaml
 from ib_insync import IB, FuturesOption, LimitOrder
 
 HOST = os.environ.get("CORSAIR_GATEWAY_HOST", "127.0.0.1")
@@ -30,6 +31,13 @@ ACCOUNT = os.environ.get("CORSAIR_ACCOUNT_ID") or os.environ.get("IBKR_ACCOUNT")
 if not ACCOUNT:
     print("ERROR: CORSAIR_ACCOUNT_ID not set")
     sys.exit(1)
+
+# Read product config so the probe targets the same product as the engine.
+_cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "corsair_v2_config.yaml")
+with open(_cfg_path) as _f:
+    _product = yaml.safe_load(_f)["product"]
+    SYMBOL = _product["underlying_symbol"]
+    MULTIPLIER = str(_product["multiplier"])
 
 # Probe parameters
 EXPIRY = "20260424"      # ETHJ6
@@ -65,7 +73,7 @@ async def probe():
     print(f"Connected. Server version {ib.client.serverVersion()}")
 
     # Qualify the contract
-    contract = FuturesOption("ETHUSDRR", EXPIRY, STRIKE, RIGHT, "CME", "50")
+    contract = FuturesOption(SYMBOL, EXPIRY, STRIKE, RIGHT, "CME", MULTIPLIER)
     await ib.qualifyContractsAsync(contract)
     if not contract.conId:
         print(f"ERROR: failed to qualify {RIGHT}{int(STRIKE)} {EXPIRY}")

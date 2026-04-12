@@ -1,8 +1,9 @@
-"""One-shot: cancel all working orders, then flatten ETHUSDRR option positions.
+"""One-shot: cancel all working orders, then flatten option positions.
 
-Connects with clientId=0 (FA-required), cancels every open ETHUSDRR FOP order
-on the configured account (clears the per-contract working-order limit), then
-sends MARKET orders sized to take each position to zero.
+Connects with clientId=0 (FA-required), cancels every open FOP order for the
+configured product on the configured account (clears the per-contract
+working-order limit), then sends MARKET orders sized to take each position
+to zero.
 
     docker compose run --rm -v ~/corsair2/scripts:/app/scripts corsair python3 /app/scripts/flatten.py
 
@@ -13,6 +14,7 @@ import os
 import sys
 import time
 
+import yaml
 from ib_insync import IB, MarketOrder
 
 HOST = os.environ.get("CORSAIR_GATEWAY_HOST", "127.0.0.1")
@@ -21,6 +23,11 @@ ACCOUNT = os.environ.get("CORSAIR_ACCOUNT_ID") or os.environ.get("IBKR_ACCOUNT")
 if not ACCOUNT:
     print("ERROR: CORSAIR_ACCOUNT_ID/IBKR_ACCOUNT not set")
     sys.exit(1)
+
+# Read product symbol from config so scripts stay in sync with the engine.
+_cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "corsair_v2_config.yaml")
+with open(_cfg_path) as _f:
+    SYMBOL = yaml.safe_load(_f)["product"]["underlying_symbol"]
 
 print(f"Connecting to {HOST}:{PORT} as clientId=0, account={ACCOUNT}")
 ib = IB()
@@ -51,11 +58,11 @@ ib.sleep(3)  # let the cache populate from the response stream
 
 open_trades = [
     t for t in ib.openTrades()
-    if t.contract.symbol == "ETHUSDRR"
+    if t.contract.symbol == SYMBOL
     and t.contract.secType == "FOP"
     and t.orderStatus.status in ("PendingSubmit", "PreSubmitted", "Submitted", "ApiPending")
 ]
-print(f"Step 1: cancelling {len(open_trades)} working orders on ETHUSDRR options (all clients)...")
+print(f"Step 1: cancelling {len(open_trades)} working orders on {SYMBOL} options (all clients)...")
 for t in open_trades:
     try:
         ib.cancelOrder(t.order)
@@ -76,7 +83,7 @@ ib.sleep(8)
 # Step 2: pull current positions and flatten with MKT orders.
 positions = [
     p for p in ib.positions(ACCOUNT)
-    if p.contract.symbol == "ETHUSDRR"
+    if p.contract.symbol == SYMBOL
     and p.contract.secType == "FOP"
     and int(p.position) != 0
 ]
@@ -125,11 +132,11 @@ for t in placed:
 ib.sleep(2)
 remaining = [
     p for p in ib.positions(ACCOUNT)
-    if p.contract.symbol == "ETHUSDRR"
+    if p.contract.symbol == SYMBOL
     and p.contract.secType == "FOP"
     and int(p.position) != 0
 ]
-print(f"\nRemaining non-zero ETHUSDRR option positions: {len(remaining)}")
+print(f"\nRemaining non-zero {SYMBOL} option positions: {len(remaining)}")
 for p in remaining:
     c = p.contract
     print(f"  {c.right}{c.strike} qty={int(p.position)}")
