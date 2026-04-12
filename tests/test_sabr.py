@@ -39,21 +39,25 @@ def test_calibration_with_flat_vol_chain(cfg):
     surf, expiry = _make_surface(cfg)
     F = 2100.0
     iv = 0.65
+    tte = surf._get_tte()
 
-    # Build a fake options dict with bid/ask wide enough to pass the
-    # calibration filter (max_calibration_bbo_width = 10) but realistic
+    # Generate realistic bid/ask from Black-76 so the IV solver recovers
+    # the input vol. A flat $2 spread passes the max_calibration_bbo_width
+    # filter (10) comfortably.
     options = {}
     for K in (1900, 1950, 2000, 2050, 2100, 2150, 2200, 2250, 2300):
+        mid = PricingEngine.black76_price(F, K, tte, iv, right="C")
         opt = SimpleNamespace(
             strike=K, expiry=expiry, put_call="C", iv=iv,
-            bid=10.0, ask=15.0,
+            bid=mid - 1.0, ask=mid + 1.0,
         )
         options[(K, expiry, "C")] = opt
 
     surf.calibrate(F, options)
     assert surf.last_calibration is not None
-    # alpha should be reasonably close to the input vol on a flat smile
-    assert 0.45 < surf.alpha < 0.85
+    # Per-side params: call-side alpha should be close to the input vol
+    alpha = surf._side_params["C"]["alpha"]
+    assert 0.45 < alpha < 0.85
 
 
 def test_theo_cache_within_ttl(cfg):

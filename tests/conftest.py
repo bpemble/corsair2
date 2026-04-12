@@ -30,6 +30,7 @@ def cfg():
     return _ns(
         product=_ns(
             symbol="ETH",
+            underlying_symbol="ETHUSDRR",
             multiplier=50,
             option_type="both",
             strike_increment=25,
