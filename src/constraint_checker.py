@@ -406,34 +406,27 @@ class ConstraintChecker:
         post_long_premium = margin_result["post_long_premium"]
         capital = float(self.config.constraints.capital)
 
+        # ── Tier-1 hard kills (always binding) ──────────────────────
+        ks = getattr(self.config, "kill_switch", None)
+        delta_kill = float(getattr(ks, "delta_kill", 5.0) or 5.0) if ks else 5.0
+        theta_kill = float(getattr(ks, "theta_kill", -500) or -500) if ks else -500.0
+        margin_kill_pct = float(
+            getattr(ks, "margin_kill_pct", 0.70) or 0.70) if ks else 0.70
+        margin_kill = capital * margin_kill_pct
+
+        if post_margin > margin_kill:
+            return False, f"margin_kill (${post_margin:,.0f} > ${margin_kill:,.0f})"
+        if abs(post_delta) > delta_kill:
+            return False, f"delta_kill ({post_delta:+.2f} > ±{delta_kill})"
+        if post_theta < theta_kill:
+            return False, f"theta_kill (${post_theta:,.0f} < ${theta_kill:,.0f})"
+
         # ── Tier-1 margin priority escape ──────────────────────────
         escape_enabled = bool(getattr(
             self.config.constraints, "margin_escape_enabled", False))
         if (escape_enabled
                 and cur_margin > margin_ceiling
                 and post_margin < cur_margin):
-            ks = getattr(self.config, "kill_switch", None)
-            delta_kill = float(getattr(ks, "delta_kill", 5.0) or 5.0) if ks else 5.0
-            theta_kill = float(getattr(ks, "theta_kill", -500) or -500) if ks else -500.0
-            margin_kill_pct = float(
-                getattr(ks, "margin_kill_pct", 0.70) or 0.70) if ks else 0.70
-            margin_kill = capital * margin_kill_pct
-
-            # Hard kills remain binding even in escape mode.
-            if post_margin > margin_kill:
-                return False, (
-                    f"margin_kill (${post_margin:,.0f} > ${margin_kill:,.0f}) "
-                    f"[escape]"
-                )
-            if abs(post_delta) > delta_kill:
-                return False, (
-                    f"delta_kill ({post_delta:+.2f} > ±{delta_kill}) [escape]"
-                )
-            if post_theta < theta_kill:
-                return False, (
-                    f"theta_kill (${post_theta:,.0f} < ${theta_kill:,.0f}) "
-                    f"[escape]"
-                )
             # Long-premium capital check is a solvency constraint
             # (cash outlay), not a risk metric — enforce it even in
             # escape mode, with the same improving-fill exception.
@@ -446,12 +439,12 @@ class ConstraintChecker:
                     )
             return True, "margin_escape"
 
-        # ── Constraint 1: SPAN margin (combined) ────────────────────
+        # ── Tier-2 constraint 1: SPAN margin (combined) ─────────────
         if post_margin > margin_ceiling:
             if not (cur_margin > margin_ceiling and post_margin <= cur_margin):
                 return False, f"margin (${post_margin:,.0f} > ${margin_ceiling:,.0f})"
 
-        # ── Constraint 1b: Capital budget for long premium ──────────
+        # ── Tier-2 constraint 1b: Capital budget for long premium ───
         # SPAN risk margin doesn't fully capture the cash outlay for long
         # premium. Cap total long-premium outlay at the configured capital
         # so a runaway long path can't silently bleed cash.
@@ -462,12 +455,12 @@ class ConstraintChecker:
                     f"long_premium (${post_long_premium:,.0f} > ${capital:,.0f})"
                 )
 
-        # ── Constraint 2: Combined net delta ────────────────────────
+        # ── Tier-2 constraint 2: Combined net delta ─────────────────
         if abs(post_delta) > delta_ceiling:
             if not (abs(cur_delta) > delta_ceiling and abs(post_delta) < abs(cur_delta)):
                 return False, f"delta ({post_delta:+.2f} > ±{delta_ceiling})"
 
-        # ── Constraint 3: Combined net theta ────────────────────────
+        # ── Tier-2 constraint 3: Combined net theta ─────────────────
         if post_theta < theta_floor:
             if not (cur_theta < theta_floor and post_theta >= cur_theta):
                 return False, f"theta (${post_theta:,.0f} < ${theta_floor:,.0f})"
