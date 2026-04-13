@@ -467,6 +467,17 @@ class QuoteManager:
             else:
                 iter_pairs = pairs
 
+            # Sort by absolute delta descending so near-ATM (high-delta)
+            # strikes get processed first, minimising TTT where it matters
+            # most. Wings with |delta| near 0 go last.
+            iter_pairs = sorted(
+                iter_pairs,
+                key=lambda sr: abs(
+                    getattr(state.get_option(sr[0], expiry=exp, right=sr[1]),
+                            'delta', 0) or 0),
+                reverse=True,
+            )
+
             # Per-expiry constants (avoid re-fetching per-strike)
             _exp_cal_ready = (config.pricing.sabr_enabled
                               and self.sabr.get_last_calibration(exp) is not None)

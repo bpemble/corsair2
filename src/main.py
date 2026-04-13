@@ -461,7 +461,8 @@ async def main():
         # Weekend protocol
         if weekend_flatten:
             is_friday_close = (now_ct.weekday() == 4 and now_ct.hour >= 16)
-            is_weekend = now_ct.weekday() >= 5
+            is_sunday_reopen = (now_ct.weekday() == 6 and now_ct.hour >= 17)
+            is_weekend = now_ct.weekday() >= 5 and not is_sunday_reopen
             if (is_friday_close or is_weekend) and not weekend_paused:
                 if last_friday_shutdown_date != now_ct.date():
                     friday_shutdown(quotes, portfolio, config)

@@ -3,23 +3,28 @@ services:
   # IBC auto-starts IB Gateway and handles the mandatory daily restart.
   # Host networking because IB Gateway binds API socket to IPv6 only.
   ib-gateway:
-    image: ghcr.io/gnzsnz/ib-gateway:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
     restart: unless-stopped
     network_mode: host
     env_file: .env
+    command: ["/bin/bash", "/mnt/scripts/gateway_run.sh"]
     environment:
       TRADING_MODE: ${TRADING_MODE:-paper}
       TWS_ACCEPT_INCOMING: "accept"
       READ_ONLY_API: "no"
-      TWS_PORT: "4002"
+      TWS_PORT: "${TWS_PORT:-4002}"
     volumes:
       - ib-gateway-data:/opt/ibgateway
+      - ./scripts/gateway_run.sh:/mnt/scripts/gateway_run.sh:ro
+      - ./scripts/totp_helper.sh:/mnt/scripts/totp_helper.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/4002' || exit 1"]
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/${TWS_PORT:-4002}' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 90s
+      start_period: 120s
 
   # ── Corsair v2 Market Maker ─────────────────────────────────────────
   corsair:
@@ -34,7 +39,7 @@ services:
     env_file: .env
     environment:
       CORSAIR_GATEWAY_HOST: "127.0.0.1"
-      CORSAIR_GATEWAY_PORT: "4002"
+      CORSAIR_GATEWAY_PORT: "${TWS_PORT:-4002}"
       CORSAIR_ACCOUNT_ID: "${IBKR_ACCOUNT}"
     volumes:
       - ./logs:/app/logs
