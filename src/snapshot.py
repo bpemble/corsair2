@@ -132,7 +132,8 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
             }
             if block["call"] is None and block["put"] is None:
                 continue
-            exp_strikes[str(int(strike))] = block
+            strike_key = f"{strike:.2f}" if strike != int(strike) else str(int(strike))
+            exp_strikes[strike_key] = block
         chains_data[exp] = {"strikes": exp_strikes}
     # Legacy top-level strikes = front-month chain (for older dashboard).
     strikes_data = (

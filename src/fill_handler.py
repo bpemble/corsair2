@@ -23,7 +23,7 @@ class FillHandler:
     """Handles fill events from IBKR."""
 
     def __init__(self, ib, portfolio, margin_checker, quote_manager,
-                 market_data, csv_logger, config):
+                 market_data, csv_logger, config, product_filter=None):
         self.ib = ib
         self.portfolio = portfolio
         self.margin = margin_checker
@@ -31,6 +31,10 @@ class FillHandler:
         self.market_data = market_data
         self.csv_logger = csv_logger
         self.config = config
+        # Optional product filter: when set, only process fills whose
+        # contract.symbol matches. Enables multi-product routing where
+        # each FillHandler instance handles its own product's fills.
+        self._product_filter = product_filter
 
         # Register fill callback
         self.ib.execDetailsEvent += self._on_exec_details
@@ -40,6 +44,12 @@ class FillHandler:
 
     def _on_exec_details(self, trade, fill):
         """Called when IBKR reports a fill execution."""
+        # Multi-product routing: skip fills for other products.
+        if self._product_filter is not None:
+            sym = getattr(fill.contract, "symbol", None)
+            if sym and sym != self._product_filter:
+                return
+
         exec_id = fill.execution.execId
         if exec_id in self._seen_exec_ids:
             return
