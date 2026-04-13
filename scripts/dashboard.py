@@ -33,6 +33,23 @@ except ImportError:
 
 SNAPSHOT_PATH = str(PROJECT_ROOT / "data" / "chain_snapshot.json")
 
+# Discover observe-only product snapshots (written by main.py for each
+# observe_products entry). Each gets a tab in the product selector.
+def _discover_products():
+    """Return list of (name, snapshot_path) tuples for all products."""
+    products = [("ETH", SNAPSHOT_PATH)]
+    data_dir = PROJECT_ROOT / "data"
+    for p in sorted(data_dir.glob("*_chain_snapshot.json")):
+        # Skip the primary snapshot
+        if p.name == "chain_snapshot.json":
+            continue
+        # Derive name from filename: hg_chain_snapshot.json -> HG
+        name = p.stem.replace("_chain_snapshot", "").upper()
+        products.append((name, str(p)))
+    return products
+
+PRODUCTS = _discover_products()
+
 # ---------------------------------------------------------------------------
 # Theme
 # ---------------------------------------------------------------------------
@@ -89,12 +106,13 @@ if _HAS_AUTOREFRESH:
 
 
 @st.cache_data(ttl=2)
-def load_snapshot():
+def load_snapshot(path=None):
     """Load chain snapshot JSON."""
-    if not os.path.exists(SNAPSHOT_PATH):
+    p = path or SNAPSHOT_PATH
+    if not os.path.exists(p):
         return None
     try:
-        with open(SNAPSHOT_PATH, "r") as f:
+        with open(p, "r") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return None
@@ -405,32 +423,42 @@ if snapshot is not None:
 
 st.markdown('<div class="section-header">Option Chain</div>', unsafe_allow_html=True)
 
-# Expiry selector (rendered outside the fragment so the selectbox survives
-# chain refreshes). Reads one snapshot to get the list; the fragment then
-# reads its own snapshot each tick and dispatches to the selected expiry.
-_sel_snap = load_snapshot() or {}
+# Product + expiry selectors (rendered outside the fragment so selectboxes
+# survive chain refreshes). Reads one snapshot to get the expiry list; the
+# fragment then reads its own snapshot each tick.
+_product_names = [p[0] for p in PRODUCTS]
+_product_paths = {p[0]: p[1] for p in PRODUCTS}
+
+_prod_col, _sel_col, _ = st.columns([1, 1, 4])
+with _prod_col:
+    _selected_product = st.selectbox(
+        "Product", options=_product_names, index=0,
+        key="selected_product",
+    )
+
+_chain_snap_path = _product_paths.get(_selected_product, SNAPSHOT_PATH)
+_sel_snap = load_snapshot(_chain_snap_path) or {}
 _expiries = _sel_snap.get("expiries") or []
 _front = _sel_snap.get("front_month_expiry")
-if _expiries:
-    _default_idx = _expiries.index(_front) if _front in _expiries else 0
-    # Constrain the selectbox to ~1/6 page width so it sits as a compact
-    # control instead of stretching across the chain-table header.
-    _sel_col, _ = st.columns([1, 5])
-    with _sel_col:
+with _sel_col:
+    if _expiries:
+        _default_idx = _expiries.index(_front) if _front in _expiries else 0
         _selected = st.selectbox(
             "Expiry", options=_expiries, index=_default_idx,
             key="selected_expiry",
         )
-else:
-    _selected = _front
-    st.session_state["selected_expiry"] = _front
+    else:
+        _selected = _front
+        st.session_state["selected_expiry"] = _front
 
 @st.fragment(run_every=0.25)
 def render_chain():
     """Chain table render. Lives in a fragment so only this section
     re-renders on its own 4Hz cadence — matches the snapshot write rate
     so we catch every fresh state without re-rendering the whole page."""
-    snapshot = load_snapshot()
+    _prod = st.session_state.get("selected_product", "ETH")
+    _path = _product_paths.get(_prod, SNAPSHOT_PATH)
+    snapshot = load_snapshot(_path)
     sel = st.session_state.get("selected_expiry")
     chain_html = build_chain_html(snapshot, selected_expiry=sel)
     if chain_html is not None:

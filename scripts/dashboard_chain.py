@@ -7,7 +7,7 @@ names, never inline styles.
 """
 
 
-def _our_price_cell(price, live, mkt_ref, raw_ref, side):
+def _our_price_cell(price, live, mkt_ref, raw_ref, side, pfmt="1"):
     """Color-coded our_bid / our_ask cell.
       - None  → idle (gray dash)
       - live (Submitted) AND at/better than BBO → quoting (green)
@@ -25,12 +25,13 @@ def _our_price_cell(price, live, mkt_ref, raw_ref, side):
         cls = "quoting" if (raw_ref == 0 or at_bbo) else "behind"
     else:
         cls = "pending"
-    return f'<span class="chain-our-price {cls}">{price:.1f}</span>'
+    return f'<span class="chain-our-price {cls}">{price:.{pfmt}f}</span>'
 
 
-def _fmt_side(s):
+def _fmt_side(s, pfmt="1"):
     """Render the half-row cells for one option type at one strike.
 
+    *pfmt* controls price decimal places ("1" for ETH, "4" for HG).
     Returns (oi, vol, pos, our_bid, our_ask, theo, mkt_bid, mkt_ask, edge).
     Cells are returned blank if the side block is None (no contract).
     """
@@ -46,9 +47,9 @@ def _fmt_side(s):
     theo = s.get("theo")
     pos = s.get("position", 0)
 
-    our_bid_html = _our_price_cell(our_bid, s.get("bid_live", False), mkt_bid, raw_bid, "BUY")
-    our_ask_html = _our_price_cell(our_ask, s.get("ask_live", False), mkt_ask, raw_ask, "SELL")
-    theo_html = f"{theo:.1f}" if theo is not None else "-"
+    our_bid_html = _our_price_cell(our_bid, s.get("bid_live", False), mkt_bid, raw_bid, "BUY", pfmt=pfmt)
+    our_ask_html = _our_price_cell(our_ask, s.get("ask_live", False), mkt_ask, raw_ask, "SELL", pfmt=pfmt)
+    theo_html = f"{theo:.{pfmt}f}" if theo is not None else "-"
 
     # Edge per side vs theo. Bid edge = theo - our_bid (positive = we buy
     # below fair). Ask edge = our_ask - theo (positive = we sell above fair).
@@ -63,7 +64,7 @@ def _fmt_side(s):
         if edges:
             avg = sum(edges) / len(edges)
             cls = "positive" if avg > 0 else "negative"
-            edge_html = f'<span class="chain-edge {cls}">{avg:+.1f}</span>'
+            edge_html = f'<span class="chain-edge {cls}">{avg:+.{pfmt}f}</span>'
 
     if pos > 0:
         pos_html = f'<span class="chain-pos long">+{pos}</span>'
@@ -72,8 +73,8 @@ def _fmt_side(s):
     else:
         pos_html = '<span class="chain-pos zero">0</span>'
 
-    mkt_bid_html = f"{mkt_bid:.1f}" if mkt_bid > 0 else "-"
-    mkt_ask_html = f"{mkt_ask:.1f}" if mkt_ask > 0 else "-"
+    mkt_bid_html = f"{mkt_bid:.{pfmt}f}" if mkt_bid > 0 else "-"
+    mkt_ask_html = f"{mkt_ask:.{pfmt}f}" if mkt_ask > 0 else "-"
     return (
         f"{s.get('open_interest', 0) or 0:,}",
         f"{s.get('volume', 0) or 0:,}",
@@ -116,7 +117,7 @@ _HEADER_HTML = """
 """
 
 
-def _build_row(strike_str, block, atm_strike):
+def _build_row(strike_str, block, atm_strike, decimal=False):
     # Backward compat: older snapshots stored a flat dict per strike.
     if "call" not in block and "put" not in block:
         call, put = block, None
@@ -124,12 +125,18 @@ def _build_row(strike_str, block, atm_strike):
         call, put = block.get("call"), block.get("put")
 
     strike_val = float(strike_str)
-    row_class = ' class="atm-row"' if abs(strike_val - atm_strike) < 1.0 else ""
+    # ATM detection threshold: ~half a strike width (1.0 for ETH $25 grid,
+    # 0.005 for HG $0.01 grid).
+    atm_tol = 0.005 if decimal else 1.0
+    row_class = ' class="atm-row"' if abs(strike_val - atm_strike) < atm_tol else ""
+    strike_label = f"{strike_val:.2f}" if decimal else str(int(strike_val))
+    # Price format: 4 decimals for small prices (HG), 1 for large (ETH)
+    pfmt = "4" if decimal else "1"
 
     (c_oi, c_vol, c_pos, c_our_bid, c_our_ask,
-     c_theo, c_mkt_bid, c_mkt_ask, c_edge) = _fmt_side(call)
+     c_theo, c_mkt_bid, c_mkt_ask, c_edge) = _fmt_side(call, pfmt=pfmt)
     (p_oi, p_vol, p_pos, p_our_bid, p_our_ask,
-     p_theo, p_mkt_bid, p_mkt_ask, p_edge) = _fmt_side(put)
+     p_theo, p_mkt_bid, p_mkt_ask, p_edge) = _fmt_side(put, pfmt=pfmt)
 
     return f"""<tr{row_class}>
         <td class="center">{c_oi}</td>
@@ -141,7 +148,7 @@ def _build_row(strike_str, block, atm_strike):
         <td>{c_our_ask}</td>
         <td>{c_mkt_ask}</td>
         <td>{c_edge}</td>
-        <td class="center chain-strike-cell"><span class="chain-strike">{int(strike_val)}</span></td>
+        <td class="center chain-strike-cell"><span class="chain-strike">{strike_label}</span></td>
         <td>{p_edge}</td>
         <td>{p_mkt_bid}</td>
         <td>{p_our_bid}</td>
@@ -172,8 +179,11 @@ def build_chain_html(snapshot, selected_expiry: str = None):
     if not strikes:
         return None
     atm_strike = snapshot.get("atm_strike", 0)
+    # Detect whether strikes are decimal (HG-style $5.90) vs integer
+    # (ETH-style 2350) so we can pick the right format strings.
+    _decimal_strikes = any("." in k for k in strikes)
     rows = "".join(
-        _build_row(k, strikes[k], atm_strike)
+        _build_row(k, strikes[k], atm_strike, decimal=_decimal_strikes)
         for k in sorted(strikes.keys(), key=float)
     )
     return f'<div id="chain-scroll" class="chain-scroll">{_HEADER_HTML}{rows}</tbody></table></div>'

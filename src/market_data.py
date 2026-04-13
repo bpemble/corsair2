@@ -268,7 +268,7 @@ class MarketDataManager:
         if inc <= 0:
             return
 
-        new_atm = round(self.state.underlying_price / inc) * inc
+        new_atm = round(round(self.state.underlying_price / inc) * inc, 10)
 
         if self.state.atm_strike == 0 or abs(new_atm - self.state.atm_strike) >= inc / 2:
             old_atm = self.state.atm_strike
@@ -382,10 +382,15 @@ class MarketDataManager:
                 len(chosen), ", ".join(chosen),
             )
 
-        # Determine strike increment from available strikes
+        # Determine strike increment. Prefer the config value when set
+        # (products like HG have mixed grids — $0.01 near ATM, $0.05/$0.25
+        # in the wings — so auto-detect picks up the wrong value).
         sorted_strikes = sorted(params.strikes)
-        if len(sorted_strikes) >= 2:
-            # Find most common increment
+        _cfg_inc = getattr(self.config.product, "strike_increment", 0)
+        if _cfg_inc and _cfg_inc > 0:
+            self.state.strike_increment = float(_cfg_inc)
+        elif len(sorted_strikes) >= 2:
+            # Fallback: auto-detect from first 20 gaps
             increments = [sorted_strikes[i+1] - sorted_strikes[i]
                          for i in range(min(20, len(sorted_strikes) - 1))]
             if increments:

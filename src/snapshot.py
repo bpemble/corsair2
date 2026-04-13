@@ -258,3 +258,84 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         os.replace(tmp, path)
     except Exception as e:
         logger.warning("Failed to write chain snapshot: %s", e)
+
+
+def write_observe_snapshot(market_data, config, sabr=None):
+    """Write a lightweight chain snapshot for an observe-only product.
+
+    No quotes, portfolio, or margin — just raw market data + optional SABR
+    theos so the dashboard can show theoretical values.
+    """
+    state = market_data.state
+    if state.underlying_price <= 0:
+        return
+
+    product_name = getattr(config, "_observe_name", "unknown")
+
+    chains_data: dict = {}
+    expiries_list = list(state.expiries) if state.expiries else (
+        [state.front_month_expiry] if state.front_month_expiry else []
+    )
+    for exp in expiries_list:
+        exp_strikes: dict = {}
+        for strike in state.get_all_strikes(expiry=exp):
+            block = {}
+            for right in ("C", "P"):
+                opt = state.get_option(strike, expiry=exp, right=right)
+                if opt is None:
+                    block[("call" if right == "C" else "put")] = None
+                    continue
+                side_key = "call" if right == "C" else "put"
+                theo = None
+                if sabr is not None:
+                    try:
+                        _last_cal = sabr.get_last_calibration(exp)
+                        if _last_cal is not None:
+                            theo = round(sabr.get_theo(strike, right, expiry=exp), 4)
+                    except Exception:
+                        pass
+                block[side_key] = {
+                    "market_bid": opt.bid,
+                    "market_ask": opt.ask,
+                    "raw_bid": opt.bid,
+                    "raw_ask": opt.ask,
+                    "our_bid": None,
+                    "our_ask": None,
+                    "bid_live": False,
+                    "ask_live": False,
+                    "theo": theo,
+                    "delta": round(opt.delta, 4) if opt.delta else 0.0,
+                    "iv": round(opt.iv, 4) if opt.iv else 0.0,
+                    "volume": opt.volume,
+                    "open_interest": opt.open_interest,
+                    "position": 0,
+                    "status": "observe",
+                }
+            if block.get("call") is None and block.get("put") is None:
+                continue
+            # Use string key that preserves decimal precision for HG strikes
+            strike_key = f"{strike:.2f}" if strike != int(strike) else str(int(strike))
+            exp_strikes[strike_key] = block
+        chains_data[exp] = {"strikes": exp_strikes}
+
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "product": product_name,
+        "underlying_price": state.underlying_price,
+        "atm_strike": state.atm_strike,
+        "front_month_expiry": state.front_month_expiry,
+        "expiries": expiries_list,
+        "chains": chains_data,
+        "observe_only": True,
+    }
+
+    path = getattr(config, "_observe_snapshot_path",
+                   f"data/{product_name.lower()}_chain_snapshot.json")
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("Failed to write %s observe snapshot: %s", product_name, e)

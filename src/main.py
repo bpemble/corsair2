@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from . import ib_insync_patch as _ib_insync_patch
 _ib_insync_patch.apply()  # must run before any IB instance is created
 
-from .config import load_config
+from .config import load_config, make_observe_config
 from .utils import setup_logging
 from .connection import IBKRConnection
 from .market_data import MarketDataManager
@@ -30,7 +30,7 @@ from .fill_handler import FillHandler
 from .risk_monitor import RiskMonitor
 from .logging_utils import CSVLogger
 from .weekend import friday_shutdown, monday_startup
-from .snapshot import write_chain_snapshot
+from .snapshot import write_chain_snapshot, write_observe_snapshot
 from . import daily_state
 from .watchdog import (
     safe_discover_and_subscribe,
@@ -423,6 +423,36 @@ async def main():
     except Exception as e:
         logger.warning("replay_missed_executions at startup failed: %s", e)
 
+    # ── Observe-only product subscriptions ──────────────────────────
+    # Each entry in config.observe_products gets its own MarketDataManager
+    # that subscribes to market data without quoting. Snapshots are written
+    # alongside the primary product's snapshot.
+    observers: list = []  # List of (name, MarketDataManager, observe_config, sabr)
+    _raw_observe = getattr(config, "observe_products", None) or []
+    for obs_entry in _raw_observe:
+        obs_name = obs_entry.name
+        obs_config = make_observe_config(config, obs_entry)
+        obs_md = MarketDataManager(ib, obs_config)
+        logger.info("Setting up observe-only product: %s", obs_name)
+        try:
+            if not await safe_discover_and_subscribe(obs_md):
+                logger.warning("Observe product %s: discovery failed, skipping", obs_name)
+                continue
+            await asyncio.sleep(3)  # let initial ticks arrive
+            # Create a SABR fitter for theo calculation
+            obs_sabr = MultiExpirySABR(obs_config)
+            obs_sabr.set_expiries(obs_md.state.expiries)
+            logger.info(
+                "Observe product %s ready: underlying=%.4f, ATM=%.4f, "
+                "%d options, expiry=%s",
+                obs_name, obs_md.state.underlying_price,
+                obs_md.state.atm_strike, len(obs_md.state.options),
+                obs_md.state.front_month_expiry,
+            )
+            observers.append((obs_name, obs_md, obs_config, obs_sabr))
+        except Exception as e:
+            logger.warning("Observe product %s setup failed: %s", obs_name, e)
+
     logger.info(
         "Entering event-driven quote loop (batch=%.0fms, fallback=%.1fs, snapshot=%.1fs)",
         batch_window_sec * 1000, fallback_interval, snapshot_interval,
@@ -517,6 +547,31 @@ async def main():
         except Exception as e:
             logger.warning("SABR recal error: %s", e)
 
+        # SABR recal for observe-only products (gated by same timer/forward-move
+        # logic as the primary product's maybe_recal_sabr)
+        for _obs_name, _obs_md, _obs_cfg, _obs_sabr in observers:
+            try:
+                _obs_state = _obs_md.state
+                if _obs_state.underlying_price <= 0 or not _obs_state.options:
+                    continue
+                _obs_last = getattr(_obs_sabr, '_last_recal_time', None)
+                _obs_last_fwd = getattr(_obs_sabr, '_last_recal_forward', 0.0)
+                _obs_elapsed = (datetime.now() - _obs_last).total_seconds() if _obs_last else 999
+                _obs_fwd_move = abs(_obs_state.underlying_price - _obs_last_fwd)
+                # Scale fast-recal threshold by underlying magnitude: ETH's $2
+                # on a $2300 underlying = ~0.09%; apply same ratio to HG.
+                _obs_fast_cfg = float(getattr(_obs_cfg.pricing, "sabr_fast_recal_dollars", 2.0))
+                _obs_fast = _obs_fast_cfg * _obs_state.underlying_price / max(market_data.state.underlying_price, 1)
+                if (_obs_last is None
+                        or _obs_elapsed >= _obs_cfg.pricing.sabr_recalibrate_seconds
+                        or _obs_fwd_move >= _obs_fast):
+                    _obs_sabr._last_recal_time = datetime.now()
+                    _obs_sabr._last_recal_forward = _obs_state.underlying_price
+                    _obs_sabr.set_expiries(_obs_state.expiries)
+                    _obs_sabr.calibrate(_obs_state.underlying_price, _obs_state.options)
+            except Exception as e:
+                logger.warning("SABR recal %s error: %s", _obs_name, e)
+
         # ── Snapshot + daily-state persistence ────────────────────────
         # Runs even when killed/paused so Docker's healthcheck (which reads
         # chain_snapshot.json age) doesn't falsely declare the container
@@ -530,6 +585,12 @@ async def main():
                                      margin, ib, config.account.account_id, config)
             except Exception as e:
                 logger.warning("Snapshot write error: %s", e)
+            # Write observe-only product snapshots at the same cadence
+            for _obs_name, _obs_md, _obs_cfg, _obs_sabr in observers:
+                try:
+                    write_observe_snapshot(_obs_md, _obs_cfg, sabr=_obs_sabr)
+                except Exception as e:
+                    logger.warning("Observe snapshot %s error: %s", _obs_name, e)
             last_snapshot_write = mono
 
         if (mono - last_daily_state_save) >= 1.0:
@@ -672,6 +733,11 @@ async def main():
         pass
     quotes.cancel_all_quotes()
     market_data.cancel_all_subscriptions()
+    for _obs_name, _obs_md, _obs_cfg, _obs_sabr in observers:
+        try:
+            _obs_md.cancel_all_subscriptions()
+        except Exception:
+            pass
     await conn.disconnect()
     logger.info("Corsair v2 shutdown complete.")
 
