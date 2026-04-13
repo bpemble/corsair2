@@ -204,7 +204,7 @@ class CSVLogger:
                  spread_captured_theo, spread_captured_mid,
                  margin_after, delta_after, theta_after, vega_after,
                  fills_today, cumulative_spread_theo, cumulative_spread_mid,
-                 fill_latency_ms=None):
+                 fill_latency_ms=None, underlying_price=None):
         self._append_row(self._fill_path, [
             datetime.now().isoformat(), strike, expiry, put_call, side,
             quantity, fill_price,
@@ -213,6 +213,20 @@ class CSVLogger:
             f"{vega_after:.0f}", fills_today,
             f"{cumulative_spread_theo:.0f}", f"{cumulative_spread_mid:.0f}",
             f"{fill_latency_ms:.0f}" if fill_latency_ms is not None else "",
+            f"{underlying_price:.2f}" if underlying_price is not None else "",
+        ])
+
+    def log_fill_classification(self, *, strike, expiry, put_call, side,
+                                fill_price, mark, realized_edge, realized_pnl,
+                                underlying_at_fill, underlying_now,
+                                classification):
+        path = self._fill_path.replace("fills.csv", "fill_classifications.csv")
+        self._append_row(path, [
+            datetime.now().isoformat(), strike, expiry, put_call, side,
+            f"{fill_price:.2f}", f"{mark:.2f}",
+            f"{realized_edge:.2f}", f"{realized_pnl:.0f}",
+            f"{underlying_at_fill:.2f}", f"{underlying_now:.2f}",
+            classification,
         ])
 
     def log_trade(self, strike, put_call, last_price, last_size,
