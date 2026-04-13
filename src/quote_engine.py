@@ -301,6 +301,11 @@ class QuoteManager:
         # cancelled. Cleared only when fresh option ticks arrive.
         self._market_data_blackout: bool = False
         self._blackout_cancel_sent: bool = False
+        # Margin rejection suppression. Keys that IBKR rejected with Error 201
+        # (insufficient margin) are tracked here so we don't re-submit every
+        # cycle. Cleared on any fill (margin conditions may have changed).
+        self._margin_rejected: set = set()
+        self._margin_rejected_last_clear: float = time.monotonic()
         self.ib.errorEvent += self._on_ib_error
 
     def _canonical_trade(self, order_id: int):
@@ -458,6 +463,14 @@ class QuoteManager:
             else:
                 return  # no options at all
 
+        # Periodic clear of margin rejection suppression so keys get a
+        # fresh attempt every 60s. Adapts to changing margin conditions
+        # (position closes, cash deposited, market moves) without restart.
+        _now_mono = time.monotonic()
+        if _now_mono - self._margin_rejected_last_clear > 60.0:
+            self._margin_rejected.clear()
+            self._margin_rejected_last_clear = _now_mono
+
         # SABR recalibration is hoisted out of this hot path and runs from
         # main.py's loop via maybe_recal_sabr() — calibration takes several ms
         # and was inflating TTT (tick→placeOrder) by landing between the tick
@@ -567,6 +580,9 @@ class QuoteManager:
                       current_underlying: float = 0.0) -> None:
         """Apply skip-reason gate, theo-edge gate, constraint check, and
         order placement for a single (strike, expiry, right, side)."""
+        # Skip if IBKR previously rejected this key for margin.
+        if (strike, expiry, right, side) in self._margin_rejected:
+            return
         config = self.config
         tick = config.quoting.tick_size
 
@@ -1212,6 +1228,17 @@ class QuoteManager:
                     "option data feed resumes.",
                 )
             self._market_data_blackout = True
+            return
+
+        # Error 201: margin rejection. Track the key so we don't re-submit
+        # the same order every cycle. Cleared on fills (margin may change).
+        if errorCode == 201:
+            for key, oid in list(self.active_orders.items()):
+                if oid == reqId:
+                    self._margin_rejected.add(key)
+                    self.active_orders.pop(key, None)
+                    self._order_underlying.pop(oid, None)
+                    break
             return
 
         if errorCode != 104:

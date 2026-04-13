@@ -235,6 +235,9 @@ class FillHandler:
         # — skip this to avoid running update_quotes before the main loop has
         # initialized the per-cycle canonical trade index.
         if trade is not None:
+            # Clear margin rejection suppression — the fill changed margin
+            # conditions so previously-rejected keys may now be acceptable.
+            self.quotes._margin_rejected.clear()
             self.quotes.update_quotes(self.portfolio)
 
     def _delayed_mark_check(self, strike, expiry, put_call, side, fill_price,
