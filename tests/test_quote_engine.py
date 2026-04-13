@@ -205,6 +205,209 @@ def test_gtd_no_refresh_when_fresh():
     # → should NOT refresh
 
 
+# ---- Market data blackout (Error 10197) --------------------------------------
+
+class _FakeIB:
+    """Minimal IB stub for QuoteManager construction."""
+    def __init__(self):
+        self.openOrderEvent = _FakeEvent()
+        self.errorEvent = _FakeEvent()
+        self._global_cancel_called = False
+
+    def reqGlobalCancel(self):
+        self._global_cancel_called = True
+
+    def openTrades(self):
+        return []
+
+    def isConnected(self):
+        return True
+
+
+class _FakeEvent:
+    """Minimal event stub that accepts += for handler registration."""
+    def __init__(self):
+        self._handlers = []
+
+    def __iadd__(self, handler):
+        self._handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self._handlers.remove(handler)
+        return self
+
+
+class _FakeMarketDataForBlackout:
+    def __init__(self):
+        self.state = SimpleNamespace(
+            underlying_price=2100.0,
+            options={
+                (2100, "20260424", "C"): SimpleNamespace(
+                    last_update=datetime.now(),
+                    delta=0.5,
+                    bid=80.0, ask=82.0,
+                    contract=None,
+                ),
+            },
+            expiries=["20260424"],
+            front_month_expiry="20260424",
+            atm_strike=2100,
+            strike_increment=25,
+            first_tick_seen=True,
+            discovery_completed_at=datetime.now(),
+        )
+        self.state.get_option = lambda s, expiry=None, right="C": self.state.options.get(
+            (s, expiry or "20260424", right)
+        )
+        self.state.get_all_strikes = lambda expiry=None: [2100]
+        self.tick_queue = None
+
+    def get_quotable_strikes(self, expiry=None):
+        return [(2100, "C")]
+
+    def find_incumbent(self, strike, side, our_prices, right="C", expiry=None):
+        return {"price": 80.0, "level": 0, "size": 5, "age_ms": 100,
+                "bbo_width": 2.0, "skip_reason": None}
+
+    def get_clean_bbo(self, strike, right, expiry=None):
+        return (80.0, 82.0)
+
+
+def test_blackout_panic_cancels_on_10197():
+    """Error 10197 must trigger panic_cancel and set blackout flag."""
+    from src.quote_engine import QuoteManager
+
+    ib = _FakeIB()
+    cfg = SimpleNamespace(
+        quoting=SimpleNamespace(
+            tick_size=0.5, penny_jump_ticks=1, quote_size=1,
+            refresh_interval_ms=1000, enabled_expiries=["front"],
+            api_bucket_capacity=250, api_bucket_refill_per_sec=250,
+        ),
+        pricing=SimpleNamespace(
+            sabr_enabled=False, min_edge_points=0.5,
+        ),
+        product=SimpleNamespace(
+            multiplier=50, quote_size=1, option_type="both",
+            quote_range_low=0, quote_range_high=5,
+        ),
+        constraints=SimpleNamespace(
+            capital=200000, margin_ceiling_pct=0.50,
+        ),
+        account=SimpleNamespace(account_id="TEST"),
+        puts=SimpleNamespace(enabled=False),
+    )
+    md = _FakeMarketDataForBlackout()
+    qm = QuoteManager(ib, cfg, md, None, None, None)
+
+    # Simulate a resting order
+    qm.active_orders[("2100", "20260424", "C", "SELL")] = 999
+
+    # Fire Error 10197
+    qm._on_ib_error(0, 10197, "No market data during competing live session", None)
+
+    assert qm._market_data_blackout is True
+    assert ib._global_cancel_called is True
+    assert len(qm.active_orders) == 0
+
+
+def test_blackout_blocks_update_quotes():
+    """While blackout is active, update_quotes must be a no-op."""
+    from src.quote_engine import QuoteManager
+
+    ib = _FakeIB()
+    cfg = SimpleNamespace(
+        quoting=SimpleNamespace(
+            tick_size=0.5, penny_jump_ticks=1, quote_size=1,
+            refresh_interval_ms=1000, enabled_expiries=["front"],
+            api_bucket_capacity=250, api_bucket_refill_per_sec=250,
+        ),
+        pricing=SimpleNamespace(
+            sabr_enabled=False, min_edge_points=0.5,
+        ),
+        product=SimpleNamespace(
+            multiplier=50, quote_size=1, option_type="both",
+            quote_range_low=0, quote_range_high=5,
+        ),
+        constraints=SimpleNamespace(
+            capital=200000, margin_ceiling_pct=0.50,
+        ),
+        account=SimpleNamespace(account_id="TEST"),
+        puts=SimpleNamespace(enabled=False),
+    )
+    md = _FakeMarketDataForBlackout()
+    qm = QuoteManager(ib, cfg, md, None, None, None)
+
+    # Set blackout with stale option data
+    qm._market_data_blackout = True
+    from datetime import timedelta
+    for opt in md.state.options.values():
+        opt.last_update = datetime.now() - timedelta(seconds=30)
+
+    # Fake portfolio for update_quotes
+    portfolio = SimpleNamespace(positions=[])
+
+    # This should return immediately without placing any orders
+    qm.update_quotes(portfolio)
+    assert len(qm.active_orders) == 0
+
+
+def test_blackout_clears_on_fresh_tick():
+    """Blackout must clear when a fresh option tick arrives."""
+    from src.quote_engine import QuoteManager
+
+    ib = _FakeIB()
+    cfg = SimpleNamespace(
+        quoting=SimpleNamespace(
+            tick_size=0.5, penny_jump_ticks=1, quote_size=1,
+            refresh_interval_ms=1000, enabled_expiries=["front"],
+            api_bucket_capacity=250, api_bucket_refill_per_sec=250,
+        ),
+        pricing=SimpleNamespace(
+            sabr_enabled=False, min_edge_points=0.5,
+        ),
+        product=SimpleNamespace(
+            multiplier=50, quote_size=1, option_type="both",
+            quote_range_low=0, quote_range_high=5,
+        ),
+        constraints=SimpleNamespace(
+            capital=200000, margin_ceiling_pct=0.50,
+        ),
+        account=SimpleNamespace(account_id="TEST"),
+        puts=SimpleNamespace(enabled=False),
+    )
+    md = _FakeMarketDataForBlackout()
+    qm = QuoteManager(ib, cfg, md, None, None, None)
+
+    # Set blackout with stale data first
+    qm._market_data_blackout = True
+    qm._blackout_cancel_sent = True
+    from datetime import timedelta
+    for opt in md.state.options.values():
+        opt.last_update = datetime.now() - timedelta(seconds=30)
+
+    portfolio = SimpleNamespace(positions=[])
+
+    # With stale data, should stay in blackout
+    qm.update_quotes(portfolio)
+    assert qm._market_data_blackout is True
+
+    # Now simulate fresh option tick (last_update = now)
+    for opt in md.state.options.values():
+        opt.last_update = datetime.now()
+
+    # update_quotes should detect fresh tick, clear blackout, then
+    # proceed into the quoting path (which will fail on missing deps,
+    # but the flag should already be cleared)
+    try:
+        qm.update_quotes(portfolio)
+    except (AttributeError, TypeError):
+        pass  # expected — constraint_checker is None in this stub
+    assert qm._market_data_blackout is False
+    assert qm._blackout_cancel_sent is False
+
+
 # ---- Tick rounding helpers ---------------------------------------------------
 
 def test_round_to_tick():

@@ -547,6 +547,30 @@ async def main():
                 logger.warning("daily_state save error: %s", e)
             last_daily_state_save = mono
 
+        # ── Blackout recovery check (runs even when killed) ─────────
+        # The blackout flag must clear based on fresh option ticks, not
+        # on update_quotes running. Otherwise a kill switch + blackout
+        # combination deadlocks: kill prevents update_quotes, which
+        # prevents the blackout from seeing fresh ticks and clearing.
+        if quotes._market_data_blackout and state.options:
+            freshest = min(
+                (now - opt.last_update).total_seconds()
+                for opt in state.options.values()
+            )
+            if freshest < 2.0:
+                logger.critical(
+                    "MARKET DATA BLACKOUT cleared: fresh option tick "
+                    "received (age=%.1fs)", freshest
+                )
+                quotes._market_data_blackout = False
+                quotes._blackout_cancel_sent = False
+                from .discord_notify import send_alert
+                send_alert(
+                    "BLACKOUT CLEARED",
+                    "Option data feed restored.",
+                    color=0x2ECC71,
+                )
+
         # ── Event-driven quote phase ─────────────────────────────────
         if risk.killed or weekend_paused:
             await asyncio.sleep(fallback_interval)

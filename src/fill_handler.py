@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 
 from ib_insync import ExecutionFilter
 
+from .discord_notify import send_fill_notification
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +164,35 @@ class FillHandler:
             self.portfolio.net_theta,
             self.portfolio.fills_today,
         )
+
+        # Discord notification (live fills only)
+        if trade is not None:
+            opt = self.market_data.state.get_option(strike, expiry=expiry, right=put_call)
+            opt_delta = opt.delta if opt else 0.0
+            opt_theta = opt.theta * self.config.product.multiplier if opt else 0.0
+            mkt_bid, mkt_ask = 0.0, 0.0
+            try:
+                mkt_bid, mkt_ask = self.market_data.get_clean_bbo(
+                    strike, put_call, expiry=expiry)
+            except Exception:
+                pass
+            theo_val = 0.0
+            try:
+                theo_val = self.quotes.sabr.get_theo(strike, put_call, expiry=expiry)
+            except Exception:
+                pass
+            send_fill_notification(
+                side=side, quantity=abs(quantity), strike=strike,
+                expiry=expiry, put_call=put_call, fill_price=fill_price,
+                theo=theo_val, spread_captured=spread_captured_theo,
+                underlying=self.market_data.state.underlying_price,
+                delta=opt_delta, theta=opt_theta,
+                market_bid=mkt_bid, market_ask=mkt_ask,
+                margin_after=self.margin.get_current_margin(),
+                net_delta=self.portfolio.net_delta,
+                net_theta=self.portfolio.net_theta,
+                fills_today=self.portfolio.fills_today,
+            )
 
         # CSV log
         self.csv_logger.log_fill(

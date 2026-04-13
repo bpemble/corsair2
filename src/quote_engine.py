@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, Optional, Tuple
 
 from ib_insync import IB, LimitOrder
+
+from .discord_notify import send_alert
 from ib_insync.order import OrderStatus
 from ib_insync.util import UNSET_DOUBLE, UNSET_INTEGER
 
@@ -290,6 +292,11 @@ class QuoteManager:
         # cleans it. Drop the entry on the first 104 so the next cycle places
         # a fresh order. Counter is for telemetry / sanity-check.
         self._error_104_count: int = 0
+        # Market data blackout flag — set on Error 10197 (competing session).
+        # While set, update_quotes is a no-op and all resting orders have been
+        # cancelled. Cleared only when fresh option ticks arrive.
+        self._market_data_blackout: bool = False
+        self._blackout_cancel_sent: bool = False
         self.ib.errorEvent += self._on_ib_error
 
     def _canonical_trade(self, order_id: int):
@@ -418,6 +425,34 @@ class QuoteManager:
         """
         state = self.market_data.state
         config = self.config
+
+        # Market data blackout guard: if Error 10197 fired, refuse to place
+        # or modify any orders until fresh option ticks confirm the feed is
+        # back. Check the freshest option tick age — if any option ticked
+        # within the last 2 seconds, the feed has recovered.
+        if self._market_data_blackout:
+            if state.options:
+                from datetime import datetime
+                freshest = min(
+                    (datetime.now() - opt.last_update).total_seconds()
+                    for opt in state.options.values()
+                )
+                if freshest < 2.0:
+                    logger.critical(
+                        "MARKET DATA BLACKOUT cleared: fresh option tick "
+                        "received (age=%.1fs) — resuming quoting", freshest
+                    )
+                    self._market_data_blackout = False
+                    self._blackout_cancel_sent = False
+                    send_alert(
+                        "BLACKOUT CLEARED",
+                        "Option data feed restored. Resuming quoting.",
+                        color=0x2ECC71,
+                    )
+                else:
+                    return  # still dark
+            else:
+                return  # no options at all
 
         # SABR recalibration is hoisted out of this hot path and runs from
         # main.py's loop via maybe_recal_sabr() — calibration takes several ms
@@ -1121,6 +1156,29 @@ class QuoteManager:
         if len(args) < 2:
             return
         reqId, errorCode = args[0], args[1]
+
+        # Error 10197: "No market data during competing live session."
+        # Another session (TWS, second gateway) stole our market data feed.
+        # Orders are still resting but we're blind to price changes.
+        # Immediately cancel everything and block new quotes until fresh
+        # option ticks confirm the feed is back.
+        if errorCode == 10197:
+            if not self._blackout_cancel_sent:
+                logger.critical(
+                    "MARKET DATA BLACKOUT (Error 10197): competing session "
+                    "detected — panic cancelling all orders"
+                )
+                self.panic_cancel()
+                self._blackout_cancel_sent = True
+                send_alert(
+                    "MARKET DATA BLACKOUT",
+                    "Error 10197: competing live session detected. "
+                    "All orders cancelled. Quoting suspended until "
+                    "option data feed resumes.",
+                )
+            self._market_data_blackout = True
+            return
+
         if errorCode != 104:
             return
         try:

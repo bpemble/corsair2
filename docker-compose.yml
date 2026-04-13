@@ -41,6 +41,7 @@ services:
       CORSAIR_GATEWAY_HOST: "127.0.0.1"
       CORSAIR_GATEWAY_PORT: "${TWS_PORT:-4002}"
       CORSAIR_ACCOUNT_ID: "${IBKR_ACCOUNT}"
+      DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:-}"
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
