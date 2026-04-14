@@ -49,8 +49,8 @@ constraints:
   # so the effective real-IBKR ceiling is closer to $66K. Conservative bias
   # is appropriate for first real-money deployment — leave the percentage
   # at 50% and let the synthetic act as the binding constraint.
-  capital: 500000
-  margin_ceiling_pct: 0.50    # 50% of $500K = $250K synthetic
+  capital: 1000000
+  margin_ceiling_pct: 0.50    # 50% of $1M = $500K synthetic
   delta_ceiling: 3.0          # |portfolio net_delta| must be <= this
   theta_floor: -200           # portfolio net_theta $/day, must be >= this
   # Margin-priority escape: when margin is currently breached, allow
@@ -74,7 +74,7 @@ puts:
   quote_range_high: 0         # up to ATM (inclusive)
 
 kill_switch:
-  margin_kill_pct: 0.70       # 70% of $500K = $350K
+  margin_kill_pct: 0.70       # 70% of $1M = $700K
   max_daily_loss: -2500       # Dollars (Stage 1)
   delta_kill: 5.0             # Combined |net_delta| kill threshold
   vega_kill: 1000             # |net_vega| (per vol pt) kill threshold
@@ -243,6 +243,12 @@ observe_products:
       min_edge_points: 0.001      # Minimum $0.001 edge vs theo ($25/contract)
       max_calibration_bbo_width: 0.05  # Drop wide BBOs from SABR calibration
       stale_iv_threshold: 0.25    # Accept wider IV divergence (HG back-month liquidity)
+      # Force SABR recal when HG forward moves > $0.005 (~0.08%, same
+      # fraction as ETH's $2/$2370). Without this, HG inherits ETH's $2
+      # threshold and never fast-recals — the delta-adjustment of stale
+      # theo in quote_engine then drifts theo far from market mid on
+      # back-month strikes, wrongly triggering behind_incumbent skips.
+      sabr_fast_recal_dollars: 0.005
     # HG SPAN scan parameters — copper is ~10× less volatile than ETH, so
     # ETH's 56%/49% scans produce bogus $100K+ margins per contract. CME
     # SPAN for copper uses ~6-8% price scans. Calibrated to target ~$15K
