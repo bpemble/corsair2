@@ -73,11 +73,13 @@ def make_observe_config(base_config, observe_entry) -> SimpleNamespace:
     ns.product = observe_entry.product
     if hasattr(observe_entry, "puts"):
         ns.puts = observe_entry.puts
-    # Overlay product-specific quoting/pricing overrides
+    # Overlay product-specific quoting/pricing/synthetic_span overrides
     if hasattr(observe_entry, "quoting"):
         ns.quoting = _overlay_namespace(base_config.quoting, observe_entry.quoting)
     if hasattr(observe_entry, "pricing"):
         ns.pricing = _overlay_namespace(base_config.pricing, observe_entry.pricing)
+    if hasattr(observe_entry, "synthetic_span"):
+        ns.synthetic_span = _overlay_namespace(base_config.synthetic_span, observe_entry.synthetic_span)
     # Carry the snapshot_path through so main.py knows where to write.
     ns._observe_snapshot_path = getattr(observe_entry, "snapshot_path",
                                          f"data/{observe_entry.name.lower()}_chain_snapshot.json")

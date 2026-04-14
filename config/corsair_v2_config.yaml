@@ -49,8 +49,8 @@ constraints:
   # so the effective real-IBKR ceiling is closer to $66K. Conservative bias
   # is appropriate for first real-money deployment — leave the percentage
   # at 50% and let the synthetic act as the binding constraint.
-  capital: 200000
-  margin_ceiling_pct: 0.50    # 50% of $200K = $100K synthetic
+  capital: 500000
+  margin_ceiling_pct: 0.50    # 50% of $500K = $250K synthetic
   delta_ceiling: 3.0          # |portfolio net_delta| must be <= this
   theta_floor: -200           # portfolio net_theta $/day, must be >= this
   # Margin-priority escape: when margin is currently breached, allow
@@ -74,7 +74,7 @@ puts:
   quote_range_high: 0         # up to ATM (inclusive)
 
 kill_switch:
-  margin_kill_pct: 0.70       # 70% of $200K = $140K (Stage 1)
+  margin_kill_pct: 0.70       # 70% of $500K = $350K
   max_daily_loss: -2500       # Dollars (Stage 1)
   delta_kill: 5.0             # Combined |net_delta| kill threshold
   vega_kill: 1000             # |net_vega| (per vol pt) kill threshold
@@ -130,7 +130,7 @@ quoting:
   # higher-tier accounts). The ib_insync IndexError race in updateMktDepthL2
   # is patched at startup via src/ib_insync_patch.py so depth cycling can
   # run safely. If you see "reqMktDepth rotate failed" warnings, drop to 3.
-  max_active_depth_subs: 5
+  max_active_depth_subs: 3         # ETH gets 3, HG gets 2 — total ≤ 5 (IBKR cap)
   depth_rotation_interval_sec: 2   # Cycle the depth window every N seconds
   min_incumbent_size: 2            # Min contracts at a level to be a "real" incumbent
   max_bbo_width_dollars: 10.00     # Don't penny-jump if BBO is wider than this (ETH options typically $5-8)
@@ -209,35 +209,47 @@ observe_products:
       multiplier: 25000           # 25,000 lbs per contract
       currency: "USD"
       option_type: "both"
-      # Subscription range: exactly the visibility window.
-      # Quoting range is [ATM+15, ATM+50] for calls, mirror for puts.
-      # +5 strikes on each end for visibility → ±55.
-      strike_range_low: -55
-      strike_range_high: 55
-      # Call quoting geometry (not active yet — for display banding only)
-      quote_range_low: 15         # ATM + $0.15
-      quote_range_high: 50        # ATM + $0.50
+      # Subscribe on the $0.05 grid only — penny strikes between have
+      # near-zero OI and never trade. ±11 increments at $0.05 = ATM±$0.55,
+      # covering the full quoting band + 1 buffer strike on each end.
+      strike_range_low: -11
+      strike_range_high: 11
+      # Call quoting geometry (in $0.05 increments)
+      quote_range_low: 3          # ATM + 3×$0.05 = ATM + $0.15
+      quote_range_high: 10        # ATM + 10×$0.05 = ATM + $0.50
       min_dte: 3
-      subscribed_expiries: 3      # Front / front+1 / front+2
+      subscribed_expiries: 3      # Front / front+1 / front+2 (SABR needs back months)
       quote_size: 1
       underlying_symbol: "HG"     # COMEX copper futures
       option_symbol: "HXE"        # Copper options on futures
       trading_class: "HXE"
       security_type: "FOP"
-      strike_increment: 0.01      # $0.01/lb near ATM
+      strike_increment: 0.05      # $0.05 grid (skips penny strikes)
     puts:
       enabled: true
-      quote_range_low: -50        # ATM - $0.50
-      quote_range_high: -15       # ATM - $0.15
+      quote_range_low: -10        # ATM - 10×$0.05 = ATM - $0.50
+      quote_range_high: -3        # ATM - 3×$0.05 = ATM - $0.15
     # HG-specific overrides for shared config blocks. These replace the
     # ETH-tuned values when quoting goes live. All dollar-denominated
     # thresholds are ~1/400th of ETH's (HG ~$6/lb vs ETH ~$2300).
     quoting:
+      enabled_expiries: ["front", "front+1", "front+2"]  # 3 months, like ETH
       tick_size: 0.0005           # HG option minimum tick ($0.0005/lb = $12.50/contract)
       max_bbo_width_dollars: 0.05 # Skip quoting if BBO wider than 5¢
       delta_retreat_threshold: 0.02  # Retreat on $0.02 underlying move (~2× HG p99 tick)
       max_resting_per_side: 120   # 35 strikes × 3 expiries + headroom
+      max_active_depth_subs: 2    # IBKR caps at 5/connection; ETH takes 3, HG takes 2
     pricing:
-      min_edge_points: 0.002      # Minimum $0.002 edge vs theo ($50/contract)
+      min_edge_points: 0.001      # Minimum $0.001 edge vs theo ($25/contract)
       max_calibration_bbo_width: 0.05  # Drop wide BBOs from SABR calibration
+      stale_iv_threshold: 0.25    # Accept wider IV divergence (HG back-month liquidity)
+    # HG SPAN scan parameters — copper is ~10× less volatile than ETH, so
+    # ETH's 56%/49% scans produce bogus $100K+ margins per contract. CME
+    # SPAN for copper uses ~6-8% price scans. Calibrated to target ~$15K
+    # per naked short, matching user's reference from IBKR's actual SPAN.
+    synthetic_span:
+      up_scan_pct: 0.08
+      down_scan_pct: 0.08
+      vol_scan_pct: 0.20
+      short_option_minimum: 500.0
     snapshot_path: "data/hg_chain_snapshot.json"

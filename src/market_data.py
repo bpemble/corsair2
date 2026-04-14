@@ -410,6 +410,18 @@ class MarketDataManager:
             low_bound = relevant_strikes[0] if relevant_strikes else 0
             high_bound = relevant_strikes[-1] if relevant_strikes else 0
 
+        # Grid filter: only keep strikes that fall on the configured increment.
+        # For products with mixed native grids (HG: $0.01 near ATM, $0.05 in
+        # wings; $0.05 increment from config skips the low-OI penny strikes).
+        # Uses a relative tolerance because strike * (1/inc) should be an
+        # integer within float precision.
+        if inc > 0:
+            tol = inc * 1e-6
+            relevant_strikes = [
+                s for s in relevant_strikes
+                if abs(round(s / inc) * inc - s) < tol
+            ]
+
         logger.info(
             "Option chain: %d expiries %s, %d strikes in range [%.0f, %.0f], "
             "increment=%.0f, ATM=%.0f",

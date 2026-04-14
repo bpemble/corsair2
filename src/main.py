@@ -31,7 +31,7 @@ from .fill_handler import FillHandler
 from .risk_monitor import RiskMonitor
 from .logging_utils import CSVLogger
 from .weekend import friday_shutdown, monday_startup
-from .snapshot import write_chain_snapshot, write_observe_snapshot
+from .snapshot import write_chain_snapshot
 from . import daily_state
 from .watchdog import (
     safe_discover_and_subscribe,
