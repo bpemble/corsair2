@@ -1,11 +1,32 @@
-"""CSV logging for Corsair v2: fills, quotes, risk snapshots, calibrations, margin scale."""
+"""CSV logging for Corsair v2: fills, quotes, risk snapshots, calibrations, margin scale.
+
+Writes are async: callers (running on the event loop) enqueue rows to an
+in-memory queue and return immediately. A background thread drains the
+queue in batches, amortizing open/close syscalls across many rows. Before
+this, synchronous per-row open/write/close was a measurable drag on TTT
+— at ~3000 quote decisions/sec, the three syscalls per row landed in the
+critical path between tick arrival and placeOrder.
+"""
 
 import csv
 import logging
 import os
+import queue
+import threading
 from datetime import date, datetime
+from typing import Tuple, List
 
 logger = logging.getLogger(__name__)
+
+# Batch drain window for the writer thread. 100ms is long enough to
+# coalesce many rows into one open/close but short enough that on crash
+# the data loss window is bounded.
+_BATCH_DRAIN_SEC = 0.1
+# Max rows per open/close. At ~3000 rows/sec across all files, 500
+# gives us ~6 opens/sec instead of ~3000.
+_BATCH_MAX_ROWS = 500
+# Queue sentinel signaling the worker to exit after draining.
+_SHUTDOWN = object()
 
 
 # Centralized schema: one source of truth so the rotation logic can compare
@@ -89,6 +110,17 @@ class CSVLogger:
         self._quote_date: date = date.today()
 
         self._init_files()
+
+        # Async write queue + worker. Bounded at 100K rows to prevent
+        # runaway memory if the writer thread stalls. On overflow we drop
+        # the oldest row and log — losing noisy quote telemetry is fine;
+        # blocking the event loop is not.
+        self._write_queue: "queue.Queue[Tuple[str, list]]" = queue.Queue(maxsize=100_000)
+        self._dropped_rows = 0
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, name="csv-writer", daemon=True,
+        )
+        self._writer_thread.start()
 
     def _init_files(self):
         """Create CSV files with headers if they don't exist. Rotate any
@@ -193,12 +225,78 @@ class CSVLogger:
             writer.writerow(fields)
 
     def _append_row(self, path: str, row: list):
+        """Enqueue a row for the background writer. Non-blocking: drops
+        the row if the queue is full rather than blocking the event loop."""
         try:
-            with open(path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(row)
-        except Exception as e:
-            logger.warning("Failed to write to %s: %s", path, e)
+            self._write_queue.put_nowait((path, row))
+        except queue.Full:
+            self._dropped_rows += 1
+            # Log once per 1000 drops to avoid flooding stderr if the
+            # writer thread wedges.
+            if self._dropped_rows % 1000 == 1:
+                logger.warning(
+                    "CSV write queue full; dropped %d rows so far",
+                    self._dropped_rows,
+                )
+
+    def _writer_loop(self):
+        """Drain the write queue in batches, coalescing rows per-file so
+        we open/close each target file at most once per batch."""
+        while True:
+            batch: List[Tuple[str, list]] = []
+            # Block on the first row so we don't busy-spin when idle.
+            try:
+                first = self._write_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if first is _SHUTDOWN:
+                return
+            batch.append(first)
+
+            # Drain additional rows up to the batch limits.
+            drain_deadline = None
+            import time as _time
+            while len(batch) < _BATCH_MAX_ROWS:
+                if drain_deadline is None:
+                    drain_deadline = _time.monotonic() + _BATCH_DRAIN_SEC
+                remaining = drain_deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._write_queue.get(timeout=min(remaining, 0.05))
+                except queue.Empty:
+                    break
+                if item is _SHUTDOWN:
+                    self._flush_batch(batch)
+                    return
+                batch.append(item)
+
+            self._flush_batch(batch)
+
+    def _flush_batch(self, batch: List[Tuple[str, list]]):
+        """Group rows by target file and write each group with a single
+        open/close. Errors are logged but don't halt the writer."""
+        by_path: dict = {}
+        for path, row in batch:
+            by_path.setdefault(path, []).append(row)
+        for path, rows in by_path.items():
+            try:
+                with open(path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
+            except Exception as e:
+                logger.warning("Failed to write %d rows to %s: %s",
+                               len(rows), path, e)
+
+    def shutdown(self, timeout: float = 5.0):
+        """Flush outstanding rows and stop the writer thread. Safe to call
+        multiple times; blocks up to *timeout* seconds."""
+        try:
+            self._write_queue.put_nowait(_SHUTDOWN)
+        except queue.Full:
+            # Queue is backed up — force shutdown by draining what we can.
+            pass
+        self._writer_thread.join(timeout=timeout)
 
     def log_fill(self, strike, expiry, put_call, side, quantity, fill_price,
                  spread_captured_theo, spread_captured_mid,

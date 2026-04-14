@@ -760,6 +760,11 @@ async def main():
         except Exception:
             pass
     await conn.disconnect()
+    # Flush any queued CSV rows to disk before exiting.
+    try:
+        csv_logger.shutdown(timeout=5.0)
+    except Exception as e:
+        logger.warning("csv_logger shutdown error: %s", e)
     logger.info("Corsair v2 shutdown complete.")
 
 
