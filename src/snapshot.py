@@ -170,17 +170,32 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         if state.front_month_expiry else {}
     )
 
-    # Per-position detail with MtM P&L. If we don't yet have a fresh
-    # bid/ask for this strike (just-subscribed, mid-rotation, etc.), fall
-    # back to the avg fill price so unrealized_pnl reads as 0 instead of a
-    # nonsensical "compared to zero mark" number.
+    # Per-position detail with MtM P&L. Mark priority:
+    #   1. live BBO mid (authoritative during market hours)
+    #   2. IBKR's portfolio() marketPrice (authoritative when markets are
+    #      closed — weekends, daily close window; our BBO is stale then and
+    #      fell through to avg_fill_price, rendering every unrealized_pnl
+    #      as 0 and masking real exposure)
+    #   3. our cached current_price (from prior live update)
+    #   4. avg_fill_price (gives unrealized=0; last resort)
     #
     # Multi-product: use pos.multiplier (per-position) — using
     # config.product.multiplier here would render HG positions with ETH's
     # 50× when this function is called for the ETH dashboard, or render
     # ETH positions with HG's 25000× when called for the HG dashboard.
-    # The product filter below also keeps the wrong-product rows out of
-    # the table entirely.
+    ibkr_marks: dict = {}
+    try:
+        for it in ib.portfolio(account_id):
+            c = it.contract
+            if c.secType != "FOP" or c.right not in ("C", "P"):
+                continue
+            px = float(it.marketPrice) if it.marketPrice else 0.0
+            if px > 0:
+                ibkr_marks[(c.symbol, float(c.strike),
+                            c.lastTradeDateOrContractMonth, c.right)] = px
+    except Exception as e:
+        logger.debug("snapshot: ib.portfolio() read failed: %s", e)
+
     positions_detail = []
     options_unrealized_total = 0.0
     own_positions = [p for p in portfolio.positions if p.product == product]
@@ -188,10 +203,13 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         opt = state.get_option(p.strike, p.expiry, p.put_call)
         if opt and opt.bid > 0 and opt.ask > 0:
             mark = (opt.bid + opt.ask) / 2
+        elif (ibkr_px := ibkr_marks.get(
+                (p.product, float(p.strike), p.expiry, p.put_call))):
+            mark = ibkr_px
         elif p.current_price > 0:
             mark = p.current_price
         else:
-            mark = p.avg_fill_price  # no live mark yet; show zero P&L
+            mark = p.avg_fill_price
         unrealized = (mark - p.avg_fill_price) * p.quantity * p.multiplier
         options_unrealized_total += unrealized
         positions_detail.append({
