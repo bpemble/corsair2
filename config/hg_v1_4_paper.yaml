@@ -41,7 +41,7 @@ constraints:
   capital: 75000
   margin_ceiling_pct: 0.60     # 60% of $75K = $45K soft ceiling
   delta_ceiling: 3.0           # |portfolio net_delta| must be <= this
-  theta_floor: -150            # soft theta floor ($/day)
+  theta_floor: -500            # soft theta floor ($/day)
   margin_escape_enabled: true  # fills that reduce margin ok above ceiling
 
 kill_switch:
@@ -57,7 +57,7 @@ kill_switch:
   # Per-product thresholds.
   delta_kill: 5.0              # |net_delta| kill (v1.4 §6.2 unchanged)
   vega_kill: 500               # |net_vega| halt ($500 Stage 1 per §6.2)
-  theta_kill: -200             # theta halt (-$200 Stage 1 per §6.2)
+  theta_kill: -500             # theta halt (raised from -200 to allow bid-side quoting while long-option positions decay)
 
 # Operational kill switches (v1.4 §7). These are infrastructure-level
 # protections, not strategy levers. Implemented in src/operational_kills.py
@@ -134,10 +134,11 @@ logging:
 # Each product's override block merges onto these.
 puts:
   enabled: true
-  # v1.4 symmetric scope: puts quote ATM-5 to ATM+5 nickels (same as
-  # calls). Replaces v1.3's asymmetric ATM-5 to ATM.
+  # Asymmetric scope: puts quote ATM-5 to ATM (OTM + ATM only). ITM puts
+  # have thin flow and wide spreads — quoting them wastes order budget
+  # and adds serialization latency without meaningful fill volume.
   quote_range_low: -5
-  quote_range_high: 5
+  quote_range_high: 0
 
 quoting:
   enabled_expiries: ["front"]  # Front-month ONLY per v1.4 §3.1
@@ -213,12 +214,15 @@ products:
       # was mostly our own tick-processing overhead).
       strike_range_low: -7
       strike_range_high: 7
-      # v1.4 §3.2 symmetric sym_5: ATM ± 5 nickels. Calls AND puts quote
-      # at every strike — handled by making the CALL range symmetric
-      # here and the PUT range symmetric in puts.quote_range_* below.
-      # Result: 11 unique nickel strikes × 2 rights = 22 instruments,
-      # 44 max resting orders.
-      quote_range_low: -5      # ATM − $0.25
+      # Asymmetric scope: CALLS quote ATM to ATM+5 nickels (OTM calls +
+      # ATM). PUTS quote ATM-5 to ATM (see puts.quote_range_* below).
+      # Shared ATM strike means 11 unique strikes, ~12 instruments (6 calls
+      # + 6 puts, ATM double-covered), ~24 max resting orders. Halves the
+      # order count vs sym_5 symmetric and cuts ~50% of per-refresh
+      # serialization latency. Trade-off: may reintroduce short-C vs
+      # short-P inventory imbalance on persistent underlying drift —
+      # monitor; re-enable inventory_balance gate if skew >30% sustained.
+      quote_range_low: 0       # ATM
       quote_range_high: 5      # ATM + $0.25
       min_dte: 3
       max_dte: 35              # v1.4 §3.1: DTE ≤ 35
@@ -238,9 +242,9 @@ products:
       nickel_only: true
     puts:
       enabled: true
-      # v1.4 symmetric scope — puts same window as calls.
+      # Asymmetric scope — puts quote ATM-5 to ATM (OTM + ATM only).
       quote_range_low: -5      # ATM − $0.25
-      quote_range_high: 5      # ATM + $0.25
+      quote_range_high: 0      # ATM
     quoting:
       enabled_expiries: ["front"]
       tick_size: 0.0005        # $0.0005/lb = $12.50/contract
