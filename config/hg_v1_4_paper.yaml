@@ -183,9 +183,15 @@ quoting:
   dead_band_mid_ticks: 3
   dead_band_far_ticks: 6
   max_concurrent_amends_per_tick: 4
-  max_age_s_near: 1.0
-  max_age_s_mid: 3.0
-  max_age_s_far: 5.0
+  # Tuned 2026-04-21: diagnostic counter showed 93% of amends were
+  # max-age force-refresh (no price change), only 7% real reprice.
+  # Raised bucket ceilings to cut background churn ~3-5× while
+  # keeping all values under GTD_EXPIRY(30s) - REFRESH_THRESHOLD(10s)
+  # so the GTD refresh path stays dormant. Real price-change amends
+  # and edge_violation bypass are unaffected.
+  max_age_s_near: 5.0
+  max_age_s_mid: 10.0
+  max_age_s_far: 15.0
 
 pricing:
   sabr_enabled: true
