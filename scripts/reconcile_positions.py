@@ -26,7 +26,7 @@ from ib_insync import IB, ExecutionFilter
 GATEWAY_HOST = "127.0.0.1"  # host networking — same as corsair
 GATEWAY_PORT = 4002
 CLIENT_ID = 99
-ACCOUNT = "DUP553656"
+ACCOUNT = "DUP553657"  # matches IBKR_ACCOUNT in .env
 SNAPSHOT = "data/chain_snapshot.json"
 
 
