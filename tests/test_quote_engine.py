@@ -426,3 +426,55 @@ def test_ceil_to_tick():
     assert ceil_to_tick(80.1, 0.5) == 80.5
     assert ceil_to_tick(80.5, 0.5) == 80.5
     assert ceil_to_tick(80.6, 0.5) == 81.0
+
+
+# ---- priority_v1 bucket classifier -------------------------------------------
+
+def _bucket_qm(near=0.30, far=0.10):
+    """Build a QuoteManager instance bypassing __init__ so we can test the
+    pure classifier without wiring up IB/market_data/sabr.
+    """
+    from src.quote_engine import QuoteManager
+    qm = QuoteManager.__new__(QuoteManager)
+    qm.config = SimpleNamespace(
+        quoting=SimpleNamespace(
+            delta_threshold_near=near,
+            delta_threshold_far=far,
+        ),
+    )
+    return qm
+
+
+def test_priority_bucket_near_on_high_delta():
+    qm = _bucket_qm()
+    assert qm._priority_bucket(SimpleNamespace(delta=0.5)) == "near"
+    assert qm._priority_bucket(SimpleNamespace(delta=-0.45)) == "near"
+    assert qm._priority_bucket(SimpleNamespace(delta=0.30)) == "near"
+
+
+def test_priority_bucket_mid_between_thresholds():
+    qm = _bucket_qm()
+    assert qm._priority_bucket(SimpleNamespace(delta=0.20)) == "mid"
+    assert qm._priority_bucket(SimpleNamespace(delta=-0.15)) == "mid"
+    assert qm._priority_bucket(SimpleNamespace(delta=0.10)) == "mid"
+
+
+def test_priority_bucket_far_below_threshold():
+    qm = _bucket_qm()
+    assert qm._priority_bucket(SimpleNamespace(delta=0.05)) == "far"
+    assert qm._priority_bucket(SimpleNamespace(delta=-0.01)) == "far"
+    assert qm._priority_bucket(SimpleNamespace(delta=0.0)) == "far"
+
+
+def test_priority_bucket_missing_delta_falls_back_to_near():
+    qm = _bucket_qm()
+    assert qm._priority_bucket(None) == "near"
+    assert qm._priority_bucket(SimpleNamespace(delta=None)) == "near"
+    assert qm._priority_bucket(SimpleNamespace()) == "near"
+
+
+def test_priority_bucket_respects_custom_thresholds():
+    qm = _bucket_qm(near=0.50, far=0.20)
+    assert qm._priority_bucket(SimpleNamespace(delta=0.45)) == "mid"
+    assert qm._priority_bucket(SimpleNamespace(delta=0.15)) == "far"
+    assert qm._priority_bucket(SimpleNamespace(delta=0.55)) == "near"

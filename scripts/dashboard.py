@@ -31,24 +31,29 @@ except ImportError:
 # Paths
 # ---------------------------------------------------------------------------
 
-SNAPSHOT_PATH = str(PROJECT_ROOT / "data" / "chain_snapshot.json")
-
-# Discover observe-only product snapshots (written by main.py for each
-# observe_products entry). Each gets a tab in the product selector.
+# Discover product snapshots via filename convention. Each product writes
+# data/<name>_chain_snapshot.json (see src/config.py:88). Dashboard shows
+# one tab per discovered file. ETH was wound down 2026-04-18; if re-enabled
+# later, update its snapshot_path override in corsair_v2_config.yaml so the
+# file matches the convention.
 def _discover_products():
     """Return list of (name, snapshot_path) tuples for all products."""
-    products = [("ETH", SNAPSHOT_PATH)]
+    products = []
     data_dir = PROJECT_ROOT / "data"
     for p in sorted(data_dir.glob("*_chain_snapshot.json")):
-        # Skip the primary snapshot
-        if p.name == "chain_snapshot.json":
-            continue
         # Derive name from filename: hg_chain_snapshot.json -> HG
         name = p.stem.replace("_chain_snapshot", "").upper()
         products.append((name, str(p)))
     return products
 
 PRODUCTS = _discover_products()
+
+# Fallback snapshot path for callers that have no explicit product in scope.
+# Defaults to the first discovered product's file; when no products are
+# present (no corsair run yet on this host) falls back to a non-existent
+# path so load_snapshot() returns None cleanly.
+SNAPSHOT_PATH = (PRODUCTS[0][1] if PRODUCTS
+                 else str(PROJECT_ROOT / "data" / "chain_snapshot.json"))
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -137,7 +142,7 @@ _product_names = [p[0] for p in PRODUCTS]
 _product_paths = {p[0]: p[1] for p in PRODUCTS}
 
 _selected_product = st.session_state.get(
-    "selected_product", _product_names[0] if _product_names else "ETH",
+    "selected_product", _product_names[0] if _product_names else "HG",
 )
 _active_snap_path = _product_paths.get(_selected_product, SNAPSHOT_PATH)
 

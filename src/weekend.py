@@ -1,14 +1,57 @@
-"""Weekend and expiry protocol for Corsair v2.
+"""Weekend, market-hours, and expiry protocol for Corsair v2.
 
 Friday: Cancel all quotes, log weekend risk summary.
 Monday: Check margin, refresh Greeks, validate before resuming.
+Market-hours helper: used by the watchdog to skip tick-staleness checks
+during the CME daily maintenance window and weekend closure.
 """
 
 import logging
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from .utils import days_to_expiry
 
 logger = logging.getLogger(__name__)
+
+CT = ZoneInfo("America/Chicago")
+
+
+def is_market_open(now_utc: datetime = None) -> bool:
+    """Return True if CME Globex HG futures / HXE options are currently
+    expected to be streaming ticks.
+
+    CME Globex HG/HXE schedule (CT):
+      - Sunday 17:00 → Friday 16:00: open
+      - Daily maintenance window Mon-Thu 16:00-17:00 CT: closed
+      - Friday 16:00 → Sunday 17:00: weekend closure
+
+    Used by the watchdog to suppress tick-staleness reconnect storms
+    during known no-tick windows. Connection loss is still treated as
+    unhealthy regardless (ib.isConnected() check bypasses this gate).
+    """
+    if now_utc is None:
+        now_utc = datetime.now(tz=timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_ct = now_utc.astimezone(CT)
+    dow = now_ct.weekday()  # 0=Mon .. 6=Sun
+    hour = now_ct.hour
+
+    # Weekend closure: Friday 16:00 CT through Sunday 17:00 CT.
+    if dow == 4 and hour >= 16:          # Friday afternoon+
+        return False
+    if dow == 5:                          # Saturday all day
+        return False
+    if dow == 6 and hour < 17:            # Sunday before 17:00 CT
+        return False
+
+    # Daily maintenance window: Mon-Thu 16:00-17:00 CT. Friday 16:00 is
+    # the weekly close (handled above), Sunday 17:00 is the reopen.
+    if dow in (0, 1, 2, 3) and hour == 16:
+        return False
+
+    return True
 
 
 def friday_shutdown(quotes, portfolio, config):

@@ -1036,9 +1036,19 @@ class MarketDataManager:
         if dte <= config.product.min_dte:
             return quotable
 
+        # v1.4 §3.2 nickel-only gate. Belt-and-braces against any non-nickel
+        # strike slipping through chain discovery (e.g. CME listing penny
+        # strikes for a specific event). Primary enforcement is at subscribe
+        # time via strike_increment=0.05 in market_data._discover_option_chain;
+        # this is the quote-path runtime check so the flag in config doesn't
+        # just document intent. Only active when the product sets nickel_only.
+        nickel_only = bool(getattr(config.product, "nickel_only", False))
+
         for right, low, high in windows:
             for strike in all_strikes:
                 if strike < low or strike > high:
+                    continue
+                if nickel_only and round(strike * 100) % 5 != 0:
                     continue
                 option = state.get_option(strike, expiry=expiry, right=right)
                 if option is None:

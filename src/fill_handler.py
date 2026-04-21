@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from ib_insync import ExecutionFilter
 
 from .discord_notify import send_fill_notification
+from .utils import format_hxe_symbol, iso8601ms_utc
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,8 @@ class FillHandler:
     """Handles fill events from IBKR."""
 
     def __init__(self, ib, portfolio, margin_checker, quote_manager,
-                 market_data, csv_logger, config, product_filter=None):
+                 market_data, csv_logger, config, product_filter=None,
+                 risk_monitor=None, hedge_manager=None):
         self.ib = ib
         self.portfolio = portfolio
         self.margin = margin_checker
@@ -36,6 +38,14 @@ class FillHandler:
         # _product_filter (which is option_symbol — what fill events come
         # back tagged with).
         self._product_key = config.product.underlying_symbol
+        # v1.4 §6.1: daily P&L halt must sample on every fill, not just
+        # at the 5-minute risk check cadence. Holding a risk reference
+        # lets us call check_daily_pnl_only() immediately post-fill.
+        # Injected by main.py; None in legacy/test paths.
+        self.risk_monitor = risk_monitor
+        # v1.4 §5: delta hedge rebalance on fill. Optional — None means
+        # no hedging wired (Stage 0 bootstrap before HedgeManager is up).
+        self.hedge_manager = hedge_manager
 
         # Register fill callback
         self.ib.execDetailsEvent += self._on_exec_details
@@ -238,6 +248,65 @@ class FillHandler:
             fill_latency_ms=fill_latency_ms,
             underlying_price=underlying_at_fill,
         )
+
+        # Paper-trading JSONL event — corsair→crowsnest interface, spec
+        # hg_spec_v1.3.md §17.1/17.2. Emits per fill; missing recommended
+        # fields (theo_at_quote, quoter_count, corsair_bid/ask at quote time,
+        # sabr_rmse_at_fill) require upstream plumbing not yet in place.
+        try:
+            self.csv_logger.log_paper_event({
+                "ts": iso8601ms_utc(),
+                "event_type": "fill",
+                "symbol": format_hxe_symbol(expiry, put_call, strike),
+                "side": "BUY" if quantity > 0 else "SELL",
+                "size": abs(quantity),
+                "price": fill_price,
+                "market_bid": mkt_bid,
+                "market_ask": mkt_ask,
+                "theo_at_fill": theo_val,
+                "margin_at_fill": self.margin.get_current_margin(),
+                "delta_at_fill": self.portfolio.net_delta,
+                "theta_at_fill": self.portfolio.net_theta,
+                "vega_at_fill": self.portfolio.net_vega,
+                "forward_at_fill": underlying_at_fill,
+            })
+        except Exception as e:
+            logger.debug("paper fill event emit failed: %s", e)
+
+        # v1.4 §6.1 PRIMARY defense: intraday P&L halt must sample on
+        # every fill. Live fills only (replayed fills re-run seed+replay
+        # math that the halt already saw at the original fill time). If
+        # the halt fires here, risk.kill() flattens via the wired
+        # flatten_callback — return BEFORE re-quoting so we don't race
+        # the flatten path.
+        if trade is not None and self.risk_monitor is not None:
+            try:
+                if self.risk_monitor.check_daily_pnl_only():
+                    return  # halt fired; flatten in progress
+            except Exception:
+                logger.exception("check_daily_pnl_only failed after fill")
+
+        # When ALREADY killed (halt fired on a prior fill, and THIS fill
+        # is one of the flatten IOC closes), skip hedge rebalance and
+        # quote update. Rebalancing on close fills during a halt would
+        # either emit misleading observe-mode log events or — in execute
+        # mode — send a futures order that contradicts the flatten-on-
+        # halt intent. Quote update is already a no-op post-kill because
+        # cancel_all_quotes emptied active_orders, but we skip explicitly
+        # for clarity.
+        if (trade is not None and self.risk_monitor is not None
+                and self.risk_monitor.killed):
+            return
+
+        # v1.4 §5: delta hedge rebalance on every live fill.
+        if trade is not None and self.hedge_manager is not None:
+            try:
+                self.hedge_manager.rebalance_on_fill(
+                    strike=strike, expiry=expiry, put_call=put_call,
+                    quantity=quantity, fill_price=fill_price,
+                )
+            except Exception:
+                logger.exception("hedge rebalance_on_fill failed")
 
         # Immediately re-evaluate all quotes (fill changes portfolio state).
         # For replayed fills (trade=None), the quote loop is not yet running

@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 
 def setup_logging(log_config) -> None:
@@ -56,3 +56,28 @@ def ceil_to_tick(price: float, tick_size: float) -> float:
     """Round a price UP to the nearest valid tick."""
     import math
     return math.ceil(price / tick_size) * tick_size
+
+
+# CME month codes: F G H J K M N Q U V X Z (Jan through Dec).
+_CME_MONTH_CODES = "FGHJKMNQUVXZ"
+
+
+def format_hxe_symbol(expiry: str, put_call: str, strike: float) -> str:
+    """Format HG option symbol per hg_spec_v1.3 §2.2: 'HXE[M][Y] [CP][strike×100]'.
+
+    e.g. expiry='20260320', put_call='C', strike=4.85 → 'HXEH6 C485'.
+    """
+    exp_date = datetime.strptime(expiry, "%Y%m%d").date()
+    month_code = _CME_MONTH_CODES[exp_date.month - 1]
+    year_digit = exp_date.year % 10
+    strike_cents = int(round(strike * 100))
+    return f"HXE{month_code}{year_digit} {put_call}{strike_cents}"
+
+
+def iso8601ms_utc() -> str:
+    """Return current UTC time as ISO 8601 with millisecond precision and 'Z'.
+
+    Spec: hg_spec_v1.3.md §17.1 ('ts' field format).
+    """
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S") + f".{now.microsecond // 1000:03d}Z"

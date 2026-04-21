@@ -27,7 +27,9 @@ from .constraint_checker import IBKRMarginChecker, ConstraintChecker, MarginCoor
 from .sabr import MultiExpirySABR
 from .quote_engine import QuoteManager
 from .fill_handler import FillHandler
-from .risk_monitor import RiskMonitor
+from .risk_monitor import RiskMonitor, _resolve_daily_halt_threshold
+from .hedge_manager import HedgeManager, HedgeFanout
+from .operational_kills import OperationalKillMonitor
 from .logging_utils import CSVLogger
 from .weekend import friday_shutdown, monday_startup
 from .snapshot import write_chain_snapshot
@@ -335,12 +337,17 @@ async def main():
         # Back-reference so the trade-tape capture in market_data can look
         # up our resting state at print time.
         md.quotes = quotes
+        # v1.4 §5 delta hedge manager. Constructed per-product since
+        # each product has its own underlying future. No-op when
+        # config.hedging.enabled is false or absent.
+        hedge = HedgeManager(ib, pcfg, md, portfolio, csv_logger=csv_logger)
         # product_filter must be the IBKR underlying symbol (what
         # fill.contract.symbol returns). Before 2026-04-14 this was set
         # to option_symbol and silently dropped every fill.
         fills_eng = FillHandler(ib, portfolio, margin, quotes, md,
                                 csv_logger, pcfg,
-                                product_filter=pcfg.product.underlying_symbol)
+                                product_filter=pcfg.product.underlying_symbol,
+                                hedge_manager=hedge)
 
         engines.append({
             "name": pcfg.name,
@@ -350,6 +357,7 @@ async def main():
             "margin": margin,
             "quotes": quotes,
             "fills": fills_eng,
+            "hedge": hedge,
         })
         logger.info(
             "Product %s ready: underlying=%.4f, ATM=%.4f, %d options, expiry=%s",
@@ -370,11 +378,71 @@ async def main():
     primary_config = primary["config"]
 
     # ── 7. Risk monitor ───────────────────────────────────────────────
-    risk = RiskMonitor(portfolio, margin_coord, quotes, csv_logger, primary_config)
+    # v1.4 §6.1/§6.2: flatten_callback iterates every registered engine so
+    # a flatten-type kill closes positions across products, not just the
+    # primary. hedge_manager is wired after construction if the v1.4
+    # hedging block is present in config.
+    def _flatten_all_engines(reason: str) -> None:
+        for eng in engines:
+            try:
+                eng["quotes"].flatten_all_positions(portfolio, reason=reason)
+            except Exception as e:
+                logger.error("flatten_all_positions %s failed: %s",
+                             eng["name"], e)
+
+    # Multi-product hedge dispatcher — see HedgeFanout docstring.
+    hedge_fanout = HedgeFanout([eng["hedge"] for eng in engines])
+
+    # v1.4 §6.1: flatten_callback must also flatten the futures hedge
+    # in addition to options. Compose the options-flatten and
+    # hedge-flatten paths.
+    #
+    # Ordering: options first, then hedge. Both steps submit orders and
+    # return immediately (IOC limits); actual fills arrive asynchronously
+    # via execDetailsEvent. In observe-mode hedging (Stage 0 default) this
+    # is correct because the hedge "flatten" just zeroes local state
+    # without real futures orders. In execute mode, there IS a race — if
+    # the options flatten fills before the hedge order is sent, the net
+    # book may briefly be mis-hedged. That race is tolerated under the
+    # "both must flatten per spec §6.1" rule; post-flatten reconciliation
+    # against ib.positions() is a v1.5 item that will close this gap.
+    def _flatten_all_engines_with_hedge(reason: str) -> None:
+        _flatten_all_engines(reason)
+        hedge_fanout.flatten_on_halt(reason)
+
+    risk = RiskMonitor(
+        portfolio, margin_coord, quotes, csv_logger, primary_config,
+        flatten_callback=_flatten_all_engines_with_hedge,
+        hedge_manager=hedge_fanout,
+    )
+
+    # Inject risk monitor into every engine's fill handler so the per-fill
+    # P&L halt check fires on every live execution (v1.4 §6.1).
+    for eng in engines:
+        try:
+            eng["fills"].risk_monitor = risk
+        except Exception:
+            logger.exception("failed to inject risk_monitor into %s fills",
+                             eng["name"])
+
+    # v1.4 §7: operational kill-switch monitor. Sampled from the main
+    # loop; fires via risk.kill(source="operational"). Sticky.
+    op_kills = OperationalKillMonitor(engines, portfolio, risk, config)
 
     # ── 8. Disconnect callback ────────────────────────────────────────
     def on_disconnect():
         logger.critical("GATEWAY DISCONNECT — panic cancelling all quotes")
+        # Emit reconnects.jsonl event (v1.4 §9.5) with pending order
+        # count BEFORE cancel_all clears local state.
+        try:
+            pending_pre = sum(1 for _ in ib.openTrades())
+            csv_logger.log_paper_reconnect(
+                event="disconnect",
+                pending_orders_pre=pending_pre,
+                detail="conn.disconnect_callback",
+            )
+        except Exception:
+            pass
         # panic_cancel (reqGlobalCancel) instead of per-order walks —
         # one message is faster and more likely to reach IBKR before the
         # socket fully tears down. Fan out across every engine's
@@ -443,6 +511,13 @@ async def main():
     last_reconcile = datetime.min
     reconcile_interval_sec = float(getattr(getattr(config, "operations", object()),
                                            "reconcile_interval_sec", 60.0))
+    # v1.4 §9.5 paper-stream snapshot cadences.
+    margin_snap_cadence = float(getattr(config.logging,
+                                        "margin_snapshots_cadence_sec", 60.0))
+    pnl_snap_cadence = float(getattr(config.logging,
+                                     "pnl_snapshots_cadence_sec", 30.0))
+    last_margin_snap = _time.monotonic() - margin_snap_cadence  # fire immediately
+    last_pnl_snap = _time.monotonic() - pnl_snap_cadence
     last_depth_rotation = datetime.min
     last_full_refresh = _time.monotonic()
     last_snapshot_write = _time.monotonic()
@@ -502,7 +577,8 @@ async def main():
                       fills=fills,
                       session_start_fn=lambda: _session_start_utc(
                           datetime.now(tz=timezone.utc), reset_hour_ct
-                      )),
+                      ),
+                      csv_logger=csv_logger),
         name="watchdog",
     )
 
@@ -514,8 +590,39 @@ async def main():
 
         # Daily reset at 5pm CT (CME daily session boundary)
         if last_session_day != session_day:
+            # Paper-trading EOD summary for the closing session, BEFORE the
+            # portfolio reset wipes spread_capture_today. One file per
+            # product (hg_spec_v1.3.md §17.4). Skip on first-run rollover
+            # (last_session_day is None) — no prior session to summarize.
+            # Margin extremes/kill-switch counters not yet tracked live —
+            # emit as 0 for MVP; live tracking can be added when Stage 1
+            # data shows it's needed.
+            if last_session_day is not None:
+                try:
+                    from .daily_summary import write_daily_summary
+                    for eng in engines:
+                        write_daily_summary(
+                            session_date=last_session_day,
+                            paper_log_dir=csv_logger._paper_log_dir,
+                            portfolio=portfolio,
+                            margin_checker=eng["margin"],
+                            multiplier=int(eng["config"].product.multiplier),
+                        )
+                except Exception as e:
+                    logger.warning("paper EOD summary emit failed: %s", e)
             portfolio.reset_daily()
             daily_state.clear()
+            # v1.4 §6.1: auto-clear daily P&L halt kill at session rollover
+            # (gated on config.operations.auto_clear_daily_halt_on_session_rollover,
+            # default True). Sticky risk/reconciliation/exception_storm kills
+            # remain sticky — only source="daily_halt" is cleared here.
+            auto_clear = bool(getattr(
+                getattr(config, "operations", object()),
+                "auto_clear_daily_halt_on_session_rollover", True))
+            if auto_clear and risk.clear_daily_halt():
+                logger.info(
+                    "Session rollover: daily P&L halt cleared, quoting resumes "
+                    "on next quote cycle")
             last_session_day = session_day
             logger.info("New CME session day: %s (5pm CT rollover)", session_day)
             for expiry in _get_todays_expiries(portfolio.positions):
@@ -584,6 +691,24 @@ async def main():
             except Exception as e:
                 logger.warning("SABR recal %s error: %s", eng["name"], e)
 
+        # v1.4 §5: periodic delta-hedge rebalance (30s default). The
+        # HedgeManager's own timer gates the actual trade; this call is
+        # cheap when no action is due.
+        for eng in engines:
+            try:
+                eng["hedge"].rebalance_periodic()
+            except Exception as e:
+                logger.warning("hedge rebalance_periodic %s error: %s",
+                               eng["name"], e)
+
+        # v1.4 §7: operational kill checks. Runs every cycle; the monitor
+        # itself gates on sustained-breach windows so spurious single-
+        # sample spikes don't halt.
+        try:
+            op_kills.check()
+        except Exception as e:
+            logger.warning("operational_kills.check error: %s", e)
+
         # Full-refresh quote update for secondary engines. The primary's
         # quote update runs below through the event-driven (dirty-set) path
         # so it can ride tick bursts without waiting the full cycle.
@@ -626,6 +751,78 @@ async def main():
             except Exception as e:
                 logger.warning("daily_state save error: %s", e)
             last_daily_state_save = mono
+
+        # v1.4 §9.5: margin_snapshots.jsonl (default 60s cadence).
+        if (mono - last_margin_snap) >= margin_snap_cadence:
+            try:
+                cur_margin = margin_coord.get_current_margin()
+                capital_v = float(config.constraints.capital)
+                pct = cur_margin / capital_v if capital_v > 0 else 0.0
+                # Best-effort pull of IBKR-reported margin and scale from
+                # the primary engine's checker (MarginCoordinator doesn't
+                # expose these centrally yet).
+                ibkr_reported = getattr(margin, "cached_ibkr_margin", None)
+                ibkr_scale = getattr(margin, "ibkr_scale", None)
+                csv_logger.log_paper_margin_snapshot(
+                    current_margin_usd=cur_margin,
+                    capital_usd=capital_v,
+                    margin_pct=pct,
+                    ibkr_reported=ibkr_reported,
+                    synthetic_raw=None,
+                    ibkr_scale=ibkr_scale,
+                )
+            except Exception as e:
+                logger.debug("margin snapshot emit failed: %s", e)
+            last_margin_snap = mono
+
+        # v1.4 §6.1 + §9.5: halt check + pnl_snapshots.jsonl emission at
+        # 30s cadence. The halt must be sampled "every 30 seconds OR on
+        # fill" per spec; the fill path runs check_daily_pnl_only from
+        # fill_handler, and this block covers the between-fill 30s leg.
+        # compute_mtm_pnl reads live bid/ask so the halt sees fresh MTM
+        # without waiting for the 5-min greek refresh.
+        if (mono - last_pnl_snap) >= pnl_snap_cadence:
+            try:
+                # Halt check first so kill+flatten fires before we write
+                # the snapshot that would otherwise log "pnl=-4000" with
+                # the halt still un-triggered — reconciliation reads
+                # kill_switch.jsonl as authoritative on halt timestamps.
+                risk.check_daily_pnl_only()
+            except Exception as e:
+                logger.debug("periodic halt check failed: %s", e)
+            try:
+                mtm = portfolio.compute_mtm_pnl()
+                realized = portfolio.realized_pnl_persisted
+                # Sum futures-hedge MTM across every engine (each product
+                # hedges independently in its own front-month future).
+                hedge_mtm = 0.0
+                for eng in engines:
+                    try:
+                        hedge_mtm += float(eng["hedge"].hedge_mtm_usd())
+                    except Exception:
+                        pass
+                daily = realized + mtm + hedge_mtm
+                capital_v = float(config.constraints.capital)
+                # Single source of truth with RiskMonitor — prevents the
+                # snapshot reporting a threshold that diverges from the
+                # one the halt actually uses.
+                halt_thr = _resolve_daily_halt_threshold(config) or 0.0
+                csv_logger.log_paper_pnl_snapshot(
+                    daily_pnl_usd=daily,
+                    realized_pnl_usd=realized,
+                    mtm_pnl_usd=mtm,
+                    hedge_mtm_usd=hedge_mtm,
+                    capital_usd=capital_v,
+                    halt_threshold_usd=halt_thr,
+                    positions_count=len(portfolio.positions),
+                    net_delta=portfolio.net_delta,
+                    net_theta=portfolio.net_theta,
+                    net_vega=portfolio.net_vega,
+                    forward=market_data.state.underlying_price,
+                )
+            except Exception as e:
+                logger.debug("pnl snapshot emit failed: %s", e)
+            last_pnl_snap = mono
 
         # ── Blackout recovery check (runs even when killed) ─────────
         # The blackout flag must clear based on fresh option ticks, not

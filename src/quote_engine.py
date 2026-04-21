@@ -314,6 +314,14 @@ class QuoteManager:
         # (strike, expiry, right, side) so skips.jsonl only captures
         # transitions. Cleared on successful placement.
         self._last_skip_reason: Dict[OrderKey, str] = {}
+        # priority_v1 refresh policy state. Last send time per key drives
+        # the max-age override that prevents far strikes from going stale
+        # indefinitely under the per-tick amend cap. Per-cycle counters
+        # reset at the top of update_quotes; the cap is the binding
+        # constraint on how many modify messages leave per tick.
+        self._last_amend_ns: Dict[OrderKey, int] = {}
+        self._tick_amend_count: int = 0
+        self._tick_amend_deferred: int = 0
         self.ib.errorEvent += self._on_ib_error
 
     def _canonical_trade(self, order_id: int):
@@ -484,6 +492,12 @@ class QuoteManager:
         if _now_mono - self._margin_rejected_last_clear > 300.0:
             self._margin_rejected.clear()
             self._margin_rejected_last_clear = _now_mono
+
+        # priority_v1: reset per-cycle amend counters. Iteration order is
+        # |delta|-desc (see sort below), so the first N amends to fire are
+        # the highest-priority; anything past the cap defers to next tick.
+        self._tick_amend_count = 0
+        self._tick_amend_deferred = 0
 
         # SABR recalibration is hoisted out of this hot path and runs from
         # main.py's loop via maybe_recal_sabr() — calibration takes several ms
@@ -673,6 +687,38 @@ class QuoteManager:
             for (strike, exp, right, side) in list(self.active_orders.keys()):
                 if (strike, exp, right, side) not in allowed_order_keys:
                     self._cancel_quote(strike, exp, right, side)
+
+        # priority_v1 observability: when the per-tick cap bit this cycle,
+        # log so deployment smoke-tests can confirm the policy is active.
+        # Silent when no deferrals — avoids log spam in calm markets or
+        # when running under legacy policy.
+        if self._tick_amend_deferred > 0:
+            logger.info(
+                "priority_v1 cycle: amends_sent=%d amends_deferred=%d",
+                self._tick_amend_count, self._tick_amend_deferred,
+            )
+
+    def _priority_bucket(self, option) -> str:
+        """Classify a strike by |delta| into near/mid/far bucket.
+
+        Returns 'near' (|delta| ≥ near_threshold, default 0.30), 'far'
+        (|delta| < far_threshold, default 0.10), or 'mid' otherwise.
+        None / missing delta falls back to 'near' — we'd rather overrun
+        the cap on an unclassified strike than under-refresh it.
+        """
+        if option is None:
+            return "near"
+        d = getattr(option, "delta", None)
+        if d is None:
+            return "near"
+        ad = abs(d)
+        near = float(getattr(self.config.quoting, "delta_threshold_near", 0.30))
+        far = float(getattr(self.config.quoting, "delta_threshold_far", 0.10))
+        if ad >= near:
+            return "near"
+        if ad < far:
+            return "far"
+        return "mid"
 
     def _process_side(self, portfolio, option, strike: float, expiry: str,
                       right: str, side: str, inc_info: dict,
@@ -1094,7 +1140,6 @@ class QuoteManager:
                 # below the floor, and the very correction that would clear
                 # it gets suppressed as "noise."
                 tick = self.config.quoting.tick_size
-                min_dt = float(getattr(self.config.quoting, "min_modify_ticks", 1))
                 edge_violation = False
                 if theo is not None and self.config.pricing.min_edge_points > 0:
                     edge = self.config.pricing.min_edge_points
@@ -1103,9 +1148,51 @@ class QuoteManager:
                         (side == "BUY" and cur > theo - edge)
                         or (side == "SELL" and cur < theo + edge)
                     )
-                if (not edge_violation
-                        and abs(price - trade.order.lmtPrice) < (min_dt * tick - 1e-9)):
-                    return  # within dead-band, leave the resting order alone
+                # Dead-band + per-tick cap (see `refresh_policy` config).
+                # legacy: single min_modify_ticks band, no cap, no max-age.
+                # priority_v1: tiered bands by |delta| (near/mid/far),
+                # per-cycle amend cap, and a max-age floor that overrides
+                # the dead-band so deferred strikes can't stay stale forever.
+                # Edge-violation bypasses BOTH the band and the cap — the
+                # correctness floor for when current price violates min_edge.
+                policy = getattr(self.config.quoting, "refresh_policy", "legacy")
+                if policy == "priority_v1":
+                    cq = self.config.quoting
+                    bucket = self._priority_bucket(option)
+                    fallback_ticks = float(getattr(cq, "min_modify_ticks", 1))
+                    if bucket == "near":
+                        band_ticks = float(getattr(
+                            cq, "dead_band_near_ticks", fallback_ticks))
+                        max_age_s = float(getattr(cq, "max_age_s_near", 1.0))
+                    elif bucket == "mid":
+                        band_ticks = float(getattr(
+                            cq, "dead_band_mid_ticks", fallback_ticks))
+                        max_age_s = float(getattr(cq, "max_age_s_mid", 3.0))
+                    else:  # far
+                        band_ticks = float(getattr(
+                            cq, "dead_band_far_ticks", fallback_ticks))
+                        max_age_s = float(getattr(cq, "max_age_s_far", 5.0))
+                    last_ns = self._last_amend_ns.get(key, 0)
+                    age_s = ((time.monotonic_ns() - last_ns) / 1e9
+                             if last_ns else float("inf"))
+                    force_refresh = age_s > max_age_s
+                    if (not edge_violation and not force_refresh
+                            and abs(price - trade.order.lmtPrice)
+                            < (band_ticks * tick - 1e-9)):
+                        return
+                    cap = int(getattr(
+                        cq, "max_concurrent_amends_per_tick", 4))
+                    if (not edge_violation
+                            and self._tick_amend_count >= cap):
+                        self._tick_amend_deferred += 1
+                        return  # defer to next tick; max-age keeps honest
+                else:
+                    min_dt = float(getattr(
+                        self.config.quoting, "min_modify_ticks", 1))
+                    if (not edge_violation
+                            and abs(price - trade.order.lmtPrice)
+                            < (min_dt * tick - 1e-9)):
+                        return
                 # Modify-too-soon guard: don't amend an order that IBKR
                 # hasn't acknowledged yet. If we send a modify while the
                 # original placeOrder is still in flight, the server sees
@@ -1154,6 +1241,11 @@ class QuoteManager:
                         self._pending_amend.pop(order_id, None)
                     else:
                         self._order_underlying[order_id] = self.market_data.state.underlying_price
+                        # priority_v1 tracking: record successful modify send
+                        # time + count against per-cycle cap. Harmless under
+                        # legacy (no reader consults them).
+                        self._last_amend_ns[key] = now_ns
+                        self._tick_amend_count += 1
                 except AssertionError:
                     # Race: wrapper.trades flipped to a DoneState between
                     # our liveness check and placeOrder. Drop tracking
@@ -1247,6 +1339,10 @@ class QuoteManager:
         self.active_orders[key] = trade.order.orderId
         self._order_underlying[trade.order.orderId] = self.market_data.state.underlying_price
         self._record_send_latency(strike, expiry, right, trade.order.orderId)
+        # priority_v1: start the max-age clock for this key on first place.
+        # New places are intentionally exempt from the per-tick amend cap —
+        # a missing resting order is higher priority than throttling churn.
+        self._last_amend_ns[key] = time.monotonic_ns()
 
     @staticmethod
     def _evict_oldest_half(d: dict) -> None:

@@ -18,6 +18,7 @@ the startup retry loop in main.py.
 
 import asyncio
 import logging
+import time as _time
 import os
 from datetime import datetime
 
@@ -275,7 +276,7 @@ def _check_health(ib, market_data, quotes=None) -> tuple:
         ))
     freshest_signal_age = min(ages) if ages else 0.0
 
-    # Tick-staleness gate — skip the check if either of these holds:
+    # Tick-staleness gate — skip the check if ANY of these holds:
     #   (a) We've never seen a tick on this session (first_tick_seen False).
     #       The initial last_update timestamps are just construction time,
     #       not real market events — measuring "staleness" against them
@@ -286,6 +287,10 @@ def _check_health(ib, market_data, quotes=None) -> tuple:
     #   (b) We're still within the post-discovery grace window, as a
     #       belt-and-suspenders against a first tick landing early and
     #       then the feed briefly hiccuping during warm-up.
+    #   (c) Market is closed per the CME Globex calendar — weekend
+    #       (Fri 16:00 CT → Sun 17:00 CT) or daily Mon-Thu 16:00-17:00
+    #       maintenance window. No ticks should flow during these windows
+    #       so treating staleness as unhealthy produces a reconnect storm.
     # The disconnect + exception-storm branches below run unconditionally
     # so a real gateway hang still triggers recovery.
     in_grace = False
@@ -296,15 +301,23 @@ def _check_health(ib, market_data, quotes=None) -> tuple:
         if since_discovery < WATCHDOG_POST_DISCOVERY_GRACE_SEC:
             in_grace = True
 
-    if (not in_grace) and freshest_signal_age >= WATCHDOG_STALE_THRESHOLD_SEC:
+    # Market-closed gate. Computed against UTC now — is_market_open handles
+    # the CT conversion and weekend/maintenance windows.
+    from .weekend import is_market_open
+    market_open = is_market_open()
+
+    if (not in_grace and market_open
+            and freshest_signal_age >= WATCHDOG_STALE_THRESHOLD_SEC):
         reasons.append(f"no fresh ticks ({freshest_signal_age:.0f}s)")
 
     # Fast-cancel tier: feed stale but not yet at reconnect threshold.
-    # Only meaningful while still connected — a real disconnect already
-    # routes through the reconnect path below. Also skipped during the
-    # post-discovery grace window (same rationale as the stale-tick check).
+    # Only meaningful while still connected, not in grace, AND market is
+    # open — a real disconnect already routes through the reconnect path
+    # below. During market closure there's nothing to cancel (book
+    # already empty / weekend_paused) so skip the tier entirely.
     if (ib.isConnected()
             and not in_grace
+            and market_open
             and freshest_signal_age >= WATCHDOG_FAST_CANCEL_STALE_SEC
             and not reasons):
         fast_cancel = True
@@ -320,13 +333,21 @@ def _check_health(ib, market_data, quotes=None) -> tuple:
 
 async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                         sabr, account_id: str, shutdown_event: asyncio.Event,
-                        fills=None, session_start_fn=None):
-    """Periodic health check + auto-recovery. See module docstring."""
+                        fills=None, session_start_fn=None, csv_logger=None):
+    """Periodic health check + auto-recovery. See module docstring.
+
+    ``csv_logger``: optional paper-trading logger; when provided, every
+    disconnect/reconnect/reconnect_failed event is emitted to
+    logs-paper/reconnects.jsonl per v1.4 §9.5.
+    """
     consecutive_failures = 0
     consecutive_recovery_failures = 0
     consecutive_fast_cancel = 0
     backoff_idx = 0
     ib = conn.ib
+    # Track disconnect timestamp so reconnect events can report outage
+    # duration. None means "currently connected".
+    disconnect_t0 = None
 
     while not shutdown_event.is_set():
         try:
@@ -381,6 +402,23 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
             # ── Recovery: tear down + reconnect ──────────────────────
             logger.critical("WATCHDOG: triggering reconnect after %d unhealthy cycles",
                             consecutive_failures)
+            # Capture pending order count BEFORE teardown for the
+            # reconnects.jsonl event (v1.4 §9.5).
+            pending_pre = 0
+            try:
+                pending_pre = sum(1 for _ in ib.openTrades())
+            except Exception:
+                pass
+            if csv_logger is not None and disconnect_t0 is None:
+                try:
+                    disconnect_t0 = _time.monotonic()
+                    csv_logger.log_paper_reconnect(
+                        event="disconnect",
+                        pending_orders_pre=pending_pre,
+                        detail="; ".join(reasons) if reasons else "",
+                    )
+                except Exception:
+                    pass
             try:
                 quotes.panic_cancel()
             except Exception as e:
@@ -452,6 +490,22 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                     quotes.consecutive_quote_errors = 0
                     logger.info("WATCHDOG: recovery complete")
                     recovery_succeeded = True
+
+                    # v1.4 §9.5: emit reconnect success event with outage
+                    # duration and post-reconnect pending order count.
+                    if csv_logger is not None and disconnect_t0 is not None:
+                        try:
+                            duration = _time.monotonic() - disconnect_t0
+                            pending_post = sum(1 for _ in ib.openTrades())
+                            csv_logger.log_paper_reconnect(
+                                event="reconnect",
+                                duration_sec=round(duration, 2),
+                                pending_orders_pre=pending_pre,
+                                pending_orders_post=pending_post,
+                            )
+                        except Exception:
+                            pass
+                        disconnect_t0 = None
             except Exception as e:
                 logger.error("WATCHDOG: reconnect attempt failed: %s", e, exc_info=True)
 

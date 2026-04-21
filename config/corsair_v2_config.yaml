@@ -6,14 +6,13 @@ account:
 
 # ── Portfolio-wide (shared across all products) ────────────────────────
 constraints:
-  # Combined portfolio bucket: one margin/delta/theta budget across
-  # products and sides (cross-margining is the whole point of running
-  # both ETH and HG from one sub-account). $1M capital, 50% utilization
-  # → $500K synthetic cap. Synthetic SPAN runs ~+25-30% over IBKR's
-  # reported MaintMarginReq (synthetic_span.py), so the effective real-
-  # IBKR ceiling is closer to $385K. Conservative bias appropriate.
-  capital: 1000000
-  margin_ceiling_pct: 0.50     # 50% of $1M = $500K synthetic
+  # Stage 1 smoke test (HG-only; ETH wound down 2026-04-18; crowsnest
+  # handoff spec docs/hg_spec_v1.3.md). $200K capital, 50% → $100K Tier-2
+  # synthetic ceiling, 70% → $140K Tier-1 kill (see kill_switch below).
+  # Synthetic SPAN runs ~+25-30% over IBKR's reported MaintMarginReq
+  # (synthetic_span.py), so real-IBKR ceiling is closer to $77K at Stage 1.
+  capital: 200000
+  margin_ceiling_pct: 0.50     # 50% of $200K = $100K synthetic (Tier-2)
   delta_ceiling: 3.0           # |portfolio net_delta| must be <= this
   theta_floor: -200            # portfolio net_theta $/day, must be >= this
   # Margin-priority escape: when margin is currently breached, allow
@@ -27,14 +26,17 @@ constraints:
   # and revert to strict per-constraint independence.
   margin_escape_enabled: true
 
+# Inventory balance monitor (hg_spec_v1.3 §6c). Stage 1 MVP wires only
+# the halt threshold; widen/tighten quote adjustments at lower thresholds
+# are tracked but not yet applied — see Phase 5 note in handoff plan.
+inventory_balance:
+  halt_pct: 0.50              # Halt new SELL opens on overweight right above this
+  widen_pct: 0.30             # NOT YET WIRED — widen overweight by 1 tick
+  tighten_pct: 0.15           # NOT YET WIRED — tighten underweight by 1 tick
+
 kill_switch:
-  margin_kill_pct: 0.70        # 70% of $1M = $700K
-  # TEMPORARY (2026-04-14): widened from -2500. Today's realized P&L sits
-  # at ~-$50K from flattening the HG ghost positions (marks were stale, so
-  # closing 200 contracts crystallized losses that don't reflect market-
-  # making performance). Restore to -2500 after the next CME session reset
-  # (5pm CT) wipes today's realized count.
-  max_daily_loss: -100000
+  margin_kill_pct: 0.70        # 70% of $200K = $140K (Stage 1 Tier-1 kill)
+  max_daily_loss: -2500        # Stage 1 Tier-1 daily P&L halt (hg_spec_v1.3 §6.1)
   # Per-product thresholds (RiskMonitor checks each product's worst-case;
   # mixing ETH mult=50 and HG mult=25000 contract-equivalent values in
   # one sum is meaningless).
@@ -154,32 +156,29 @@ synthetic_span:
 
 # ── Products (primary first; index 0 is used for watchdog + healthcheck snapshot) ──
 products:
-  - name: "ETH"
-    # snapshot_path kept as data/chain_snapshot.json to preserve the
-    # docker healthcheck target without code churn.
-    snapshot_path: "data/chain_snapshot.json"
-    product:
-      symbol: "ETH"
-      exchange: "CME"
-      multiplier: 50
-      currency: "USD"
-      option_type: "both"      # "calls_only", "puts_only", "both"
-      # Subscription/display range — wider window we receive market data for.
-      # 5-strike buffer on each side of the quoting band so the dashboard
-      # shows wings we don't actively quote.
-      strike_range_low: -30
-      strike_range_high: 30
-      quote_range_low: 0       # 0 = ATM
-      quote_range_high: 25     # Number of strikes above ATM to quote
-      min_dte: 3
-      subscribed_expiries: 3   # front / front+1 / front+2
-      quote_size: 1
-      underlying_symbol: "ETHUSDRR"
-      option_symbol: "ETH"
-      trading_class: "ETH"
-      security_type: "FOP"
-      strike_increment: 25     # ETH strike spacing
-    # (no overrides — uses shared defaults above)
+  # ETH wound down 2026-04-18 pending HG-only pivot (crowsnest handoff spec v1.2).
+  # Re-enable by un-commenting the block below. Healthcheck target moved to HG
+  # snapshot path (see docker-compose.yml); revert that too when restoring ETH.
+  # - name: "ETH"
+  #   snapshot_path: "data/chain_snapshot.json"
+  #   product:
+  #     symbol: "ETH"
+  #     exchange: "CME"
+  #     multiplier: 50
+  #     currency: "USD"
+  #     option_type: "both"
+  #     strike_range_low: -30
+  #     strike_range_high: 30
+  #     quote_range_low: 0
+  #     quote_range_high: 25
+  #     min_dte: 3
+  #     subscribed_expiries: 3
+  #     quote_size: 1
+  #     underlying_symbol: "ETHUSDRR"
+  #     option_symbol: "ETH"
+  #     trading_class: "ETH"
+  #     security_type: "FOP"
+  #     strike_increment: 25
 
   - name: "HG"
     snapshot_path: "data/hg_chain_snapshot.json"
@@ -193,9 +192,13 @@ products:
       # near-zero OI and never trade. ±11 × $0.05 = ATM±$0.55.
       strike_range_low: -11
       strike_range_high: 11
-      quote_range_low: 3       # ATM + 3×$0.05 = ATM + $0.15
-      quote_range_high: 10     # ATM + 10×$0.05 = ATM + $0.50
+      # v1.3 asymmetric NEAR-OTM+ATM (hg_spec_v1.3 §3.3): calls ATM to ATM+5
+      # nickels ($0.25 OTM). ATM strike is quoted on BOTH C and P (11 unique
+      # strikes → 12 instruments → 24 max resting orders).
+      quote_range_low: 0       # ATM
+      quote_range_high: 5      # ATM + 5×$0.05 = ATM + $0.25
       min_dte: 3
+      max_dte: 35              # hg_spec_v1.3 §2.3: do NOT quote DTE > 35
       subscribed_expiries: 3
       quote_size: 1
       underlying_symbol: "HG"  # COMEX copper futures
@@ -205,16 +208,17 @@ products:
       strike_increment: 0.05   # $0.05 grid (skips penny strikes)
     puts:
       enabled: true
-      quote_range_low: -10     # ATM − 10×$0.05 = ATM − $0.50
-      quote_range_high: -3     # ATM − 3×$0.05 = ATM − $0.15
+      # v1.3 asymmetric NEAR-OTM+ATM (hg_spec_v1.3 §3.3): puts ATM-5 nickels
+      # to ATM ($0.25 OTM to ATM). ATM shared with call side.
+      quote_range_low: -5      # ATM − 5×$0.05 = ATM − $0.25
+      quote_range_high: 0      # ATM
     # HG-specific overrides for shared config blocks. All dollar-denominated
     # thresholds are ~1/400th of ETH's (HG ~$6/lb vs ETH ~$2300).
     quoting:
-      # Observe-only until strike density improves (crowsnest 2026-04-18
-      # Change 4). Market data keeps flowing so we can measure density
-      # over time; revisit monthly. Re-enable front-only when snapshot
-      # front-strike count per side stays ≥ 10 median for a week.
-      enabled_expiries: []
+      # Stage 1 smoke test: quote front-month only (hg_spec_v1.3 §2.3, DTE
+      # ≤ 35). front+1 subscribed for SABR surface coverage but not quoted
+      # — spec §1 explicitly excludes back-month quoting.
+      enabled_expiries: ["front"]
       tick_size: 0.0005        # HG option minimum tick ($0.0005/lb = $12.50/contract)
       max_bbo_width_dollars: 0.05
       delta_retreat_threshold: 0.02

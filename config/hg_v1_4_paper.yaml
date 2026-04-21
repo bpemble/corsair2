@@ -167,6 +167,22 @@ quoting:
   # market is too wide to quote into. Expressed as a multiplier of
   # pricing.min_edge_points; enforced per-side in quote_engine.
   skip_if_spread_over_edge_mul: 4.0
+  # priority_v1 refresh policy knobs (see docs/latency_decomp_plan.md Item 2).
+  # Base defaults tuned for the portfolio-wide `quoting:` units (ticks of
+  # whatever product); per-product overrides below rescale to product ticks.
+  # Default policy is `legacy`: behaviour-preserving, identical to pre-
+  # priority_v1 code path. Flip a product's `refresh_policy` to `priority_v1`
+  # to enable bucketing + per-tick cap + max-age override.
+  refresh_policy: legacy
+  delta_threshold_near: 0.30
+  delta_threshold_far: 0.10
+  dead_band_near_ticks: 2
+  dead_band_mid_ticks: 3
+  dead_band_far_ticks: 6
+  max_concurrent_amends_per_tick: 4
+  max_age_s_near: 1.0
+  max_age_s_mid: 3.0
+  max_age_s_far: 5.0
 
 pricing:
   sabr_enabled: true
@@ -258,8 +274,16 @@ products:
       # queries them (max_quote_staleness_sec=10s). Improves incumbent
       # quality via the multi-level size-filter path.
       max_active_depth_subs: 5
-      min_modify_ticks: 20     # $0.01 dead-band
+      min_modify_ticks: 20     # $0.01 dead-band (legacy-policy knob)
       max_modifies_per_sec_per_oid: 20
+      # priority_v1 overrides (HG tick = $0.0005). Flip refresh_policy to
+      # priority_v1 to activate. dead_band_near_ticks keeps the $0.01 band;
+      # mid widens to $0.015, far to $0.03 (still well under max BBO width
+      # of $0.05 and the edge_violation bypass catches any hard drift).
+      refresh_policy: priority_v1
+      dead_band_near_ticks: 20
+      dead_band_mid_ticks: 30
+      dead_band_far_ticks: 60
     pricing:
       # v1.4 §3.4: min_edge = 0.001 ($25/contract at mult=25000)
       min_edge_points: 0.001

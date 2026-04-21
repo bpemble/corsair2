@@ -4,6 +4,30 @@ Hard-earned lessons. Read before debugging anything weird around connectivity,
 order lifecycle, or margin display. Each entry took hours to find live; the
 goal of this doc is to never re-discover them.
 
+## Current spec: v1.4 (HG front-only, sym_5)
+
+Active strategy spec: `docs/hg_spec_v1.4.md` (APPROVED 2026-04-19). Active
+config: `config/hg_v1_4_paper.yaml` (selected via `CORSAIR_CONFIG` env var
+in docker-compose.yml; defaults to v1.4). v1.3 config is preserved for
+rollback at `config/corsair_v2_config.yaml`.
+
+Key v1.4 differences from v1.3 (see §9 below for details):
+- Strike scope: **symmetric ATM ± 5 nickels** (calls AND puts at each strike
+  → 22 instruments → 44 resting orders). v1.3 was asymmetric NEAR-OTM+ATM.
+- **Daily P&L halt at −5% capital (−$3,750)** is the PRIMARY defense — not
+  just cancels quotes, FLATTENS options + hedge, session-level halt.
+- Capital: $200K → $75K (Stage 1). Kill switches rescaled accordingly.
+- NEW hedging subsystem via HG futures front-month (`src/hedge_manager.py`).
+  Default mode: **observe** (logs intent, no orders). Flip to **execute**
+  once Gate 0 induced tests validate the paths.
+- NEW operational kills (`src/operational_kills.py`): SABR RMSE sustained
+  >0.05, quote latency median >2s for 60s, abnormal fill rate >10× baseline.
+- 8 JSONL streams in `logs-paper/` per spec §9.5.
+
+ETH is tabled (config products list is HG-only) but the multi-product
+architecture is preserved — re-enabling ETH is a matter of un-commenting
+its product block and wiring market data.
+
 ## 0. Source is BAKED INTO the corsair image — `restart` ≠ `up --build`
 
 The `corsair` service in `docker-compose.yml` builds from the local
@@ -26,7 +50,9 @@ Gateway and dashboard images are similarly built locally; same rule.
 
 ## 1. clientId=0 is REQUIRED on FA paper accounts
 
-Our paper login (`DUP553656` under master `DFP553653`) is a Financial
+Our paper login (`DUP553657` under master `DFP553653`; set via
+`IBKR_ACCOUNT` env var in `.env` — the `account_id` in yaml configs is a
+placeholder) is a Financial
 Advisor / Friends-and-Family account structure: one DFP master, several DUP
 sub-accounts. On FA logins, **IBKR routes order status messages through the
 FA master**. ib_insync's wrapper looks up trades by `(clientId, orderId)` to
@@ -160,7 +186,74 @@ Currently configured for Stage 1 of the deployment ramp:
 These numbers come from the deployment ramp doc. Stage 2 (post-validation)
 goes to $500K margin. Don't loosen them ad-hoc — they're the safety net.
 
-## 8. The dashboard polls; it doesn't stream
+## 8. v1.4 daily P&L halt: FLATTEN is not just "cancel"
+
+v1.4 §6.1 upgrades the daily P&L halt from "cancel resting quotes" to
+**flatten all positions + flatten hedge + session-level halt**. The path:
+
+1. `RiskMonitor.kill(..., kill_type="flatten")` fires
+2. `quotes.cancel_all_quotes()` runs first (always — fail-safe)
+3. Then `flatten_callback` is invoked (wired from main.py):
+   - `_flatten_all_engines(reason)` — each engine's
+     `QuoteManager.flatten_all_positions()` sends aggressive IOC limit
+     orders (market ± 1 tick) to close every option position
+   - `hedge_fanout.flatten_on_halt(reason)` — each engine's
+     `HedgeManager.flatten_on_halt()` closes its futures hedge
+4. Paper-stream `kill_switch-YYYY-MM-DD.jsonl` row emitted with full
+   book snapshot (positions, margin, pnl, greeks)
+5. `risk.killed = True`, source="daily_halt"
+
+**Session rollover at 17:00 CT** auto-clears only the daily_halt source
+(see `risk.clear_daily_halt()`). Every other kill source is sticky —
+requires manual restart + investigation before quoting resumes.
+
+**Per-fill halt check**: the fill handler calls
+`risk.check_daily_pnl_only()` on every live fill so the halt fires
+between the 5-minute full risk checks. Daily P&L includes hedge MTM
+via `RiskMonitor._hedge_mtm_usd()`.
+
+## 9. v1.4 induced kill-switch tests (Gate 0)
+
+Every v1.4 Tier-1 kill must pass an induced-breach test before Stage 1
+launch (§9.4). Induce via sentinel file:
+
+```bash
+docker compose exec corsair python scripts/induce_kill_switch.py --switch daily_pnl
+docker compose exec corsair python scripts/induce_kill_switch.py --switch margin
+docker compose exec corsair python scripts/induce_kill_switch.py --switch delta
+docker compose exec corsair python scripts/induce_kill_switch.py --switch theta
+docker compose exec corsair python scripts/induce_kill_switch.py --switch vega
+```
+
+The script writes `/tmp/corsair_induce_<switch>`; `RiskMonitor.check()`
+picks it up on the next cycle, fires the matching kill through its real
+path (cancel + flatten/halt + paper log), and deletes the sentinel.
+Induced kills carry `source="induced_<source>"` in
+`kill_switch-YYYY-MM-DD.jsonl` so reconciliation can distinguish them
+from genuine breaches.
+
+Non-daily_halt induced kills are sticky — `docker compose restart corsair`
+to clear. daily_halt induced kills auto-clear at the next CME session
+rollover (17:00 CT).
+
+## 10. v1.4 hedge mode: observe vs execute
+
+`src/hedge_manager.py` runs in one of two modes via
+`config.hedging.mode`:
+- **observe**: computes required hedge trades and logs intent to
+  `logs-paper/hedge_trades-YYYY-MM-DD.jsonl`; does NOT place futures
+  orders. Local `hedge_qty` is updated optimistically so daily P&L
+  halt still sees hedge MTM as if trades had filled.
+- **execute**: places aggressive IOC limit orders at market ± 1 tick
+  on the front-month HG futures contract. Live fills NOT yet wired
+  through an execDetails callback — reconciliation against
+  `ib.positions()` is a v1.5 item. Use observe mode until that lands.
+
+Stage 0 default: `mode: observe`. Flip to `execute` **only after** all
+five induced kill-switch tests pass AND the delta-kill induced test
+confirms `force_flat()` correctly lands at `hedge_qty=0`.
+
+## 11. The dashboard polls; it doesn't stream
 
 Streamlit is request/response. Currently:
 - corsair writes `data/chain_snapshot.json` every **250ms** (4Hz)

@@ -9,11 +9,12 @@ critical path between tick arrival and placeOrder.
 """
 
 import csv
+import json
 import logging
 import os
 import queue
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Tuple, List
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,13 @@ class CSVLogger:
     def __init__(self, config):
         self.log_dir = config.logging.log_dir
         os.makedirs(self.log_dir, exist_ok=True)
+
+        # Paper-trading JSONL log dir (corsair→crowsnest interface, spec
+        # hg_spec_v1.3.md §17). Sibling of log_dir so logs/ stays for
+        # operational CSVs and logs-paper/ is the stable external interface.
+        self._paper_log_dir = os.path.join(
+            os.path.dirname(os.path.abspath(self.log_dir)), "logs-paper")
+        os.makedirs(self._paper_log_dir, exist_ok=True)
 
         self._fill_path = os.path.join(self.log_dir, "fills.csv")
         self._risk_path = os.path.join(self.log_dir, "risk_snapshots.csv")
@@ -275,15 +283,22 @@ class CSVLogger:
 
     def _flush_batch(self, batch: List[Tuple[str, list]]):
         """Group rows by target file and write each group with a single
-        open/close. Errors are logged but don't halt the writer."""
+        open/close. Errors are logged but don't halt the writer.
+
+        CSV paths receive lists (written via csv.writer); .jsonl paths
+        receive pre-serialized JSON strings (written as lines).
+        """
         by_path: dict = {}
         for path, row in batch:
             by_path.setdefault(path, []).append(row)
         for path, rows in by_path.items():
             try:
                 with open(path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerows(rows)
+                    if path.endswith(".jsonl"):
+                        f.write("\n".join(rows) + "\n")
+                    else:
+                        writer = csv.writer(f)
+                        writer.writerows(rows)
             except Exception as e:
                 logger.warning("Failed to write %d rows to %s: %s",
                                len(rows), path, e)
@@ -297,6 +312,184 @@ class CSVLogger:
             # Queue is backed up — force shutdown by draining what we can.
             pass
         self._writer_thread.join(timeout=timeout)
+
+    def log_paper_event(self, event: dict) -> None:
+        """Legacy entry point — routes to the fills stream.
+
+        Preserved for compatibility with fill_handler's existing call site
+        (which emits event_type="fill" or "skip" into a single file).
+        v1.4 §9.5 splits streams into separate files; callers should
+        prefer the typed helpers below.
+        """
+        self.log_paper_stream("fills", event)
+
+    def log_paper_stream(self, stream: str, event: dict) -> None:
+        """Write ``event`` to ``logs-paper/<stream>-YYYY-MM-DD.jsonl``.
+
+        Core primitive backing the v1.4 §9.5 eight-stream interface:
+        fills, skips, kill_switch, reconnects, sabr_fits, margin_snapshots,
+        pnl_snapshots, hedge_trades.
+
+        The caller is responsible for populating the schema fields for
+        each stream; this method only adds `timestamp_utc` if missing.
+        Write is enqueued on the CSVLogger background thread — no blocking
+        I/O on the event loop.
+        """
+        if "timestamp_utc" not in event:
+            # datetime.utcnow() is deprecated in 3.12+; use an aware UTC
+            # datetime and strip the timezone suffix for the ISO-8601 Z
+            # suffix we emit downstream.
+            now_utc = datetime.now(timezone.utc)
+            event["timestamp_utc"] = (
+                now_utc.replace(tzinfo=None).isoformat(timespec="milliseconds")
+                + "Z"
+            )
+        path = os.path.join(
+            self._paper_log_dir,
+            f"{stream}-{date.today().isoformat()}.jsonl")
+        try:
+            line = json.dumps(event, separators=(",", ":"), default=str)
+        except (TypeError, ValueError) as e:
+            logger.warning("paper event serialization failed (%s): %s (event=%s)",
+                           stream, e, event)
+            return
+        self._append_row(path, line)
+
+    # ── Typed v1.4 paper-stream helpers (§9.5) ─────────────────────────
+    def log_paper_skip(self, symbol: str, side: str, skip_reason: str,
+                       strike: float = 0.0, cp: str = "",
+                       theo: float = None, bbo_bid: float = None,
+                       bbo_ask: float = None, forward: float = None,
+                       expiry: str = "") -> None:
+        """Record a skipped quote attempt. Emits one row per skip reason
+        per (strike, right, side). Callers de-dup via the CSV quotes log;
+        this stream is the crowsnest-facing summary."""
+        self.log_paper_stream("skips", {
+            "event_type": "skip",
+            "symbol": symbol,
+            "cp": cp,
+            "strike": strike,
+            "expiry": expiry,
+            "side": side,
+            "skip_reason": skip_reason,
+            "theo": theo,
+            "bbo_bid": bbo_bid,
+            "bbo_ask": bbo_ask,
+            "forward": forward,
+        })
+
+    def log_paper_kill_switch(self, switch_name: str, reason: str,
+                              source: str, book_state: dict) -> None:
+        """Record a kill switch trigger with full book snapshot per
+        v1.4 §9.4. ``book_state`` should include positions, margin, pnl,
+        delta, theta, vega, and the current forward."""
+        self.log_paper_stream("kill_switch", {
+            "event_type": "kill_switch_fire",
+            "switch_name": switch_name,
+            "reason": reason,
+            "source": source,
+            "book_state": book_state,
+        })
+
+    def log_paper_reconnect(self, event: str, duration_sec: float = None,
+                            pending_orders_pre: int = None,
+                            pending_orders_post: int = None,
+                            detail: str = "") -> None:
+        """Record a gateway disconnect/reconnect. ``event`` is one of
+        "disconnect", "reconnect", "reconnect_failed"."""
+        self.log_paper_stream("reconnects", {
+            "event_type": event,
+            "duration_sec": duration_sec,
+            "pending_orders_pre": pending_orders_pre,
+            "pending_orders_post": pending_orders_post,
+            "detail": detail,
+        })
+
+    def log_paper_sabr_fit(self, expiry: str, side: str, model: str,
+                           forward: float, tte_years: float,
+                           n_points: int, rmse: float,
+                           params: dict) -> None:
+        """Record a SABR/SVI surface fit. ``params`` is the model-native
+        parameter dict (e.g. {a,b,rho,m,sigma} for SVI)."""
+        self.log_paper_stream("sabr_fits", {
+            "event_type": "sabr_fit",
+            "expiry": expiry,
+            "side": side,
+            "model": model,
+            "forward": forward,
+            "tte_years": tte_years,
+            "n_points": n_points,
+            "rmse": rmse,
+            "params": params,
+        })
+
+    def log_paper_margin_snapshot(self, current_margin_usd: float,
+                                   capital_usd: float,
+                                   margin_pct: float,
+                                   ibkr_reported: float = None,
+                                   synthetic_raw: float = None,
+                                   ibkr_scale: float = None) -> None:
+        """Record a SPAN margin snapshot (v1.4 §9.5; 1-min cadence)."""
+        self.log_paper_stream("margin_snapshots", {
+            "event_type": "margin_snapshot",
+            "current_margin_usd": round(float(current_margin_usd), 2),
+            "capital_usd": float(capital_usd),
+            "margin_pct": round(float(margin_pct), 4),
+            "ibkr_reported_usd": ibkr_reported,
+            "synthetic_raw_usd": synthetic_raw,
+            "ibkr_scale": ibkr_scale,
+        })
+
+    def log_paper_pnl_snapshot(self, daily_pnl_usd: float,
+                                realized_pnl_usd: float,
+                                mtm_pnl_usd: float,
+                                hedge_mtm_usd: float = 0.0,
+                                capital_usd: float = 0.0,
+                                halt_threshold_usd: float = 0.0,
+                                positions_count: int = 0,
+                                net_delta: float = 0.0,
+                                net_theta: float = 0.0,
+                                net_vega: float = 0.0,
+                                forward: float = 0.0) -> None:
+        """Record an intraday P&L snapshot (v1.4 §9.5; 30-sec cadence).
+        The daily halt check fires on ``daily_pnl_usd`` (= realized + MTM
+        + hedge_mtm) vs halt_threshold_usd."""
+        self.log_paper_stream("pnl_snapshots", {
+            "event_type": "pnl_snapshot",
+            "daily_pnl_usd": round(float(daily_pnl_usd), 2),
+            "realized_pnl_usd": round(float(realized_pnl_usd), 2),
+            "mtm_pnl_usd": round(float(mtm_pnl_usd), 2),
+            "hedge_mtm_usd": round(float(hedge_mtm_usd), 2),
+            "capital_usd": float(capital_usd),
+            "halt_threshold_usd": float(halt_threshold_usd),
+            "positions_count": int(positions_count),
+            "net_delta": round(float(net_delta), 3),
+            "net_theta": round(float(net_theta), 2),
+            "net_vega": round(float(net_vega), 2),
+            "forward": float(forward),
+        })
+
+    def log_paper_hedge_trade(self, side: str, qty: int, price: float,
+                              forward_at_trade: float,
+                              net_delta_pre: float,
+                              net_delta_post: float,
+                              reason: str,
+                              mode: str,
+                              order_id: str = "") -> None:
+        """Record a delta-hedge futures trade (v1.4 §5 / §9.5). In
+        observe mode, this is the intent log — no actual order placed."""
+        self.log_paper_stream("hedge_trades", {
+            "event_type": "hedge_trade",
+            "mode": mode,
+            "side": side,
+            "qty": int(qty),
+            "price": float(price) if price is not None else None,
+            "forward_at_trade": float(forward_at_trade),
+            "net_delta_pre": round(float(net_delta_pre), 3),
+            "net_delta_post": round(float(net_delta_post), 3),
+            "reason": reason,
+            "order_id": order_id,
+        })
 
     def log_fill(self, strike, expiry, put_call, side, quantity, fill_price,
                  spread_captured_theo, spread_captured_mid,
@@ -382,6 +575,10 @@ class CSVLogger:
         ``model`` is ``"sabr"`` or ``"svi"``. Unused param columns are
         written as empty strings so the two models share one file without
         forcing a join downstream.
+
+        Also mirrors the fit into ``logs-paper/sabr_fits-YYYY-MM-DD.jsonl``
+        per v1.4 §9.5 so reconciliation can consume structured params
+        without parsing the fixed-width CSV.
         """
         def _fmt(v, prec=4):
             return f"{v:.{prec}f}" if v is not None else ""
@@ -392,6 +589,20 @@ class CSVLogger:
             _fmt(alpha), _fmt(beta), _fmt(rho_sabr), _fmt(nu),
             _fmt(a), _fmt(b), _fmt(rho_svi), _fmt(m), _fmt(sigma),
         ])
+        # Paper JSONL mirror — model-native params only (drop null fields).
+        if model == "svi":
+            params = {"a": a, "b": b, "rho": rho_svi, "m": m, "sigma": sigma}
+        else:
+            params = {"alpha": alpha, "beta": beta, "rho": rho_sabr, "nu": nu}
+        params = {k: v for k, v in params.items() if v is not None}
+        try:
+            self.log_paper_sabr_fit(
+                expiry=expiry, side=side, model=model,
+                forward=float(forward), tte_years=float(tte_years),
+                n_points=int(n_points), rmse=float(rmse), params=params,
+            )
+        except Exception:
+            pass
 
     def log_margin_scale(self, raw_synthetic: float, ibkr_actual: float,
                          ratio: float, ibkr_scale: float, clamped: bool):

@@ -44,8 +44,12 @@ services:
       CORSAIR_GATEWAY_PORT: "${TWS_PORT:-4002}"
       CORSAIR_ACCOUNT_ID: "${IBKR_ACCOUNT}"
       DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:-}"
+      # v1.4 Stage 1 paper config. Flip to corsair_v2_config.yaml to
+      # roll back to the v1.3 config (asymmetric scope, $200K cap).
+      CORSAIR_CONFIG: "${CORSAIR_CONFIG:-config/hg_v1_4_paper.yaml}"
     volumes:
       - ./logs:/app/logs
+      - ./logs-paper:/app/logs-paper      # v1.4 §9.5 paper JSONL streams
       - ./data:/app/data
       - ./span_data:/app/span_data
       - ./config:/app/config:ro
@@ -64,7 +68,7 @@ services:
       # timeout in src/watchdog.py — at 30s a discovery that legitimately
       # takes 31s would get the container nuked mid-recovery, even though
       # the watchdog would have succeeded a second later.
-      test: ["CMD-SHELL", "test -f /app/data/chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/chain_snapshot.json) )) -lt 60"]
+      test: ["CMD-SHELL", "test -f /app/data/hg_chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/hg_chain_snapshot.json) )) -lt 60"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -79,6 +83,7 @@ services:
     network_mode: host
     volumes:
       - ./logs:/app/logs:ro
+      - ./logs-paper:/app/logs-paper:ro  # v1.4 §9.5 paper JSONL streams
       - ./data:/app/data:ro
       - ./config:/app/config:ro
 
