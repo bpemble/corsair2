@@ -451,6 +451,20 @@ class SABRSurface:
         """Set the front month expiry for TTE calculations."""
         self._front_month_expiry = expiry
 
+    def latest_rmse(self) -> Optional[float]:
+        """Return the latest accepted RMSE across C/P sides (max). Returns
+        None if no fit has landed. Public accessor for the operational
+        kill monitor — don't reach into ``_side_params`` from outside."""
+        vals = []
+        for sp in self._side_params.values():
+            r = sp.get("svi_params") or sp.get("params")
+            if r is None:
+                continue
+            rmse = getattr(r, "rmse", None)
+            if rmse is not None:
+                vals.append(float(rmse))
+        return max(vals) if vals else None
+
     def get_vol(self, strike: float, put_call: str = "C") -> float:
         """Return implied vol for a given strike using the OTM-side's fit.
 
@@ -1094,6 +1108,15 @@ class MultiExpirySABR:
     def get_last_calibration(self, expiry: str):
         surf = self._surfaces.get(expiry)
         return surf.last_calibration if surf else None
+
+    def latest_rmse(self, expiry: str) -> Optional[float]:
+        """Return the latest accepted RMSE for ``expiry``. Returns None if
+        the expiry isn't subscribed or no fit has landed yet. Takes the
+        max across C/P sides so a bad fit on either surfaces the breach.
+        Public accessor for OperationalKillMonitor — don't reach through
+        ``_surfaces``/``_side_params`` from outside this module."""
+        surf = self._surfaces.get(expiry)
+        return surf.latest_rmse() if surf else None
 
     @property
     def params(self):

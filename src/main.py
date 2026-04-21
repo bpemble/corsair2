@@ -429,7 +429,23 @@ async def main():
     # loop; fires via risk.kill(source="operational"). Sticky.
     op_kills = OperationalKillMonitor(engines, portfolio, risk, config)
 
-    # ── 8. Disconnect callback ────────────────────────────────────────
+    # ── 8. Kill-switch self-test (v1.4 §9.4 boot gate) ────────────────
+    # Exercise every induced sentinel through fresh RiskMonitor
+    # instances with mock callbacks. Catches regressions in the
+    # sentinel→kill→jsonl plumbing at boot rather than waiting for a
+    # real breach to silently not-fire. Refuses to accept live orders
+    # on failure. CORSAIR_SKIP_KILL_SELF_TEST=1 bypasses (logs CRITICAL).
+    from .startup_checks import run_kill_switch_self_test
+    if not run_kill_switch_self_test(
+        portfolio, margin_coord, quotes, csv_logger, primary_config,
+    ):
+        logger.critical(
+            "Aborting boot: kill-switch self-test failed. Fix the kill "
+            "path and restart. Container will exit with code 1."
+        )
+        raise SystemExit(1)
+
+    # ── 9. Disconnect callback ────────────────────────────────────────
     def on_disconnect():
         logger.critical("GATEWAY DISCONNECT — panic cancelling all quotes")
         # Emit reconnects.jsonl event (v1.4 §9.5) with pending order
@@ -459,7 +475,7 @@ async def main():
 
     conn.set_disconnect_callback(on_disconnect)
 
-    # ── 9. Seed portfolio + replay + ensure_position_subscribed ──────
+    # ── 10. Seed portfolio + replay + ensure_position_subscribed ─────
     # Reseed now that every product is registered (one walk of ib.positions
     # for the whole account).
     try:
@@ -495,7 +511,7 @@ async def main():
                            eng["name"], e)
 
 
-    # ── 10. Handle graceful shutdown ──────────────────────────────────
+    # ── 11. Handle graceful shutdown ──────────────────────────────────
     shutdown_event = asyncio.Event()
 
     def handle_signal(sig):
@@ -506,7 +522,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
 
-    # ── 7. Main loop ─────────────────────────────────────────────────
+    # ── 12. Main loop ─────────────────────────────────────────────────
     last_greek_refresh = datetime.min
     last_reconcile = datetime.min
     reconcile_interval_sec = float(getattr(getattr(config, "operations", object()),

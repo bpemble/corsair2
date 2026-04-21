@@ -25,6 +25,7 @@ Kill source (governs auto-clear rules):
 
 import logging
 import os
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,32 @@ class RiskMonitor:
         self._kill_reason: str = ""
         self._kill_source: str = ""
         self._kill_type: str = ""
+
+        # v1.4 §6.1 PRIMARY DEFENSE: resolve once at init and cache. If
+        # neither daily_pnl_halt_pct nor max_daily_loss is configured the
+        # halt is disabled — log CRITICAL so an operator can't miss it.
+        # check() and check_daily_pnl_only() both bail on None rather
+        # than re-resolving per-call (avoids silent drift if config is
+        # hot-reloaded).
+        self.daily_halt_threshold: Optional[float] = (
+            _resolve_daily_halt_threshold(config)
+        )
+        if self.daily_halt_threshold is None:
+            logger.critical(
+                "DAILY P&L HALT DISABLED: neither kill_switch.daily_pnl_halt_pct "
+                "nor kill_switch.max_daily_loss is configured. The primary v1.4 "
+                "defense will NOT fire. Set daily_pnl_halt_pct (e.g. 0.05) in "
+                "the active config before resuming live orders."
+            )
+        else:
+            _cap = float(getattr(config.constraints, "capital", 0)) or 0.0
+            _pct = (
+                abs(self.daily_halt_threshold / _cap) * 100 if _cap > 0 else 0.0
+            )
+            logger.info(
+                "Daily P&L halt armed: threshold=$%.0f (-%.1f%% of $%.0f capital)",
+                self.daily_halt_threshold, _pct, _cap,
+            )
 
     def check(self, market_state):
         """Run all risk checks. Called every greek_refresh_seconds."""
@@ -220,25 +247,22 @@ class RiskMonitor:
             return
 
         # Daily P&L halt (v1.4 §6.1 PRIMARY DEFENSE): FLATTEN on breach.
-        #
-        # Threshold source precedence:
-        #   1. kill_switch.daily_pnl_halt_pct (fraction of capital)
-        #   2. kill_switch.max_daily_loss (absolute, negative)
-        # The spec expresses it as "-5% of deployed capital", so the _pct
-        # form is canonical; max_daily_loss is accepted for legacy configs.
-        halt_threshold = self._resolve_daily_halt_threshold()
-        self.portfolio.daily_pnl = (
-            self.portfolio.realized_pnl_persisted
-            + self.portfolio.compute_mtm_pnl()
-            + self._hedge_mtm_usd()
-        )
-        if halt_threshold is not None and self.portfolio.daily_pnl < halt_threshold:
-            self.kill(
-                f"DAILY P&L HALT: ${self.portfolio.daily_pnl:,.0f} < "
-                f"${halt_threshold:,.0f} (-{abs(halt_threshold/capital)*100:.1f}% cap)",
-                source="daily_halt", kill_type="flatten",
+        # Threshold resolved+cached at __init__; None means the halt is
+        # disabled (CRITICAL log already emitted).
+        if self.daily_halt_threshold is not None:
+            self.portfolio.daily_pnl = (
+                self.portfolio.realized_pnl_persisted
+                + self.portfolio.compute_mtm_pnl()
+                + self._hedge_mtm_usd()
             )
-            return
+            if self.portfolio.daily_pnl < self.daily_halt_threshold:
+                self.kill(
+                    f"DAILY P&L HALT: ${self.portfolio.daily_pnl:,.0f} < "
+                    f"${self.daily_halt_threshold:,.0f} "
+                    f"(-{abs(self.daily_halt_threshold/capital)*100:.1f}% cap)",
+                    source="daily_halt", kill_type="flatten",
+                )
+                return
 
         # Margin warning (above ceiling but below kill) — log only; the
         # constraint checker already blocks margin-increasing opens.
@@ -258,21 +282,19 @@ class RiskMonitor:
 
         Returns True if the halt fired (caller may want to short-circuit).
         """
-        if self.killed:
-            return False
-        halt_threshold = self._resolve_daily_halt_threshold()
-        if halt_threshold is None:
+        if self.killed or self.daily_halt_threshold is None:
             return False
         self.portfolio.daily_pnl = (
             self.portfolio.realized_pnl_persisted
             + self.portfolio.compute_mtm_pnl()
             + self._hedge_mtm_usd()
         )
-        if self.portfolio.daily_pnl < halt_threshold:
+        if self.portfolio.daily_pnl < self.daily_halt_threshold:
             capital = self.config.constraints.capital
             self.kill(
                 f"DAILY P&L HALT (fill-path): ${self.portfolio.daily_pnl:,.0f} < "
-                f"${halt_threshold:,.0f} (-{abs(halt_threshold/capital)*100:.1f}% cap)",
+                f"${self.daily_halt_threshold:,.0f} "
+                f"(-{abs(self.daily_halt_threshold/capital)*100:.1f}% cap)",
                 source="daily_halt", kill_type="flatten",
             )
             return True
@@ -305,19 +327,6 @@ class RiskMonitor:
                         self._hedge_mtm_err_logged = True
                     return 0.0
         return 0.0
-
-    def resolve_daily_halt_threshold(self):
-        """Return the dollar-denominated halt threshold (negative). v1.4
-        prefers daily_pnl_halt_pct × capital; falls back to legacy
-        max_daily_loss. Returns None if neither is set.
-
-        Public so main.py's pnl_snapshot emitter can reuse the same
-        resolution logic (avoids drift between threshold reported in
-        snapshots vs. threshold actually enforced by kill())."""
-        return _resolve_daily_halt_threshold(self.config)
-
-    # Back-compat alias for internal callers.
-    _resolve_daily_halt_threshold = resolve_daily_halt_threshold
 
     def kill(self, reason: str, source: str = "risk",
              kill_type: str = "halt"):
@@ -447,10 +456,21 @@ class RiskMonitor:
             path = os.path.join(INDUCE_SENTINEL_DIR, fname)
             if not os.path.exists(path):
                 continue
+            # Remove the sentinel BEFORE firing so the kill can't
+            # re-trigger on the next cycle if the remove fails after
+            # the fact (e.g., permissions, NFS). If remove fails, log
+            # WARNING and skip the fire: operator needs the signal,
+            # not a pinned kill that re-fires on daily_halt rollover.
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning(
+                    "Induced sentinel %s present but os.remove failed (%s); "
+                    "refusing to fire kill to avoid a stuck re-trigger loop. "
+                    "Remove the sentinel manually before the next check.",
+                    path, e,
+                )
+                return False
             reason = (
                 f"INDUCED TEST [{switch_key.upper()}]: sentinel {path} — "
                 f"exercising kill_type={kill_type} source={source}"

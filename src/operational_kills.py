@@ -18,13 +18,18 @@ Fires via risk.kill(reason, source="operational", kill_type="halt").
 All operational kills are sticky (source="operational" is not cleared
 by clear_disconnect_kill or clear_daily_halt) — they indicate a genuine
 infrastructure problem that needs human review before re-quoting.
+
+**Sustained-breach pattern**: each signal tracks ``first_breach_ts`` —
+the monotonic timestamp when the current breach streak began. Reset to
+None on first good sample. Fires when ``now - first_breach_ts >
+window_sec``. This replaces an earlier "every-sample-in-window breaches"
+check that relied on sample alignment against the window edge and
+silently failed at moderately-slow check cadences.
 """
 
 import logging
-import statistics
 import time
-from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +42,10 @@ class OperationalKillMonitor:
     the kill signal is global — if SABR degrades on the primary, we
     halt everything.
 
-    Inputs it pulls each cycle:
-      - engines[*]["sabr"].last_rmse or surface fit history
-      - engines[*]["quotes"]._place_rtt_us (rolling ring, microseconds)
-      - portfolio.fills_today snapshots over time (rolling fill-rate)
+    Inputs it pulls each cycle via public accessors:
+      - engines[*]["sabr"].latest_rmse(expiry)
+      - engines[*]["quotes"].get_latency_snapshot() → place_rtt_us.p50
+      - portfolio.fills_today (rolling fill-rate)
 
     Public API:
       - check(): call from the main loop at 5-10s cadence
@@ -69,15 +74,17 @@ class OperationalKillMonitor:
         self.rvol_alert_threshold: float = float(
             getattr(op, "rvol_alert_5d_threshold", 0.50))
 
-        # Sliding history per signal. Each entry is (monotonic_ts, value).
-        # RMSE history is keyed by (engine_name, expiry) — different
-        # expiries calibrate independently so we track them separately
-        # and only fire the kill when the front-month is sustained-bad.
-        self._rmse_hist: Dict[Tuple[str, str], Deque[Tuple[float, float]]] = {}
-        self._latency_hist: Deque[Tuple[float, float]] = deque(maxlen=2000)
-        # Fill-count snapshots at each check tick: (ts, fills_today). The
-        # rolling rate comes from the slope across two snapshots.
-        self._fill_hist: Deque[Tuple[float, int]] = deque(maxlen=2000)
+        # Sustained-breach tracking. Per-signal monotonic ts of when the
+        # current breach streak began; None means no active breach.
+        # RMSE keyed by (engine_name, expiry) — different expiries
+        # calibrate independently.
+        self._rmse_first_breach_ts: dict = {}
+        self._latency_first_breach_ts: Optional[float] = None
+
+        # Fill-count snapshots: (ts, fills_today). The short-term rate
+        # vs rolling-hour baseline comparison uses a sliding window here
+        # (not a breach-streak), so we keep the sample history.
+        self._fill_hist: list = []
 
     def check(self) -> None:
         """Evaluate all operational kill switches. No-op if already
@@ -87,112 +94,97 @@ class OperationalKillMonitor:
 
         now = time.monotonic()
 
-        # 1) SABR RMSE sustained > threshold on the front-month.
         self._check_sabr_rmse(now)
         if self.risk.killed:
             return
 
-        # 2) Quote latency median > threshold sustained.
         self._check_quote_latency(now)
         if self.risk.killed:
             return
 
-        # 3) Abnormal fill rate vs rolling baseline.
         self._check_fill_rate(now)
 
     # ── Per-switch checks ─────────────────────────────────────────────
     def _check_sabr_rmse(self, now: float) -> None:
-        """Front-month RMSE > threshold continuously for window_sec ⇒ kill.
-
-        Sampling: every check call we record one (ts, rmse) per engine's
-        front expiry. If every sample inside the window exceeds the
-        threshold, we fire. Single dips below the threshold reset the
-        streak (implicit via the window — older good samples age out as
-        the window slides forward).
+        """Front-month RMSE > threshold continuously for ``window_sec`` ⇒
+        kill. Streak is tracked via ``_rmse_first_breach_ts[key]``; a
+        single sample at-or-below threshold resets the streak to None.
         """
-        cutoff = now - self.rmse_window_sec
-
         for eng in self.engines:
             sabr = eng.get("sabr")
-            if sabr is None:
-                continue
             md = eng.get("md")
-            if md is None:
+            if sabr is None or md is None:
                 continue
-            # Front-month expiry only — that's what v1.4 §7 specifies.
+            if not hasattr(sabr, "latest_rmse"):
+                # SABR version predates the public API; skip rather than
+                # silently disarm. Log once so the operator sees it.
+                if not getattr(self, "_sabr_api_warned", False):
+                    logger.warning(
+                        "operational_kills: engine %s SABR has no "
+                        "latest_rmse() — RMSE kill disabled for this engine.",
+                        eng.get("name", "?"),
+                    )
+                    self._sabr_api_warned = True
+                continue
+
             expiries = getattr(md.state, "expiries", []) or []
             if not expiries:
                 continue
             front = expiries[0]
 
-            # Pull the latest RMSE for this expiry. SABR stores it in the
-            # per-side surface params; take the max across sides so a
-            # busted call fit trips the switch even if puts are clean.
-            rmse = self._latest_rmse(sabr, front)
+            rmse = sabr.latest_rmse(front)
             if rmse is None:
-                continue
+                continue  # no fit has landed yet
 
             key = (eng["name"], front)
-            hist = self._rmse_hist.setdefault(key, deque(maxlen=2000))
-            hist.append((now, rmse))
-            while hist and hist[0][0] < cutoff:
-                hist.popleft()
-
-            # Fire only if the window is fully populated AND every sample
-            # breaches. Window-length gate prevents a cold-start false
-            # positive where two bad samples span "the whole window"
-            # because the history is empty.
-            if hist and hist[0][0] <= cutoff + 1.0:
-                # Window is at least rmse_window_sec long AND
-                # every sample breaches threshold.
-                all_breached = all(r > self.rmse_threshold for _, r in hist)
-                if all_breached:
+            if rmse > self.rmse_threshold:
+                first = self._rmse_first_breach_ts.get(key)
+                if first is None:
+                    self._rmse_first_breach_ts[key] = now
+                elif (now - first) > self.rmse_window_sec:
                     self.risk.kill(
                         f"SABR RMSE SUSTAINED BREACH [{eng['name']}/{front}]: "
-                        f"all {len(hist)} samples in {self.rmse_window_sec:.0f}s "
-                        f"window > {self.rmse_threshold:.3f}",
+                        f"rmse={rmse:.4f} > {self.rmse_threshold:.3f} for "
+                        f"{now - first:.0f}s (window {self.rmse_window_sec:.0f}s)",
                         source="operational", kill_type="halt",
                     )
                     return
+            else:
+                self._rmse_first_breach_ts[key] = None
 
     def _check_quote_latency(self, now: float) -> None:
         """Median place-RTT > threshold sustained ⇒ kill.
 
-        Samples the primary engine's quote manager's _place_rtt_us ring.
-        Latency above 2s indicates a wire-protocol or gateway problem
-        (not a strategy issue), so we halt quoting and page operator.
+        Samples the primary engine's latency snapshot. Latency above 2s
+        indicates a wire-protocol or gateway problem (not a strategy
+        issue), so we halt quoting and page operator.
         """
-        cutoff = now - self.latency_window_sec
-        # Primary engine only — secondaries' latency is usually correlated.
         if not self.engines:
             return
         primary = self.engines[0]
         quotes = primary.get("quotes")
-        if quotes is None:
-            return
-        ring = getattr(quotes, "_place_rtt_us", None)
-        if ring is None or len(ring) == 0:
+        if quotes is None or not hasattr(quotes, "get_latency_snapshot"):
             return
 
-        # Convert the latest ring value to ms and stash the sample.
-        # The ring holds microseconds; we don't have per-sample
-        # timestamps so we just snapshot its median now.
-        ring_ms = [v / 1000.0 for v in ring]
-        median_ms = statistics.median(ring_ms) if ring_ms else 0.0
-        self._latency_hist.append((now, median_ms))
-        while self._latency_hist and self._latency_hist[0][0] < cutoff:
-            self._latency_hist.popleft()
+        snap = quotes.get_latency_snapshot() or {}
+        p50_us = (snap.get("place_rtt_us") or {}).get("p50")
+        if p50_us is None:
+            return  # no samples yet
+        median_ms = float(p50_us) / 1000.0
 
-        if (self._latency_hist
-                and self._latency_hist[0][0] <= cutoff + 1.0
-                and all(v > self.latency_ms_max
-                        for _, v in self._latency_hist)):
-            self.risk.kill(
-                f"QUOTE LATENCY BREACH: median place-RTT > "
-                f"{self.latency_ms_max:.0f}ms sustained "
-                f"{self.latency_window_sec:.0f}s (latest={median_ms:.0f}ms)",
-                source="operational", kill_type="halt",
-            )
+        if median_ms > self.latency_ms_max:
+            if self._latency_first_breach_ts is None:
+                self._latency_first_breach_ts = now
+            elif (now - self._latency_first_breach_ts) > self.latency_window_sec:
+                self.risk.kill(
+                    f"QUOTE LATENCY BREACH: place-RTT p50={median_ms:.0f}ms "
+                    f"> {self.latency_ms_max:.0f}ms for "
+                    f"{now - self._latency_first_breach_ts:.0f}s "
+                    f"(window {self.latency_window_sec:.0f}s)",
+                    source="operational", kill_type="halt",
+                )
+        else:
+            self._latency_first_breach_ts = None
 
     def _check_fill_rate(self, now: float) -> None:
         """Fills/minute > multiplier × baseline ⇒ kill.
@@ -205,12 +197,12 @@ class OperationalKillMonitor:
         <5 total fills, skip — the ratio is meaningless when numbers
         are small.
         """
-        fills_today = getattr(self.portfolio, "fills_today", 0)
-        self._fill_hist.append((now, int(fills_today)))
+        fills_today = int(getattr(self.portfolio, "fills_today", 0))
+        self._fill_hist.append((now, fills_today))
         # Evict samples older than the baseline window + buffer.
         cutoff = now - (self.fill_rate_baseline_window_sec + 60)
         while self._fill_hist and self._fill_hist[0][0] < cutoff:
-            self._fill_hist.popleft()
+            self._fill_hist.pop(0)
 
         if len(self._fill_hist) < 3:
             return
@@ -245,32 +237,3 @@ class OperationalKillMonitor:
                 f"ratio {ratio:.1f}× > {self.fill_rate_mul:.0f}×",
                 source="operational", kill_type="halt",
             )
-
-    # ── Helpers ───────────────────────────────────────────────────────
-    @staticmethod
-    def _latest_rmse(sabr, expiry: str) -> Optional[float]:
-        """Pull the latest accepted RMSE for an expiry from the SABR
-        surface. Returns the max across C/P sides (bad fit on either
-        side trips the switch).
-
-        Returns None if no fit has landed yet.
-        """
-        # MultiExpirySABR stores per-expiry SABRSurface instances. Each
-        # side params dict carries the fit result object with .rmse.
-        surfaces = getattr(sabr, "surfaces", None) or {}
-        surf = surfaces.get(expiry)
-        if surf is None:
-            return None
-        side_params = getattr(surf, "_side_params", None) or {}
-        vals: List[float] = []
-        for side, sp in side_params.items():
-            # Prefer SVI result; fall back to SABR result.
-            r = sp.get("svi_params") or sp.get("params")
-            if r is None:
-                continue
-            rmse = getattr(r, "rmse", None)
-            if rmse is not None:
-                vals.append(float(rmse))
-        if not vals:
-            return None
-        return max(vals)

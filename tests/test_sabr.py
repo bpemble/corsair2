@@ -151,3 +151,41 @@ def test_call_and_put_theo_distinct(cfg):
     assert put_theo > 0
     # ATM call and put should be approximately equal under Black-76 with no rate
     assert call_theo == pytest.approx(put_theo, rel=0.05)
+
+
+# ── latest_rmse: public accessor for OperationalKillMonitor ────────────
+
+def test_latest_rmse_returns_none_before_any_fit(cfg):
+    """No fit has landed → latest_rmse must return None, not 0 or raise.
+    Operational kill treats None as "skip this cycle" (no breach
+    streak advanced), not "fit is healthy"."""
+    surf = SABRSurface(cfg)
+    assert surf.latest_rmse() is None
+
+
+def test_latest_rmse_returns_max_across_sides(cfg):
+    """When both sides have fit results, latest_rmse returns the max
+    so a busted side trips the operational kill even if the other
+    side is clean."""
+    from src.sabr import SVIParams
+    surf = SABRSurface(cfg)
+    surf._side_params["C"]["svi_params"] = SVIParams(
+        a=0.0, b=0.02, rho=0.0, m=0.0, sigma=0.04, rmse=0.003, n_points=10,
+    )
+    surf._side_params["P"]["svi_params"] = SVIParams(
+        a=0.0, b=0.02, rho=0.0, m=0.0, sigma=0.04, rmse=0.07, n_points=10,
+    )
+    assert surf.latest_rmse() == pytest.approx(0.07)
+
+
+def test_multi_expiry_latest_rmse_returns_none_for_unknown_expiry(cfg):
+    """MultiExpirySABR.latest_rmse with an unsubscribed expiry returns
+    None — guards against operational_kills keying on a stale expiry
+    across a roll."""
+    from src.sabr import MultiExpirySABR
+    m = MultiExpirySABR(cfg)
+    m.set_expiries(["20260427"])
+    assert m.latest_rmse("99999999") is None
+    # Even the subscribed expiry returns None pre-fit.
+    assert m.latest_rmse("20260427") is None
+    m.shutdown(timeout=0.1)
