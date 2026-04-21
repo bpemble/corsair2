@@ -90,7 +90,7 @@ async def _lean_connect(ib: IB, host: str, port: int, account: str):
 
 async def _cancel_working_orders(ib: IB, symbol: str):
     """Cancel every FOP working order for *symbol* across all clients."""
-    ib.reqAllOpenOrders()
+    await ib.reqAllOpenOrdersAsync()
     await asyncio.sleep(3)
     pending = [
         t for t in ib.openTrades()
