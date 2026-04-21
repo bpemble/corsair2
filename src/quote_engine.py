@@ -321,6 +321,13 @@ class QuoteManager:
         self._last_amend_ns: dict[OrderKey, int] = {}
         self._tick_amend_count: int = 0
         self._tick_amend_deferred: int = 0
+        # Diagnostic counters for distinguishing max-age force-refresh
+        # amends from genuine price-change amends. Reset at process start;
+        # surfaced via get_latency_snapshot() so the tuning question "is
+        # max_age_s firing too often?" can be answered from the live
+        # snapshot instead of adding ad-hoc logging.
+        self._amend_force_count: int = 0
+        self._amend_price_count: int = 0
         self.ib.errorEvent += self._on_ib_error
 
     def _canonical_trade(self, order_id: int):
@@ -1154,6 +1161,9 @@ class QuoteManager:
                 # the dead-band so deferred strikes can't stay stale forever.
                 # Edge-violation bypasses BOTH the band and the cap — the
                 # correctness floor for when current price violates min_edge.
+                # Declared up front so the post-success counter path can
+                # read it regardless of which policy branch was taken.
+                force_refresh = False
                 policy = getattr(self.config.quoting, "refresh_policy", "legacy")
                 if policy == "priority_v1":
                     cq = self.config.quoting
@@ -1245,6 +1255,15 @@ class QuoteManager:
                         # legacy (no reader consults them).
                         self._last_amend_ns[key] = now_ns
                         self._tick_amend_count += 1
+                        # Classify the amend for diagnostic tuning: a
+                        # max-age-driven "touch" where the price wasn't
+                        # changing is a force_refresh; anything else
+                        # (price moved past dead-band, or edge_violation
+                        # correctness fix) counts as a price-driven amend.
+                        if force_refresh and not edge_violation:
+                            self._amend_force_count += 1
+                        else:
+                            self._amend_price_count += 1
                 except AssertionError:
                     # Race: wrapper.trades flipped to a DoneState between
                     # our liveness check and placeOrder. Drop tracking
@@ -1552,10 +1571,21 @@ class QuoteManager:
                 "p10": pct(0.10), "p25": pct(0.25), "p50": pct(0.50),
                 "p75": pct(0.75), "p90": pct(0.90), "p99": pct(0.99),
             }
+        total_amends = self._amend_force_count + self._amend_price_count
+        force_pct = (
+            100.0 * self._amend_force_count / total_amends
+            if total_amends > 0 else 0.0
+        )
         return {
             "ttt_us": stats(self._ttt_us),
             "place_rtt_us": stats(self._place_rtt_us),
             "amend_us": stats(self._amend_us),
+            "amend_reasons": {
+                "force_refresh": self._amend_force_count,
+                "price_change": self._amend_price_count,
+                "force_pct": round(force_pct, 1),
+                "total": total_amends,
+            },
         }
 
     def _cancel_quote(self, strike: float, expiry: str, right: str, side: str):
