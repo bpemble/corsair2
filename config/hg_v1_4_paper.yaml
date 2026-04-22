@@ -192,7 +192,7 @@ quoting:
   # 0.0455 (2 ticks better than 0.0445) instead of filling into the
   # rally. Tradeoff: suppresses fills when SABR is right and the
   # market is wrong — expected to lose some edge on the tails.
-  peer_consensus_cap_ticks: 0
+  peer_consensus_cap_ticks: 2
 
   # Hardburst-skip overlay (spec: crowsnest/docs/findings/
   # wing_latency_burst_thesis_2026-04-21.md). Skips new quote placement
