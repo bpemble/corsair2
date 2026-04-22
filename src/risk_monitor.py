@@ -3,13 +3,23 @@
 Continuous monitoring (every 5 minutes or more frequently):
 - SPAN margin vs kill threshold
 - Portfolio delta vs kill threshold
-- Daily P&L vs kill threshold (v1.4 §6.1 PRIMARY defense; flattens book)
+- Daily P&L vs kill threshold (halts quoting; see CLAUDE.md §8)
 - Margin warning (above ceiling but below kill)
 
-Kill taxonomy (v1.4 §6.2):
-- kill_type="halt"       — cancel quotes, no flatten. Theta / vega halts.
+Kill taxonomy:
+- kill_type="halt"       — cancel quotes, no flatten. Theta / vega halts,
+                           daily P&L halt, and SPAN margin kill. The
+                           last two deviate from v1.4 §6.1/§6.2 which
+                           specified "flatten" — operator decision
+                           2026-04-22 after an incident where flatten
+                           slippage (8 IOC closes into wide spreads)
+                           erased morning P&L. Rationale: book is
+                           preserved; operator monitors and unwinds
+                           manually. See CLAUDE.md §7/§8.
 - kill_type="flatten"    — cancel quotes + flatten options + flatten hedge.
-                           Daily P&L halt and SPAN margin kill.
+                           Not used by any live kill path post-2026-04-22
+                           — retained for future re-enablement and for
+                           induced-test parity if/when reinstated.
 - kill_type="hedge_flat" — cancel quotes + force hedge to 0 (no options
                            flatten). Delta kill.
 
@@ -40,9 +50,9 @@ logger = logging.getLogger(__name__)
 INDUCE_SENTINEL_DIR = os.environ.get("CORSAIR_INDUCE_DIR", "/tmp")
 INDUCE_SENTINELS = {
     "daily_pnl": ("corsair_induce_daily_pnl",
-                  "flatten", "daily_halt"),
+                  "halt", "daily_halt"),
     "margin":    ("corsair_induce_margin",
-                  "flatten", "risk"),
+                  "halt", "risk"),
     "delta":     ("corsair_induce_delta",
                   "hedge_flat", "risk"),
     "theta":     ("corsair_induce_theta",
@@ -207,12 +217,16 @@ class RiskMonitor:
             self.portfolio.compute_mtm_pnl(),
         )
 
-        # SPAN margin kill (v1.4 §6.2): FLATTEN book on breach.
+        # SPAN margin kill: HALT (cancel quotes + session lockout, no
+        # flatten). Deviates from v1.4 §6.2 which specified flatten —
+        # operator override 2026-04-22 after IOC-flatten slippage on a
+        # 70%-margin breach erased morning P&L. Positions preserved;
+        # operator unwinds manually. Requires restart to clear (source=risk).
         margin_kill = capital * self.config.kill_switch.margin_kill_pct
         if current_margin > margin_kill:
             self.kill(
                 f"MARGIN KILL: ${current_margin:,.0f} > ${margin_kill:,.0f}",
-                source="risk", kill_type="flatten",
+                source="risk", kill_type="halt",
             )
             return
 
@@ -245,7 +259,12 @@ class RiskMonitor:
             )
             return
 
-        # Daily P&L halt (v1.4 §6.1 PRIMARY DEFENSE): FLATTEN on breach.
+        # Daily P&L halt: HALT (cancel quotes + auto-clear at session
+        # rollover). Deviates from v1.4 §6.1 which specified flatten as
+        # the PRIMARY defense — operator override 2026-04-22 (same
+        # rationale as margin kill above). Source="daily_halt" still
+        # auto-clears at 17:00 CT, so quoting resumes next session
+        # without manual intervention. Positions persist across the halt.
         # Threshold resolved+cached at __init__; None means the halt is
         # disabled (CRITICAL log already emitted).
         if self.daily_halt_threshold is not None:
@@ -259,7 +278,7 @@ class RiskMonitor:
                     f"DAILY P&L HALT: ${self.portfolio.daily_pnl:,.0f} < "
                     f"${self.daily_halt_threshold:,.0f} "
                     f"(-{abs(self.daily_halt_threshold/capital)*100:.1f}% cap)",
-                    source="daily_halt", kill_type="flatten",
+                    source="daily_halt", kill_type="halt",
                 )
                 return
 
@@ -294,7 +313,7 @@ class RiskMonitor:
                 f"DAILY P&L HALT (fill-path): ${self.portfolio.daily_pnl:,.0f} < "
                 f"${self.daily_halt_threshold:,.0f} "
                 f"(-{abs(self.daily_halt_threshold/capital)*100:.1f}% cap)",
-                source="daily_halt", kill_type="flatten",
+                source="daily_halt", kill_type="halt",
             )
             return True
         return False

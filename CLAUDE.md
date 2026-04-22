@@ -186,31 +186,50 @@ Currently configured for Stage 1 of the deployment ramp:
 These numbers come from the deployment ramp doc. Stage 2 (post-validation)
 goes to $500K margin. Don't loosen them ad-hoc — they're the safety net.
 
-## 8. v1.4 daily P&L halt: FLATTEN is not just "cancel"
+**Margin kill behavior (operator override 2026-04-22)**: on breach, the
+kill fires with `kill_type="halt"` — cancel all resting quotes, session
+lockout (source=risk, sticky, requires `docker compose restart corsair`
+to clear), but **positions are NOT flattened**. Deviates from v1.4 §6.2
+which specified flatten. Rationale: on 2026-04-22 the margin kill flattened
+an 8-position book into wide spreads via IOC limits and erased $1.6K of
+morning P&L in 700ms (realized net −$1,325 after starting the hour at
++$1,600 MtM). Operator now monitors margin manually and unwinds
+discretionarily. To reinstate flatten, flip `kill_type` back in
+`risk_monitor.py` at the margin kill call site and update
+`INDUCE_SENTINELS["margin"]`.
 
-v1.4 §6.1 upgrades the daily P&L halt from "cancel resting quotes" to
-**flatten all positions + flatten hedge + session-level halt**. The path:
+## 8. Daily P&L halt: HALT (cancel + session-level lockout, not flatten)
 
-1. `RiskMonitor.kill(..., kill_type="flatten")` fires
-2. `quotes.cancel_all_quotes()` runs first (always — fail-safe)
-3. Then `flatten_callback` is invoked (wired from main.py):
-   - `_flatten_all_engines(reason)` — each engine's
-     `QuoteManager.flatten_all_positions()` sends aggressive IOC limit
-     orders (market ± 1 tick) to close every option position
-   - `hedge_fanout.flatten_on_halt(reason)` — each engine's
-     `HedgeManager.flatten_on_halt()` closes its futures hedge
-4. Paper-stream `kill_switch-YYYY-MM-DD.jsonl` row emitted with full
-   book snapshot (positions, margin, pnl, greeks)
-5. `risk.killed = True`, source="daily_halt"
+**Operator override 2026-04-22**: deviates from v1.4 §6.1 which specified
+**flatten all positions + flatten hedge**. Now uses `kill_type="halt"`:
+cancel all resting quotes, session-level lockout, **positions preserved**.
+Same rationale as margin kill (§7) — flatten slippage into wide option
+spreads is too costly.
 
-**Session rollover at 17:00 CT** auto-clears only the daily_halt source
-(see `risk.clear_daily_halt()`). Every other kill source is sticky —
-requires manual restart + investigation before quoting resumes.
+The path:
+
+1. `RiskMonitor.kill(..., kill_type="halt")` fires (threshold:
+   `daily_pnl_halt_pct × capital`, default −5%)
+2. `quotes.cancel_all_quotes()` runs
+3. Paper-stream `kill_switch-YYYY-MM-DD.jsonl` row emitted with full book
+   snapshot (positions, margin, pnl, greeks). `book_state.kill_type`
+   field now reads "halt" instead of "flatten".
+4. `risk.killed = True`, source="daily_halt"
+
+**Session rollover at 17:00 CT** still auto-clears the daily_halt source
+(see `risk.clear_daily_halt()`), so quoting resumes automatically at next
+session with whatever position inventory we had at halt time. Every other
+kill source is sticky — requires manual restart + investigation before
+quoting resumes.
 
 **Per-fill halt check**: the fill handler calls
 `risk.check_daily_pnl_only()` on every live fill so the halt fires
 between the 5-minute full risk checks. Daily P&L includes hedge MTM
-via `RiskMonitor._hedge_mtm_usd()`.
+via `RiskMonitor._hedge_mtm_usd()`. Same `kill_type="halt"` applies.
+
+**The `flatten_callback` is still wired in main.py** — no live call path
+invokes it today, but the plumbing is preserved for future re-enablement
+and induced-test parity.
 
 ## 9. v1.4 induced kill-switch tests (Gate 0)
 
