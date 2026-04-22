@@ -97,15 +97,16 @@ operational_kills:
 # "execute" when induced tests pass.
 hedging:
   enabled: true
-  # Flipped observe → execute 2026-04-22. Gate 0 induced tests pass
-  # (5/5 green at boot). Observe-mode logs showed the rebalance logic
-  # computing correct targets on today's fills. KNOWN LIMITATION: no
-  # execDetailsEvent wiring for hedge fills means local hedge_qty is
-  # optimistically updated at the resting-quote F (not the actual IOC
-  # fill price). Paper-sim execution will surface drift magnitudes; use
-  # those measurements to scope the v1.5 reconciliation path before any
-  # LIVE flip. See CLAUDE.md §10.
-  mode: "execute"              # "observe" = log-only; "execute" = place orders
+  # Reverted execute → observe 2026-04-22. Flipping to execute surfaced
+  # an immediate Error 201 rejection: IBKR blocks retail orders on the
+  # resolved hedge contract (HGJ6, April 2026, 6 days to expiry) under
+  # their near-expiration physical-delivery risk policy. The hedge
+  # manager picks "front-month" but during the last ~1-2 weeks before
+  # delivery, that contract is retail-locked for orders. Fix path: have
+  # hedge_manager resolve the FIRST TRADEABLE contract (skip the
+  # expiring front) — 1-day task. Until then execute mode is dead on
+  # HG; observe logs the intent without actually trying.
+  mode: "observe"              # "observe" = log-only; "execute" = place orders
   instrument: "HG_futures_front"  # Front-month HG futures contract
   tolerance_deltas: 0.5        # ±0.5 contract-deltas no-trade band
   rebalance_on_fill: true
