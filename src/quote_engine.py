@@ -1159,6 +1159,7 @@ class QuoteManager:
                 strike, right, expiry=expiry)
             if mkt_bid > 0 and mkt_ask > 0 and mkt_ask > mkt_bid:
                 mid = (mkt_bid + mkt_ask) / 2.0
+                pre_cap = adj
                 if side == "BUY":
                     # Don't bid more than peer_cap_ticks above mid.
                     ceiling = floor_to_tick(
@@ -1171,6 +1172,35 @@ class QuoteManager:
                         mid - peer_cap_ticks * tick, tick)
                     if adj < floor_px:
                         adj = floor_px
+                # Instrumentation: emit to skips JSONL whenever cap
+                # actually changes the price so we can measure fire rate,
+                # price improvement distribution, and for sampling the
+                # "SABR-was-right counterfactual" cases.
+                if adj != pre_cap and self.csv_logger is not None:
+                    try:
+                        improvement_ticks = (
+                            abs(adj - pre_cap) / tick if tick else 0.0
+                        )
+                        self.csv_logger.log_paper_stream("skips", {
+                            "event_type": "cap_engaged",
+                            "symbol": format_hxe_symbol(expiry, right, strike),
+                            "cp": right,
+                            "strike": float(strike),
+                            "expiry": expiry,
+                            "side": "BUY" if side == "BUY" else "SELL",
+                            "skip_reason": "capped_peer_consensus",
+                            "pre_cap_price": float(pre_cap),
+                            "post_cap_price": float(adj),
+                            "improvement_ticks": float(improvement_ticks),
+                            "mid": float(mid),
+                            "bbo_bid": float(mkt_bid),
+                            "bbo_ask": float(mkt_ask),
+                            "theo": float(theo) if theo is not None else None,
+                            "forward": self.market_data.state.underlying_price,
+                            "cap_ticks": peer_cap_ticks,
+                        })
+                    except Exception:
+                        logger.debug("cap_engaged log failed", exc_info=True)
 
         # Behind-incumbent gate: if the theo cap pushed our price behind
         # the incumbent, the order has little queue value. The strict
