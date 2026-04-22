@@ -97,7 +97,15 @@ operational_kills:
 # "execute" when induced tests pass.
 hedging:
   enabled: true
-  mode: "observe"              # "observe" = log-only; "execute" = place orders
+  # Flipped observe → execute 2026-04-22. Gate 0 induced tests pass
+  # (5/5 green at boot). Observe-mode logs showed the rebalance logic
+  # computing correct targets on today's fills. KNOWN LIMITATION: no
+  # execDetailsEvent wiring for hedge fills means local hedge_qty is
+  # optimistically updated at the resting-quote F (not the actual IOC
+  # fill price). Paper-sim execution will surface drift magnitudes; use
+  # those measurements to scope the v1.5 reconciliation path before any
+  # LIVE flip. See CLAUDE.md §10.
+  mode: "execute"              # "observe" = log-only; "execute" = place orders
   instrument: "HG_futures_front"  # Front-month HG futures contract
   tolerance_deltas: 0.5        # ±0.5 contract-deltas no-trade band
   rebalance_on_fill: true

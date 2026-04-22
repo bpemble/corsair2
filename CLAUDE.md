@@ -261,7 +261,7 @@ Non-daily_halt induced kills are sticky — `docker compose restart corsair`
 to clear. daily_halt induced kills auto-clear at the next CME session
 rollover (17:00 CT).
 
-## 10. v1.4 hedge mode: observe vs execute
+## 10. Hedge mode: execute (flipped 2026-04-22 in paper)
 
 `src/hedge_manager.py` runs in one of two modes via
 `config.hedging.mode`:
@@ -270,13 +270,34 @@ rollover (17:00 CT).
   orders. Local `hedge_qty` is updated optimistically so daily P&L
   halt still sees hedge MTM as if trades had filled.
 - **execute**: places aggressive IOC limit orders at market ± 1 tick
-  on the front-month HG futures contract. Live fills NOT yet wired
-  through an execDetails callback — reconciliation against
-  `ib.positions()` is a v1.5 item. Use observe mode until that lands.
+  on the front-month HG futures contract. Currently active in paper
+  as of 2026-04-22 — Gate 0 induced tests pass (5/5 green at boot)
+  and observe-mode logs confirmed the rebalance targets were correct
+  on today's fills.
 
-Stage 0 default: `mode: observe`. Flip to `execute` **only after** all
-five induced kill-switch tests pass AND the delta-kill induced test
-confirms `force_flat()` correctly lands at `hedge_qty=0`.
+**KNOWN LIMITATION (still unfixed, do NOT enable in LIVE until
+resolved)**: local `hedge_qty` is updated optimistically at the
+resting-quote forward F, NOT at the actual IOC fill price. There is
+no execDetailsEvent callback wired for hedge fills, and no periodic
+reconciliation against `ib.positions()`. In paper, this means:
+- If an IOC doesn't fill (market moved past the ±1-tick limit in the
+  round-trip window), local `hedge_qty` says we hedged but IBKR says
+  we didn't — silent drift.
+- If the IOC fills at the limit (not F), `avg_entry_F` is off by 1
+  tick — small hedge MTM error.
+
+The paper session with execute mode ON is the instrument to measure
+drift magnitudes and build the v1.5 reconciliation pass. Watch
+`hedge_trades-YYYY-MM-DD.jsonl` vs `ib.positions()` out-of-band to
+catch drift early. **To revert**: flip `hedging.mode: execute → observe`
+in yaml and restart.
+
+Bounds note: hedge_manager has no explicit cap on `hedge_qty`. Target
+is always `-round(net_delta)` to flatten the options delta. Effective
+bound comes from `delta_kill: 5.0` — if portfolio |net_delta| > 5 the
+delta kill fires (`kill_type="hedge_flat"`) and force-flats hedge_qty
+to 0. Tolerance band is `tolerance_deltas: 0.5` (no trade if
+|effective_delta| ≤ 0.5). Rebalance cadence 30s + on every option fill.
 
 ## 11. The dashboard polls; it doesn't stream
 
