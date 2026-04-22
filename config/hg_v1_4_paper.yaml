@@ -1,28 +1,31 @@
 # ═══════════════════════════════════════════════════════════════════════
-# HG v1.4 Paper Config — Stage 1 ($75K capital)
+# HG v1.4 Paper Config — $500K capital
 # ═══════════════════════════════════════════════════════════════════════
 # Spec: docs/hg_spec_v1.4.md (APPROVED 2026-04-19).
 #
-# This file replaces corsair_v2_config.yaml at Stage 1 cutover. Selected
-# via CORSAIR_CONFIG env var — see docker-compose.yml. The v1.3 config is
-# preserved alongside for rollback.
+# Capital bumped 75K → 500K on 2026-04-22 after the kill-switch behavior
+# was changed from flatten → halt (see CLAUDE.md §7/§8) and operator
+# moved to manual margin monitoring. Derived thresholds:
+#   margin_ceiling = 50% × $500K = $250,000 (soft — blocks new opens)
+#   margin_kill    = 70% × $500K = $350,000 (hard — cancel quotes +
+#                                             session lockout, positions
+#                                             preserved; see CLAUDE.md §7)
+#   daily_loss     = -5% × $500K = -$25,000 (halt quoting, positions
+#                                             preserved; see CLAUDE.md §8)
+# Greek kills (delta_kill, vega_kill, theta_kill) are absolute and did
+# NOT scale with capital — watch for delta-first binding under larger
+# books (5 contract-deltas is the same hedge capacity regardless of cap).
 #
 # Key v1.4 changes from v1.3:
 #   - Strike scope asymmetric (NEAR-OTM+ATM) → SYMMETRIC ATM±5 nickels
 #     (both calls AND puts at every strike, 22 instruments → 44 orders)
-#   - Daily P&L halt at -5% capital (-$3,750) is the PRIMARY defense.
-#     Triggers FLATTEN of options + hedge (not just cancel). Session-level.
-#   - Capital: $200K → $75K. Kill switches rescaled:
-#       margin_kill = 70% × $75K  = $52,500
-#       daily_loss  = -5% × $75K  = -$3,750
-#       vega_kill   = $500 (was $1000)
-#       theta_kill  = -$200 (was -$500)
-#       delta_kill  = 5.0 (unchanged)
+#   - Daily P&L halt is PRIMARY defense. Originally flatten per §6.1;
+#     now halt per 2026-04-22 operator override.
 #   - NEW operational kills: SABR RMSE sustained >0.05, quote latency
 #     median >2s for 60s, abnormal trade rate >10×.
 #   - NEW hedging subsystem: delta-hedge via HG futures front-month,
 #     ±0.5 tolerance. Default mode: "observe" (log intent only, no orders).
-#     Flip to "execute" once Gate 0 induced tests are validated.
+#     Execute mode blocked on execDetailsEvent wiring (v1.5 item).
 #   - ETH tabled — only HG in products list.
 
 account:
@@ -33,26 +36,28 @@ account:
 
 # ── Portfolio-wide (shared across all products) ────────────────────────
 constraints:
-  # Stage 1 paper ($75K capital). Soft ceiling at 60% ($45K) gates new
-  # margin-increasing opens — expected working range per v1.4 §8.3 is
-  # 60-70%, so typical steady state sits AT the ceiling and the constraint
-  # checker's margin-escape path (still enabled below) handles reducing
-  # fills cleanly. Hard kill at 70% ($52.5K) per v1.4 §6.2.
-  capital: 75000
-  margin_ceiling_pct: 0.60     # 60% of $75K = $45K soft ceiling
+  # Paper ($500K capital). Soft ceiling at 50% ($250K) gates new
+  # margin-increasing opens. Hard kill at 70% ($350K) per v1.4 §6.2,
+  # now firing as HALT (not flatten) per 2026-04-22 override — see
+  # CLAUDE.md §7. Margin-escape path (below) still lets margin-reducing
+  # fills through above ceiling.
+  capital: 500000
+  margin_ceiling_pct: 0.50     # 50% of $500K = $250K soft ceiling
   delta_ceiling: 3.0           # |portfolio net_delta| must be <= this
   theta_floor: -500            # soft theta floor ($/day)
   margin_escape_enabled: true  # fills that reduce margin ok above ceiling
 
 kill_switch:
-  # SPAN margin kill (v1.4 §6.2). 70% × $75K = $52.5K.
+  # SPAN margin kill (v1.4 §6.2). 70% × $500K = $350K. Fires as HALT
+  # (not flatten) per 2026-04-22 override — see CLAUDE.md §7.
   margin_kill_pct: 0.70
-  # Daily P&L halt (v1.4 §6.1, PRIMARY defense). Triggers FLATTEN of
-  # options + hedge, not just quote cancel. Session-level halt.
+  # Daily P&L halt (v1.4 §6.1, PRIMARY defense). Originally flatten;
+  # now HALT per 2026-04-22 override — see CLAUDE.md §8. Session-level,
+  # auto-clears at 17:00 CT session rollover.
   # Either max_daily_loss (absolute) or daily_pnl_halt_pct (fraction of
   # capital) can be set; code prefers _pct when present and derives the
   # absolute threshold. Both here for explicitness.
-  max_daily_loss: -3750        # absolute $; = -5% × 75000
+  max_daily_loss: -25000       # absolute $; = -5% × 500000
   daily_pnl_halt_pct: 0.05     # fraction of capital
   # Per-product thresholds.
   delta_kill: 5.0              # |net_delta| kill (v1.4 §6.2 unchanged)
@@ -148,6 +153,56 @@ quoting:
   tick_size: 0.50
   penny_jump_ticks: 1
   min_modify_ticks: 2
+
+  # 2026-04-22 Experiment B: behind_incumbent tie semantics.
+  # Default True (current behavior): an equal-priced quote is considered
+  # "behind in queue" and skipped. False: we place at NBBO and accept
+  # back-of-queue position — overflow fills us if aggressor size exceeds
+  # incumbent size, and we promote to best-bid/ask if incumbent cancels.
+  #
+  # Evidence (2026-04-22): 37% of behind_incumbent events at 4dp precision
+  # are exact ties; flipping this knob is predicted to eliminate those
+  # skips at zero per-fill edge cost (target price unchanged).
+  #
+  # Revert to true before declaring the experiment conclusive, OR amend
+  # the v1.4 spec §3.4 with supporting evidence if the experiment lands.
+  tie_is_behind: false
+
+  # Peer-consensus cap (2026-04-22 prototype). Brackets our quote against
+  # the NBBO mid to prevent SABR-aggressive quotes from sitting too far
+  # below mid (SELLs) or above mid (BUYs) in wide markets. Addresses
+  # the 2026-04-22 14:07 AS fill: theo=0.0428 sat 3.5 ticks below mid
+  # (0.0463) in a 9-tick spread, our SELL at theo+3 ticks (0.0445)
+  # was 4 ticks below mid, and a rally print lifted it at the cheapest
+  # offer on display.
+  #
+  # 0 = disabled (current default — protect baseline behavior while
+  #     measuring). N > 0 = SELL floor = ceil(mid - N×tick);
+  #                         BUY ceiling = floor(mid + N×tick).
+  # For the 2026-04-22 14:07 case, N=2 would have held the SELL at
+  # 0.0455 (2 ticks better than 0.0445) instead of filling into the
+  # rally. Tradeoff: suppresses fills when SABR is right and the
+  # market is wrong — expected to lose some edge on the tails.
+  peer_consensus_cap_ticks: 0
+
+  # Hardburst-skip overlay (spec: crowsnest/docs/findings/
+  # wing_latency_burst_thesis_2026-04-21.md). Skips new quote placement
+  # when front-month futs BBO has moved ≥threshold_ticks inside the
+  # trailing window — protects against aggressor picks in the amend-RTT
+  # exposure window. Detector always runs when enabled (cheap O(1));
+  # skip_enabled flag is OFF by default — do NOT enable live until the
+  # validation gate in the spec passes (2-4 week paper-trade shadow
+  # comparing suppressed-fill signed_bias, P&L lift, grid sweep).
+  hardburst_detector_enabled: true    # detector runs; always-on shadow logging
+  hardburst_skip_enabled: false       # FEATURE FLAG — skip-new gate OFF
+  hardburst_threshold_ticks: 5
+  hardburst_window_ms: 40
+  hardburst_skip_sides: "both"        # reserved for v1.5 (both | sell_only | buy_only)
+  # Kill switch: force hardburst_skip_enabled=false for the rest of the
+  # session if daily suppression rate exceeds this fraction of total
+  # update_quotes invocations. Guards against runaway suppression from
+  # a miscalibrated threshold or a regime shift.
+  hardburst_suppression_kill_rate: 0.20
   delta_retreat_threshold: 5.0
   api_bucket_capacity: 250
   api_bucket_refill_per_sec: 250
@@ -237,8 +292,13 @@ products:
       # to reduce event-loop contention under tick load (amend RTT p50 was
       # 351ms with 138 subscriptions vs 39ms on an idle Gateway — the gap
       # was mostly our own tick-processing overhead).
-      strike_range_low: -7
-      strike_range_high: 7
+      #
+      # TEMP 2026-04-21 evening: bumped to ±10 for dashboard visibility.
+      # Expected latency cost ~30-50ms on amend p50. REVERT to ±7 before
+      # tomorrow's 4dp precision + min_edge experiment so the data
+      # collection is against the production subscription width.
+      strike_range_low: -10
+      strike_range_high: 10
       # Asymmetric scope: CALLS quote ATM to ATM+5 nickels (OTM calls +
       # ATM). PUTS quote ATM-5 to ATM (see puts.quote_range_* below).
       # Shared ATM strike means 11 unique strikes, ~12 instruments (6 calls

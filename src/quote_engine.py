@@ -328,7 +328,147 @@ class QuoteManager:
         # snapshot instead of adding ad-hoc logging.
         self._amend_force_count: int = 0
         self._amend_price_count: int = 0
+        # Requote-cycle instrumentation (logs-paper/requote_cycles-*.jsonl).
+        # Each update_quotes() call opens a cycle; acks arrive async via
+        # _on_open_order_ack and close the cycle when the last sent order
+        # has acknowledged. _prev_cycle_deferred_end seeds the next cycle's
+        # deferred_queue_depth_at_start so compounding deferrals are visible.
+        self._cycle_seq: int = 0
+        self._cycle: dict | None = None
+        self._cycles_pending_emit: dict[int, dict] = {}
+        self._cycle_by_oid: dict[int, int] = {}
+        self._last_cycle_forward: float | None = None
+        self._prev_cycle_deferred_end: int = 0
+
+        # Hardburst-skip overlay telemetry. Counters reset at session
+        # rollover via reset_daily_hardburst_counters(). Populated by the
+        # gate at the top of update_quotes when hardburst_skip_enabled is
+        # True. _hardburst_update_attempts counts ALL reached-the-gate
+        # cycles (so the ratio .../attempts is the suppression rate).
+        self._hardburst_skip_count: int = 0
+        self._hardburst_update_attempts: int = 0
+        self._last_hardburst_skip_ts: int = 0
+        # Runtime kill-override from operational_kills when suppression
+        # rate breaches the daily ceiling. Takes precedence over the
+        # config flag; cleared at the next daily counter reset.
+        self._hardburst_skip_disabled_by_kill: bool = False
         self.ib.errorEvent += self._on_ib_error
+
+    def _begin_requote_cycle(self, trigger: str) -> None:
+        """Open a new requote cycle. Called at the top of update_quotes()
+        after early-return gates. Cycle closes when the last amended order
+        has been acked (or immediately if no amends were sent)."""
+        self._cycle_seq += 1
+        cid = self._cycle_seq
+        fwd = self.market_data.state.underlying_price
+        prev_fwd = self._last_cycle_forward
+        tick_size = float(getattr(self.config.product, "tick_size", 0.0005))
+        fwd_delta_usd = (fwd - prev_fwd) if prev_fwd is not None else 0.0
+        fwd_delta_ticks = (int(round(fwd_delta_usd / tick_size))
+                           if tick_size > 0 else 0)
+        self._last_cycle_forward = fwd
+        self._cycle = {
+            'cycle_id': cid,
+            'trigger': trigger,
+            'refit_expiries': [],
+            'start_ns': time.monotonic_ns(),
+            'forward': fwd,
+            'forward_delta_usd': fwd_delta_usd,
+            'forward_delta_ticks': fwd_delta_ticks,
+            'tick_size': tick_size,
+            'n_evaluated': 0,
+            'skip_reasons': {},
+            'deferred_depth_start': self._prev_cycle_deferred_end,
+            'sent_order_ids': set(),
+            'ack_us': [],
+            'ready_to_emit': False,
+        }
+        self._cycles_pending_emit[cid] = self._cycle
+
+    def _note_cycle_eval(self, skip_reason: str) -> None:
+        c = self._cycle
+        if c is None:
+            return
+        c['n_evaluated'] += 1
+        reason = skip_reason or "amended_or_placed"
+        c['skip_reasons'][reason] = c['skip_reasons'].get(reason, 0) + 1
+
+    def _note_cycle_amend_send(self, order_id: int) -> None:
+        c = self._cycle
+        if c is None:
+            return
+        c['sent_order_ids'].add(order_id)
+        self._cycle_by_oid[order_id] = c['cycle_id']
+
+    def _note_cycle_amend_ack(self, order_id: int, ack_us: int) -> None:
+        cid = self._cycle_by_oid.pop(order_id, None)
+        if cid is None:
+            return
+        c = self._cycles_pending_emit.get(cid)
+        if c is None:
+            return
+        c['ack_us'].append(ack_us)
+        c['sent_order_ids'].discard(order_id)
+        if c['ready_to_emit'] and not c['sent_order_ids']:
+            self._emit_requote_cycle(cid)
+
+    def _end_requote_cycle(self) -> None:
+        """Finalize the open cycle. If amends were sent and some acks are
+        still pending, emission is deferred to the last ack. Otherwise
+        emits immediately (or drops the row if no amends fired)."""
+        c = self._cycle
+        if c is None:
+            return
+        c['n_amended'] = self._tick_amend_count
+        c['n_deferred'] = self._tick_amend_deferred
+        c['deferred_depth_end'] = self._tick_amend_deferred
+        c['ready_to_emit'] = True
+        self._prev_cycle_deferred_end = self._tick_amend_deferred
+        self._cycle = None
+        if c['n_amended'] == 0:
+            # No-op cycle — nothing to measure. Drop to avoid noise.
+            self._cycles_pending_emit.pop(c['cycle_id'], None)
+            return
+        if not c['sent_order_ids']:
+            self._emit_requote_cycle(c['cycle_id'])
+
+    def _emit_requote_cycle(self, cycle_id: int) -> None:
+        c = self._cycles_pending_emit.pop(cycle_id, None)
+        if c is None or self.csv_logger is None:
+            return
+        ack = sorted(c['ack_us'])
+
+        def _pct(p: float):
+            if not ack:
+                return None
+            k = min(len(ack) - 1,
+                    max(0, int(round((p / 100.0) * (len(ack) - 1)))))
+            return ack[k]
+
+        total_us = (time.monotonic_ns() - c['start_ns']) // 1000
+        try:
+            self.csv_logger.log_paper_requote_cycle(
+                cycle_id=c['cycle_id'],
+                trigger=c['trigger'],
+                refit_expiries=c['refit_expiries'],
+                forward=c['forward'],
+                forward_delta_usd=c['forward_delta_usd'],
+                forward_delta_ticks=c['forward_delta_ticks'],
+                tick_size=c['tick_size'],
+                orders_evaluated=c['n_evaluated'],
+                orders_amended=c['n_amended'],
+                orders_deferred=c['n_deferred'],
+                orders_skipped_reasons=c['skip_reasons'],
+                deferred_queue_depth_at_start=c['deferred_depth_start'],
+                deferred_queue_depth_at_end=c['deferred_depth_end'],
+                first_ack_us=ack[0] if ack else None,
+                last_ack_us=ack[-1] if ack else None,
+                p50_ack_us=_pct(50),
+                p99_ack_us=_pct(99),
+                cycle_total_us=total_us,
+            )
+        except Exception as e:
+            logger.debug("requote_cycle emit failed: %s", e)
 
     def _canonical_trade(self, order_id: int):
         """Return the canonical (latest) Trade object for an orderId, or
@@ -499,11 +639,39 @@ class QuoteManager:
             self._margin_rejected.clear()
             self._margin_rejected_last_clear = _now_mono
 
+        # Hardburst-skip overlay. When the detector sees front-month futs
+        # BBO moved ≥threshold_ticks inside the trailing window_ms, skip
+        # this update_quotes invocation entirely. Existing resting quotes
+        # are LEFT IN PLACE — cancelling them adds cancel-RTT risk that
+        # the mechanism argument doesn't justify (spec Change 2, step 4).
+        # Flag defaults OFF; detector-always-on gives us the shadow
+        # counter-factual via fill_handler's detector_was_hardburst column.
+        # _hardburst_skip_disabled_by_kill shorts the gate when the
+        # operational suppression-rate kill has tripped for the day.
+        if (getattr(config.quoting, "hardburst_skip_enabled", False)
+                and not self._hardburst_skip_disabled_by_kill):
+            self._hardburst_update_attempts += 1
+            detector = getattr(self.market_data, "burst_detector", None)
+            if detector is not None:
+                now_ns = time.time_ns()
+                if detector.is_hardburst(now_ns):
+                    self._hardburst_skip_count += 1
+                    self._last_hardburst_skip_ts = now_ns
+                    logger.debug(
+                        "hardburst_skip: window=%s",
+                        detector.snapshot(now_ns),
+                    )
+                    return  # skip this update cycle entirely; no cycle opened
+
         # priority_v1: reset per-cycle amend counters. Iteration order is
         # |delta|-desc (see sort below), so the first N amends to fire are
         # the highest-priority; anything past the cap defers to next tick.
         self._tick_amend_count = 0
         self._tick_amend_deferred = 0
+        # Open a requote cycle for instrumentation. Trigger refinement (refit
+        # detection) happens after consume_refit_pending() below.
+        self._begin_requote_cycle(
+            "dirty_event" if dirty is not None else "periodic")
 
         # SABR recalibration is hoisted out of this hot path and runs from
         # main.py's loop via maybe_recal_sabr() — calibration takes several ms
@@ -556,6 +724,12 @@ class QuoteManager:
         # pre-refit theo can stay below the new min_edge floor for the
         # entire ~250-500ms amend RTT window.
         refit_expiries = self.sabr.consume_refit_pending()
+        if refit_expiries and self._cycle is not None:
+            self._cycle['refit_expiries'] = sorted(refit_expiries)
+            # "refit" takes priority over the generic trigger label — it's
+            # the more interesting signal (a material surface change forced
+            # a full re-eval of those expiries).
+            self._cycle['trigger'] = "refit"
 
         for exp, pairs in per_expiry_quotable.items():
             if exp in refit_expiries:
@@ -703,6 +877,49 @@ class QuoteManager:
                 "priority_v1 cycle: amends_sent=%d amends_deferred=%d",
                 self._tick_amend_count, self._tick_amend_deferred,
             )
+
+        # Close the requote cycle. Emits immediately if no amends were
+        # sent OR all acks have already arrived; otherwise _emit_requote_cycle
+        # fires from the last async ack in _on_open_order_ack.
+        self._end_requote_cycle()
+
+    def reset_daily_hardburst_counters(self) -> None:
+        """Reset hardburst skip counters at session rollover. Called from
+        main.py's session-boundary hook along with other daily-reset state.
+
+        We intentionally DON'T reset _last_hardburst_skip_ts — a consumer
+        wanting "was the last skip recent?" needs to compare vs now itself.
+        Also clears the operational-kill override so the next session
+        starts fresh.
+        """
+        self._hardburst_skip_count = 0
+        self._hardburst_update_attempts = 0
+        self._hardburst_skip_disabled_by_kill = False
+
+    def disable_hardburst_skip_for_session(self, reason: str) -> None:
+        """Runtime override — operational_kills calls this when daily
+        suppression rate exceeds config's kill rate. Force the gate off
+        until reset_daily_hardburst_counters() runs at session rollover.
+        Idempotent; safe to call repeatedly."""
+        if not self._hardburst_skip_disabled_by_kill:
+            self._hardburst_skip_disabled_by_kill = True
+            logger.warning(
+                "hardburst_skip disabled by operational kill until session "
+                "rollover — reason: %s (skips=%d, attempts=%d, rate=%.3f)",
+                reason, self._hardburst_skip_count,
+                self._hardburst_update_attempts,
+                self.get_hardburst_suppression_rate(),
+            )
+
+    def get_hardburst_suppression_rate(self) -> float:
+        """Fraction of update_quotes invocations that were skipped by the
+        hardburst gate since the last daily reset. Returns 0.0 when the
+        gate has never been reached (flag OFF or boot with no ticks).
+        Used by operational_kills to enforce the ≤20% ceiling."""
+        attempts = self._hardburst_update_attempts
+        if attempts <= 0:
+            return 0.0
+        return self._hardburst_skip_count / attempts
 
     def _priority_bucket(self, option) -> str:
         """Classify a strike by |delta| into near/mid/far bucket.
@@ -925,13 +1142,57 @@ class QuoteManager:
                 if adj < capped:
                     adj = capped
 
-        # Behind-incumbent gate: if the theo cap pushed our price to or
-        # behind the incumbent (bid at/below best bid, ask at/above best
-        # ask), the order has zero queue value — we'd match the incumbent
-        # with worse time priority. Cancel rather than rest dead weight.
+        # Peer-consensus cap (2026-04-22, opt-in via
+        # peer_consensus_cap_ticks). Brackets our quote against NBBO mid
+        # so a SABR theo that disagrees with market consensus can't park
+        # us far below mid (for a SELL) or above mid (for a BUY).
+        # Motivated by the 2026-04-22 14:07 C6.10 fill where theo sat
+        # 3.5 ticks under mid in a 9-tick-wide market and our resting
+        # SELL was picked off on a rally print. Defaults to 0 (disabled)
+        # to preserve baseline quoting; positive N enforces the bracket.
+        # Skipped under _bypass_wide_market since that path is already
+        # mid-anchored by design (see ~line 1069).
+        peer_cap_ticks = int(
+            getattr(config.quoting, "peer_consensus_cap_ticks", 0) or 0)
+        if peer_cap_ticks > 0 and not _bypass_wide_market:
+            mkt_bid, mkt_ask = self.market_data.get_clean_bbo(
+                strike, right, expiry=expiry)
+            if mkt_bid > 0 and mkt_ask > 0 and mkt_ask > mkt_bid:
+                mid = (mkt_bid + mkt_ask) / 2.0
+                if side == "BUY":
+                    # Don't bid more than peer_cap_ticks above mid.
+                    ceiling = floor_to_tick(
+                        mid + peer_cap_ticks * tick, tick)
+                    if adj > ceiling:
+                        adj = ceiling
+                else:  # SELL
+                    # Don't offer more than peer_cap_ticks below mid.
+                    floor_px = ceil_to_tick(
+                        mid - peer_cap_ticks * tick, tick)
+                    if adj < floor_px:
+                        adj = floor_px
+
+        # Behind-incumbent gate: if the theo cap pushed our price behind
+        # the incumbent, the order has little queue value. The strict
+        # semantics (tie_is_behind=True) also skips ties — reasoning was
+        # "match the incumbent with worse time priority = dead weight."
+        #
+        # Relaxed semantics (tie_is_behind=False) treat tie as OK and
+        # place at NBBO (we sit behind incumbent in time, but fill on any
+        # overflow, and also become the best quote if incumbent cancels).
+        # 2026-04-22 experiment B: analysis showed ~37% of behind_incumbent
+        # events are ties at 4dp precision; flipping tie_is_behind=False
+        # is predicted to eliminate those skips at zero per-fill edge cost
+        # (target is unchanged). If fill rate rises without adverse-
+        # selection deterioration, permanent change is justified.
+        tie_is_behind = bool(getattr(config.quoting, "tie_is_behind", True))
         if inc_info["price"] is not None and not _bypass_wide_market:
-            behind = ((side == "BUY" and adj <= inc_info["price"])
-                      or (side == "SELL" and adj >= inc_info["price"]))
+            if tie_is_behind:
+                behind = ((side == "BUY" and adj <= inc_info["price"])
+                          or (side == "SELL" and adj >= inc_info["price"]))
+            else:
+                behind = ((side == "BUY" and adj < inc_info["price"])
+                          or (side == "SELL" and adj > inc_info["price"]))
             if behind:
                 self._cancel_quote(strike, expiry, right, side)
                 self._log_quote_telemetry(
@@ -1255,6 +1516,7 @@ class QuoteManager:
                         # legacy (no reader consults them).
                         self._last_amend_ns[key] = now_ns
                         self._tick_amend_count += 1
+                        self._note_cycle_amend_send(order_id)
                         # Classify the amend for diagnostic tuning: a
                         # max-age-driven "touch" where the price wasn't
                         # changing is a force_refresh; anything else
@@ -1459,6 +1721,7 @@ class QuoteManager:
                 amend_us = (now_ns - sent_ns) // 1000
                 if 0 <= amend_us < 5_000_000:
                     self._amend_us.append(amend_us)
+                    self._note_cycle_amend_ack(oid, amend_us)
         except Exception:
             pass
 
@@ -1812,9 +2075,12 @@ class QuoteManager:
                              theo: float | None = None,
                              expiry: str | None = None):
         """Emit per-quote telemetry row."""
+        skip_reason = info.get("skip_reason", "")
+        # Cycle instrumentation: count every evaluation (including skips)
+        # regardless of csv_logger presence so tests see the right counts.
+        self._note_cycle_eval(skip_reason)
         if self.csv_logger is None:
             return
-        skip_reason = info.get("skip_reason", "")
         if self.config.logging.log_quotes:
             try:
                 self.csv_logger.log_quote(

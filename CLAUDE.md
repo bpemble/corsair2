@@ -174,17 +174,23 @@ timeouts upstream.
 options on CME use 50. If you see P&L or margin numbers that look 2× too
 big or 2× too small, check the multiplier first.
 
-## 7. Stage 1 capital + cap
+## 7. Capital + cap
 
-Currently configured for Stage 1 of the deployment ramp:
-- `capital: 200000` ($200K)
-- `margin_ceiling_pct: 0.50` (synthetic cap = $100K)
-- `margin_kill_pct: 0.70` (kill switch at $140K)
-- `delta_ceiling: 3.0`, `theta_floor: -200`, `vega_kill: 1000`
-- `delta_kill: 5.0`
+Currently configured at $500K capital (bumped 2026-04-22 from $75K paper
+after the kill-switch behavior change below made manual margin monitoring
+the primary control):
+- `capital: 500000` ($500K)
+- `margin_ceiling_pct: 0.50` (soft ceiling = $250K, blocks new opens)
+- `margin_kill_pct: 0.70` (kill at $350K, **halt not flatten** — see below)
+- `daily_pnl_halt_pct: 0.05` (daily halt at −$25K, **halt not flatten** — §8)
+- `delta_ceiling: 3.0`, `theta_floor: -500`, `theta_kill: -500`
+- `delta_kill: 5.0`, `vega_kill: 500`
 
-These numbers come from the deployment ramp doc. Stage 2 (post-validation)
-goes to $500K margin. Don't loosen them ad-hoc — they're the safety net.
+**Greek kills did NOT scale with capital** when we moved to $500K. 5
+contract-deltas is the same hedge capacity regardless of book size, so
+under a bigger book it's now easier to bind on `delta_kill` before
+`margin_kill`. Worth revisiting if the strategy consistently binds on
+delta before margin.
 
 **Margin kill behavior (operator override 2026-04-22)**: on breach, the
 kill fires with `kill_type="halt"` — cancel all resting quotes, session
