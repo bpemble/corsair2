@@ -785,12 +785,23 @@ async def main():
         # v1.4 §5: periodic delta-hedge rebalance (30s default). The
         # HedgeManager's own timer gates the actual trade; this call is
         # cheap when no action is due.
-        for eng in engines:
-            try:
-                eng["hedge"].rebalance_periodic()
-            except Exception as e:
-                logger.warning("hedge rebalance_periodic %s error: %s",
-                               eng["name"], e)
+        #
+        # Gated on weekend_paused so execute-mode IOCs don't fire into a
+        # closed market. Without this, weekend-pause boots issue an IOC
+        # to clear residual options delta, the order finds no liquidity,
+        # local hedge_qty is updated optimistically (per the v1.5
+        # reconciliation gap in CLAUDE.md §10), and IBKR's actual
+        # position book diverges from corsair's view. Symptom observed
+        # 2026-04-26 (Sunday boot pre-session): oid=141 BUY 3 HGK6 went
+        # out, no execDetails arrived, hedge_qty stuck at 3 in memory.
+        # Restart resets hedge_qty to 0; this gate prevents recurrence.
+        if not weekend_paused:
+            for eng in engines:
+                try:
+                    eng["hedge"].rebalance_periodic()
+                except Exception as e:
+                    logger.warning("hedge rebalance_periodic %s error: %s",
+                                   eng["name"], e)
 
         # v1.4 §7: operational kill checks. Runs every cycle; the monitor
         # itself gates on sustained-breach windows so spurious single-
