@@ -32,6 +32,14 @@ class FillHandler:
         # contract.symbol matches. Enables multi-product routing where
         # each FillHandler instance handles its own product's fills.
         self._product_filter = product_filter
+        # Per-fill daily_state persistence callback. Wired by main.py
+        # after the loop sets up the session_day/portfolio closure. Fired
+        # immediately after dedup-add inside _on_exec_details so a hard
+        # crash between the 1-second main-loop save cadence and the next
+        # fill cannot lose seen_exec_ids — without this, the next boot's
+        # replay path would re-process those fills as new and double-
+        # count their position effect.
+        self._save_state_cb = None
         # Multi-product portfolio key — the IBKR underlying symbol
         # (e.g. "ETHUSDRR" or "HG") that the portfolio uses to route
         # add_fill into the right multiplier/registry. Distinct from
@@ -69,6 +77,15 @@ class FillHandler:
         # Bound the dedup set
         if len(self._seen_exec_ids) > self._MAX_SEEN:
             self._seen_exec_ids = set(list(self._seen_exec_ids)[-5000:])
+
+        # Persist seen_exec_ids synchronously so a hard crash before the
+        # next 1-second main-loop save can't lose this dedup entry. See
+        # __init__ comment for the failure mode this closes.
+        if self._save_state_cb is not None:
+            try:
+                self._save_state_cb()
+            except Exception:
+                logger.exception("daily_state per-fill save failed")
 
         # Only process option fills (ignore any stray futures fills)
         contract = fill.contract

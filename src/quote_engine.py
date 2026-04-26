@@ -20,7 +20,7 @@ from ib_insync.util import UNSET_DOUBLE, UNSET_INTEGER
 
 from .utils import (
     ceil_to_tick, days_to_expiry, floor_to_tick,
-    format_hxe_symbol, iso8601ms_utc, round_to_tick,
+    format_hxe_symbol, round_to_tick,
 )
 
 LATENCY_RING_SIZE = 500   # rolling window for TTT/RTT/AMEND percentiles

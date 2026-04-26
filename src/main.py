@@ -586,6 +586,28 @@ async def main():
             len(fills._seen_exec_ids), _startup_session_day,
         )
 
+    # Per-fill daily_state save: closes the 1-second window between the
+    # main-loop save cadence and the next fill where a hard crash would
+    # lose seen_exec_ids and cause the next boot's replay to double-
+    # count those fills as new. Reads the current session_day on each
+    # call so it remains correct across the 5pm CT rollover.
+    def _save_daily_state_now() -> None:
+        try:
+            cur_day = _session_day(datetime.now(tz=timezone.utc),
+                                   reset_hour_ct)
+            daily_state.save(
+                cur_day,
+                fills_today=portfolio.fills_today,
+                spread_capture_today=portfolio.spread_capture_today,
+                spread_capture_mid_today=portfolio.spread_capture_mid_today,
+                daily_pnl=portfolio.daily_pnl,
+                realized_pnl=portfolio.realized_pnl_persisted,
+                seen_exec_ids=list(fills._seen_exec_ids),
+            )
+        except Exception as e:
+            logger.warning("daily_state per-fill save error: %s", e)
+    fills._save_state_cb = _save_daily_state_now
+
     logger.info(
         "Entering event-driven quote loop (batch=%.0fms, fallback=%.1fs, snapshot=%.1fs)",
         batch_window_sec * 1000, fallback_interval, snapshot_interval,
