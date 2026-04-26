@@ -407,3 +407,76 @@ def test_resolve_falls_back_when_no_contract_past_cutoff():
     )
     moved = asyncio.run(h.resolve_hedge_contract())
     assert moved is False  # no resolution — fallback in effect
+
+
+# ── Stage 0 burst-injection sentinel poll ──────────────────────────
+
+
+import json
+import os
+
+
+def test_burst_injection_sentinel_replays_records(tmp_path,
+                                                   monkeypatch):
+    """Stage 0 sentinel: a JSON array of fill records on disk should be
+    parsed and replayed through note_layer_c_fill, then the sentinel
+    auto-deleted to avoid re-firing on the next cycle."""
+    from src import quote_engine
+    monkeypatch.setattr(quote_engine, "BURST_INJECT_SENTINEL_DIR",
+                        str(tmp_path))
+    sentinel = tmp_path / quote_engine.BURST_INJECT_SENTINEL
+    payload = [
+        {"strike": 6.10, "expiry": "20260526", "right": "C",
+         "side": "BUY", "ts_offset_ms": 0},
+        {"strike": 6.10, "expiry": "20260526", "right": "C",
+         "side": "SELL", "ts_offset_ms": 100},
+        {"strike": 6.15, "expiry": "20260526", "right": "C",
+         "side": "BUY", "ts_offset_ms": 200},
+    ]
+    sentinel.write_text(json.dumps(payload))
+
+    qm = _make_quote_manager_minimal()
+    # Bind the sentinel poll method (using the real implementation)
+    from src.quote_engine import QuoteManager
+    qm.check_burst_injection_sentinel = (
+        QuoteManager.check_burst_injection_sentinel.__get__(qm))
+    n = qm.check_burst_injection_sentinel()
+    assert n == 3
+    # Sentinel must auto-delete so the next cycle is a no-op.
+    assert not sentinel.exists()
+    # Burst tracker must have absorbed all 3 fills (any-side count = 3).
+    # Since master+sub-flag are OFF, observational rows emitted instead
+    # of action — burst_events should have a C2 row at the 3rd fill.
+    triggers = [e["trigger"] for e in qm.csv_logger.burst_events]
+    assert "C2" in triggers
+
+
+def test_burst_injection_sentinel_handles_malformed_json(tmp_path,
+                                                          monkeypatch):
+    """Bad JSON in the sentinel must not blow up — and the sentinel
+    should be removed so the next cycle isn't a re-fire loop."""
+    from src import quote_engine
+    monkeypatch.setattr(quote_engine, "BURST_INJECT_SENTINEL_DIR",
+                        str(tmp_path))
+    sentinel = tmp_path / quote_engine.BURST_INJECT_SENTINEL
+    sentinel.write_text("not valid json {{")
+
+    qm = _make_quote_manager_minimal()
+    from src.quote_engine import QuoteManager
+    qm.check_burst_injection_sentinel = (
+        QuoteManager.check_burst_injection_sentinel.__get__(qm))
+    n = qm.check_burst_injection_sentinel()
+    assert n == 0
+    assert not sentinel.exists()  # auto-removed despite parse failure
+
+
+def test_burst_injection_no_sentinel_is_noop(tmp_path, monkeypatch):
+    """No sentinel file → fast no-op return, no log noise."""
+    from src import quote_engine
+    monkeypatch.setattr(quote_engine, "BURST_INJECT_SENTINEL_DIR",
+                        str(tmp_path))
+    qm = _make_quote_manager_minimal()
+    from src.quote_engine import QuoteManager
+    qm.check_burst_injection_sentinel = (
+        QuoteManager.check_burst_injection_sentinel.__get__(qm))
+    assert qm.check_burst_injection_sentinel() == 0

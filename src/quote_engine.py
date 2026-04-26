@@ -6,7 +6,9 @@ For each quotable strike:
   - Send/update or cancel
 """
 
+import json
 import logging
+import os
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -85,6 +87,14 @@ class TokenBucket:
 
 OrderKey = tuple[float, str, str, str]  # (strike, expiry, right, side)
 ORDER_REF_PREFIX = "corsair"
+
+# Stage 0 burst-injection sentinel (Thread 3 deployment runbook Phase 1).
+# Path inside the corsair container; analogous to risk_monitor's
+# INDUCE_SENTINEL_DIR convention. Operators write this via
+# scripts/induce_burst.py to inject synthetic fills into the burst tracker
+# without touching the IBKR event path.
+BURST_INJECT_SENTINEL_DIR = os.environ.get("CORSAIR_INDUCE_DIR", "/tmp")
+BURST_INJECT_SENTINEL = "corsair_inject_burst"
 
 
 class FillBurstTracker:
@@ -2165,6 +2175,91 @@ class QuoteManager:
                     )
                 except Exception:
                     logger.debug("order_lifecycle emit failed", exc_info=True)
+
+    def check_burst_injection_sentinel(self) -> int:
+        """Stage 0 burst-injection hook (Thread 3 deployment runbook
+        Phase 1). Polls ``BURST_INJECT_SENTINEL`` in
+        ``BURST_INJECT_SENTINEL_DIR``; if present, parses a JSON array
+        of fill records and replays them through ``note_layer_c_fill``
+        with logical timestamps spaced by ``ts_offset_ms``. Sentinel is
+        deleted after replay so the next cycle is a no-op until the
+        next injection.
+
+        Sentinel JSON shape (one entry per synthetic fill):
+        ``[{"strike": 6.10, "expiry": "20260526", "right": "C",
+            "side": "SELL", "ts_offset_ms": 0}, ...]``
+
+        Returns the number of fills replayed (0 if no sentinel). Errors
+        in parsing log + delete the sentinel — we'd rather drop a bad
+        injection than re-fire on every cycle.
+
+        Caller: main loop, once per iteration alongside risk.check().
+        Synchronous; injection latency is sub-millisecond per record.
+        """
+        path = os.path.join(BURST_INJECT_SENTINEL_DIR, BURST_INJECT_SENTINEL)
+        try:
+            if not os.path.exists(path):
+                return 0
+        except OSError:
+            return 0
+        try:
+            with open(path) as fh:
+                payload = json.load(fh)
+        except Exception as e:
+            logger.warning(
+                "burst-inject sentinel %s present but unreadable (%s); "
+                "removing without firing", path, e,
+            )
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return 0
+        try:
+            os.remove(path)
+        except OSError as e:
+            logger.warning(
+                "burst-inject sentinel %s read but os.remove failed (%s); "
+                "skipping injection to avoid a re-fire loop", path, e,
+            )
+            return 0
+        if not isinstance(payload, list):
+            logger.warning(
+                "burst-inject sentinel %s: expected JSON array, got %s; "
+                "no fills injected", path, type(payload).__name__,
+            )
+            return 0
+        base_ns = time.monotonic_ns()
+        injected = 0
+        for i, record in enumerate(payload):
+            try:
+                strike = float(record["strike"])
+                expiry = str(record["expiry"])
+                right = str(record["right"])
+                side = str(record["side"])
+                offset_ms = float(record.get("ts_offset_ms", i * 100))
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning(
+                    "burst-inject record %d malformed (%s): %s",
+                    i, e, record,
+                )
+                continue
+            ts_ns = base_ns + int(offset_ms * 1_000_000)
+            try:
+                self.note_layer_c_fill(
+                    strike=strike, expiry=expiry, right=right,
+                    side=side, ts_ns=ts_ns)
+                injected += 1
+            except Exception:
+                logger.exception("burst-inject record %d failed", i)
+        logger.critical(
+            "STAGE 0 BURST INJECTION: replayed %d/%d synthetic fills "
+            "from %s (logical span %.0fms)",
+            injected, len(payload), path,
+            (max((float(r.get("ts_offset_ms", i * 100))
+                  for i, r in enumerate(payload)), default=0.0)),
+        )
+        return injected
 
     # ── Thread 3 Layer C: burst-rate quote pull ───────────────────────
     def note_layer_c_fill(self, strike: float, expiry: str, right: str,

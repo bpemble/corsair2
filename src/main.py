@@ -761,6 +761,17 @@ async def main():
                                    eng["name"], e)
             last_recenter = now
 
+        # Stage 0 burst-injection sentinel poll (Thread 3 deployment
+        # runbook Phase 1). Cheap no-op when no sentinel present. Runs
+        # before SABR recal so a burst injection's effects are visible
+        # in the upcoming cycle's `update_quotes` cooldown gate.
+        for eng in engines:
+            try:
+                eng["quotes"].check_burst_injection_sentinel()
+            except Exception as e:
+                logger.warning("burst injection poll %s error: %s",
+                               eng["name"], e)
+
         # SABR recalibration for every engine (hoisted out of update_quotes
         # so it doesn't land between the tick handler and placeOrder, which
         # was inflating TTT by several ms per cycle). The method's own
