@@ -346,9 +346,13 @@ quoting:
   # keeping all values under GTD_EXPIRY(30s) - REFRESH_THRESHOLD(10s)
   # so the GTD refresh path stays dormant. Real price-change amends
   # and edge_violation bypass are unaffected.
-  max_age_s_near: 5.0
-  max_age_s_mid: 10.0
-  max_age_s_far: 15.0
+  # Re-tuned 2026-04-28: post tier-2 gateway recreate ack RTT p50
+  # climbed from 142ms → 321ms with force_refresh still ~50% of all
+  # amends. Raised ceilings further (still under the 20s GTD headroom)
+  # to cut residual TTL churn. Pair with ib-gateway clean restart.
+  max_age_s_near: 10.0
+  max_age_s_mid: 15.0
+  max_age_s_far: 19.0
 
 pricing:
   sabr_enabled: true
