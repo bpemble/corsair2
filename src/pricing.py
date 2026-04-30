@@ -9,11 +9,37 @@ Black-76 formulas:
 
     d1 = [ln(F/K) + (sigma^2 / 2) * T] / (sigma * sqrt(T))
     d2 = d1 - sigma * sqrt(T)
+
+Hot-path note: the scalar `black76_price` and `implied_vol` are called
+from `_on_option_tick`, `is_quote_stale`, and the SABR refit path —
+combined ~30% of the asyncio loop in py-spy on 2026-04-30. They have a
+Rust counterpart (`corsair_pricing`, ~10-30x faster). The wrappers below
+delegate to Rust when the extension is importable AND the
+``CORSAIR_PRICING_BACKEND`` env var isn't ``"python"``. Parity is
+verified by tests/test_pricing_parity.py to ~1e-9 (price) / ~1e-5 (iv).
+
+`black76_price_vec` is numpy-vectorized and stays in Python — it's used
+off the hot path (synthetic SPAN, constraint checker) and the numpy
+broadcast already saturates BLAS.
 """
+
+import os
 
 import numpy as np
 from scipy.optimize import brentq
 from scipy.stats import norm
+
+# Optional Rust hot-path. Import is best-effort; failure leaves the
+# Python implementation in place. Operator can force the Python path by
+# setting CORSAIR_PRICING_BACKEND=python (one-line A/B kill switch).
+_USE_RUST = False
+_rs = None
+if os.environ.get("CORSAIR_PRICING_BACKEND", "").lower() != "python":
+    try:
+        import corsair_pricing as _rs
+        _USE_RUST = True
+    except ImportError:
+        _rs = None
 
 
 class PricingEngine:
@@ -25,6 +51,16 @@ class PricingEngine:
         r: float = 0.0, right: str = "C",
     ) -> float:
         """Return Black-76 theoretical price for a futures option."""
+        if _USE_RUST:
+            return _rs.black76_price(F, K, T, sigma, r, right)
+        return PricingEngine._black76_price_python(F, K, T, sigma, r, right)
+
+    @staticmethod
+    def _black76_price_python(
+        F: float, K: float, T: float, sigma: float,
+        r: float = 0.0, right: str = "C",
+    ) -> float:
+        """Pure-Python Black-76 — kept as fallback + parity-test reference."""
         right = right.upper()
         if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
             if right == "C":
@@ -82,6 +118,16 @@ class PricingEngine:
         r: float = 0.0, right: str = "C",
     ) -> float | None:
         """Solve for implied volatility via Brent's method."""
+        if _USE_RUST:
+            return _rs.implied_vol(market_price, F, K, T, r, right)
+        return PricingEngine._implied_vol_python(market_price, F, K, T, r, right)
+
+    @staticmethod
+    def _implied_vol_python(
+        market_price: float, F: float, K: float, T: float,
+        r: float = 0.0, right: str = "C",
+    ) -> float | None:
+        """Pure-Python implied vol — kept as fallback + parity-test reference."""
         right = right.upper()
         if T <= 0 or market_price <= 0:
             return None
@@ -92,7 +138,7 @@ class PricingEngine:
             return None
 
         def objective(sigma: float) -> float:
-            return PricingEngine.black76_price(F, K, T, sigma, r, right) - market_price
+            return PricingEngine._black76_price_python(F, K, T, sigma, r, right) - market_price
 
         try:
             iv = brentq(objective, 0.01, 5.0, xtol=1e-6)

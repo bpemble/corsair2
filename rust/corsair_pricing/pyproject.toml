@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "corsair_pricing"
+version = "0.1.0"
+description = "Rust hot-path math for Corsair v2: Black-76 + implied vol"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "Cargo.toml"
