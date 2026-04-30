@@ -607,14 +607,16 @@ class QuoteManager:
             cached = self._canonical_idx.get(order_id)
             if cached is not None:
                 return cached
-        # True cold path — order isn't in our cache (perhaps not ours,
-        # or already terminal). Walk openTrades as a final fallback;
-        # caller's intent here is correctness, not performance.
-        latest = None
-        for t in self.ib.openTrades():
-            if t.order.orderId == order_id:
-                latest = t
-        return latest
+        # Cache miss after seed = order isn't live. Three paths get here:
+        # (a) order_id genuinely isn't ours (filtered by orderRef on insert),
+        # (b) order went terminal and was evicted by orderStatusEvent, or
+        # (c) caller is holding a stale orderId from active_orders that
+        # hasn't been cleaned up yet. In all three cases, return None.
+        # The previous `for t in self.ib.openTrades()` fallback was a
+        # safety net but the underlying listcomp walks ib_insync's
+        # wrapper.trades dict (which only grows) — at 2hr uptime it was
+        # 11% of the loop. Callers handle None correctly.
+        return None
 
     def _seed_canonical_idx(self) -> None:
         """Populate _canonical_idx from a one-shot walk of openTrades.
@@ -1446,6 +1448,12 @@ class QuoteManager:
         was dropped). Callers that need to track Trade state must handle
         the None case — typically by leaving `active_orders` untouched
         so the next quote cycle re-attempts naturally.
+
+        Side-effect: seeds `_canonical_idx[orderId]` with the returned
+        Trade so callers reading the cache between placeOrder and the
+        openOrderEvent ack don't take the cold path. _on_open_order_ack
+        will replace this entry with the canonical Trade once IBKR
+        responds (handles the FA-adoption orphan→canonical swap).
         """
         if not self._tb.try_consume(1.0):
             if self._tb.drops % 100 == 1:
@@ -1454,7 +1462,16 @@ class QuoteManager:
                     self._tb.drops, self._tb.tokens,
                 )
             return None
-        return self.ib.placeOrder(contract, order)
+        trade = self.ib.placeOrder(contract, order)
+        # Seed the cache immediately so reads in the same cycle (or
+        # before the openOrderEvent ack arrives) hit the hot path.
+        try:
+            ref = getattr(trade.order, "orderRef", "") or ""
+            if ref.startswith(ORDER_REF_PREFIX):
+                self._canonical_idx[trade.order.orderId] = trade
+        except Exception:
+            pass
+        return trade
 
     def _try_cancel_order(self, order_obj) -> bool:
         """Token-bucketed wrapper around `ib.cancelOrder`. Returns True if
