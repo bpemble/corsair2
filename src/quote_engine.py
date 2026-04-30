@@ -1471,6 +1471,20 @@ class QuoteManager:
                 self._canonical_idx[trade.order.orderId] = trade
         except Exception:
             pass
+        # Pre-populate the FA orderKey side-index so the FIRST FA-rewritten
+        # event for this orderId hits the cached fast path instead of
+        # walking ib.wrapper.trades. wrapper.trades grows linearly with
+        # session orderId count; without this, _fa_orderKey was 8.4% of
+        # CPU after 58min uptime (2026-04-30 measurement). The trade was
+        # just inserted into wrapper.trades under (clientId, orderId), so
+        # we know the canonical key.
+        try:
+            register = getattr(self.ib, "_fa_register_order", None)
+            if register is not None:
+                register(trade.order.orderId,
+                         (self.ib.client.clientId, trade.order.orderId))
+        except Exception:
+            pass
         return trade
 
     def _try_cancel_order(self, order_obj) -> bool:

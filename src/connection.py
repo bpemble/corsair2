@@ -123,6 +123,16 @@ class IBKRConnection:
             # rewrite is resolved. wrapper.trades grows unboundedly across
             # a session (completed/cancelled orders are retained), so the
             # naive O(N) fallback was hot in py-spy after a few hours.
+            #
+            # Exposed on the IB instance via ``_fa_register_order`` so
+            # ``_try_place_order`` can pre-populate the cache at placement
+            # time. Without that, the FIRST event after placement always
+            # hits the slow walk (the (rewrittenCID, oid) key isn't in
+            # wrapper.trades yet, and the cache is empty for that oid).
+            # Pre-population means the slow walk is never hit in steady
+            # state — observed 2026-04-30: _fa_orderKey grew from 0.8% to
+            # 8.4% of CPU over 58min as wrapper.trades accumulated; pre-
+            # population eliminates the per-orderId-once linear cost.
             _fa_orderid_idx: dict = {}
 
             def _fa_orderKey(clientId_cb, orderId_cb, permId_cb):
@@ -142,6 +152,9 @@ class IBKRConnection:
                 return key
 
             ib.wrapper.orderKey = _fa_orderKey
+            # Public registration hook for placeOrder callers to pre-populate
+            # the cache — closes the per-orderId slow walk (see above).
+            ib._fa_register_order = _fa_orderid_idx.__setitem__
 
             # 2-4. Minimal initializing requests, run concurrently. Each gets
             #      its own timeout so a single slow one doesn't block the rest.
