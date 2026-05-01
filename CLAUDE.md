@@ -523,14 +523,14 @@ FIX adapter.
 | 2 | Broker forwards events; trader logs decisions | done |
 | 3 | Trader places orders via IPC; broker dispatches | **shipped, default DISABLED** |
 | 4 | Slow workloads off broker's loop (snapshot build, daily_state.save) | done — TTT p99 5ms → 2.4ms |
-| 5 | SHM ring-buffer transport | code exists, untested in production |
+| 5 | SHM ring-buffer transport | **PRODUCTION** since 2026-05-01 — TTT p50 1.85ms→0.94ms, IPC p99 208ms→4.9ms |
 | 6 | Rust port of trader's decide_quote + SABR | done |
 
 ### Env flags
 
 - `CORSAIR_BROKER_MODE=1` — broker starts the IPC server. Default off → no behavior change.
 - `CORSAIR_TRADER_PLACES_ORDERS=1` — broker dispatches trader commands to `ib.placeOrder`; broker's own quote engine is gated off. **DO NOT enable in production until further notice — see "Cut-over disabled" below.**
-- `CORSAIR_IPC_TRANSPORT=socket|shm` — default `socket`. SHM is implemented but not yet exercised end-to-end.
+- `CORSAIR_IPC_TRANSPORT=socket|shm` — default `socket`. SHM validated in production 2026-05-01 (cut TTT p50 in half, killed IPC tail latency). Pass `shm` on both broker and trader; they communicate via mmap rings at `/app/data/corsair_ipc.{events,commands}`. Rollback to socket via `unset CORSAIR_IPC_TRANSPORT` + restart.
 - `CORSAIR_TRADER_BACKEND=python` — forces the Python `decide_quote` path on the trader. Default uses Rust for SABR.
 - All four are wired through `docker-compose.yml`'s `environment:` blocks for both services. Adding a new flag requires updating the compose file too — host-shell exports alone don't reach containers.
 
