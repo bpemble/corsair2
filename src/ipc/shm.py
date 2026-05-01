@@ -267,6 +267,7 @@ class SHMServer:
         self._commands = _Ring(f"{base_path}.commands", capacity, owner=True)
         self._on_command: Optional[Callable[[dict], None]] = None
         self._poll_task = None
+        self._monitor_task = None
         self._stop = False
 
     @property
@@ -298,8 +299,10 @@ class SHMServer:
         loop.add_reader(self._commands._notify_r_fd, _on_cmd_readable)
         self._poll_task = asyncio.create_task(self._poll_commands(),
                                               name="shm-cmd-poll")
+        self._monitor_task = asyncio.create_task(self._monitor_drops(),
+                                                  name="shm-drop-monitor")
         logger.warning("SHM IPC server up: base=%s capacity=%d "
-                       "(notify-fifo enabled)",
+                       "(notify-fifo enabled, drop-monitor active)",
                        self._base, self._capacity)
 
     async def stop(self) -> None:
@@ -310,8 +313,43 @@ class SHMServer:
                 await self._poll_task
             except Exception:
                 pass
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except Exception:
+                pass
         self._events.close()
         self._commands.close()
+
+    async def _monitor_drops(self) -> None:
+        """Periodic surface of frames_dropped counters. Critical safety
+        signal: if the trader stalls, the events ring can fill up and
+        the broker silently drops frames — including kill / risk_state
+        events the trader needs to see. Loud logging once we observe
+        any drops."""
+        import asyncio
+        last_events_drops = 0
+        last_commands_drops = 0
+        while not self._stop:
+            await asyncio.sleep(10.0)
+            ed = self._events.frames_dropped
+            cd = self._commands.frames_dropped
+            if ed > last_events_drops:
+                logger.warning(
+                    "shm: events ring DROPPED %d frames in last 10s "
+                    "(total %d). Trader may be missing events — "
+                    "safety regression possible.",
+                    ed - last_events_drops, ed,
+                )
+                last_events_drops = ed
+            if cd > last_commands_drops:
+                logger.warning(
+                    "shm: commands ring DROPPED %d frames in last 10s "
+                    "(total %d). Broker may be missing trader commands.",
+                    cd - last_commands_drops, cd,
+                )
+                last_commands_drops = cd
 
     async def _poll_commands(self) -> None:
         import asyncio
