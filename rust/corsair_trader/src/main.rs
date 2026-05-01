@@ -414,25 +414,49 @@ fn on_tick(
     tick: &TickMsg,
     decisions_log: &Arc<jsonl::JsonlWriter>,
 ) {
-    let key = (TraderState::strike_key(tick.strike), tick.expiry.clone(), tick.right.clone());
-    state.lock().unwrap().options.insert(key, tick.clone());
-
     let now_mono = now_ns_monotonic();
-    let decisions = {
+    let send_ns_wall = now_ns_wall();
+
+    // Hot-path optimization (cleanup pass 14, 2026-05-01): consolidate
+    // mutex acquisitions. Previously took the state lock 5-7 times per
+    // tick (insert tick, decide, JSONL write, TTT push, cancel, place,
+    // our_orders insert). Now: one extended critical section that does
+    // tick insert + decide + TTT push, releases, then unlocked work
+    // (JSONL write, ring writes), then a final brief lock for our_orders
+    // insert. Cuts mutex churn ~70%.
+    let (decisions, forward) = {
         let mut s = state.lock().unwrap();
         let mut c = counters.lock().unwrap();
-        decide_on_tick(&mut s, &mut c, tick, now_mono)
+        let key = (TraderState::strike_key(tick.strike),
+                   tick.expiry.clone(), tick.right.clone());
+        s.options.insert(key, tick.clone());
+        let forward = s.underlying_price;
+        let decisions = decide_on_tick(&mut s, &mut c, tick, now_mono);
+
+        // TTT push if we're going to send (cheap; under same lock).
+        if !decisions.is_empty() && places_orders() {
+            if let Some(emit_ns) = tick.ts_ns {
+                let lat = send_ns_wall.saturating_sub(emit_ns) / 1000;
+                if lat < 5_000_000 {
+                    s.ttt_us.push_back(lat);
+                    if s.ttt_us.len() > 500 {
+                        s.ttt_us.pop_front();
+                    }
+                }
+            }
+        }
+        (decisions, forward)
     };
 
-    // Log decisions to JSONL — one line per Place outcome (mirrors
-    // Python's per-side decision log; skips counted in telemetry).
+    // Log decisions to JSONL — UNLOCKED. JSONL writer is mpsc-async;
+    // hot path doesn't block on disk.
     let recv_ts = chrono::Utc::now().to_rfc3339();
     for d in &decisions {
         if let Decision::Place { side, price, cancel_old_oid } = d {
             decisions_log.write(serde_json::json!({
                 "recv_ts": recv_ts,
                 "trigger_ts_ns": tick.ts_ns,
-                "forward": state.lock().unwrap().underlying_price,
+                "forward": forward,
                 "decision": {
                     "action": "place",
                     "side": side.as_str(),
@@ -446,46 +470,31 @@ fn on_tick(
         }
     }
 
-    if decisions.is_empty() {
+    if decisions.is_empty() || !places_orders() {
         return;
     }
 
-    if !places_orders() {
-        // Phase 2 mode: log decisions but don't send orders.
-        return;
-    }
-
-    let send_ns = now_ns_wall();
-    if let Some(emit_ns) = tick.ts_ns {
-        let lat = send_ns.saturating_sub(emit_ns) / 1000;
-        if lat < 5_000_000 {
-            let mut s = state.lock().unwrap();
-            s.ttt_us.push_back(lat);
-            if s.ttt_us.len() > 500 {
-                s.ttt_us.pop_front();
-            }
-        }
-    }
-
+    // Build all outbound frames first (msgpack encoding) — UNLOCKED.
+    // Then take the locks just once each at the end. Reduces contention
+    // with staleness/telemetry tasks.
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(decisions.len() * 2);
+    let mut places_to_track: Vec<((u64, String, String, String), OurOrder, Option<i64>)> =
+        Vec::with_capacity(decisions.len());
     for d in decisions {
         if let Decision::Place { side, price, cancel_old_oid } = d {
-            // Send cancel first if needed.
             if let Some(oid) = cancel_old_oid {
                 let cancel = CancelOrder {
                     msg_type: "cancel_order",
-                    ts_ns: now_ns_wall(),
+                    ts_ns: send_ns_wall,
                     order_id: oid,
                 };
                 if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
-                    let frame = ipc::protocol::pack_frame(&body);
-                    commands_ring.lock().unwrap().write_frame(&frame);
+                    frames.push(ipc::protocol::pack_frame(&body));
                 }
-                let mut s = state.lock().unwrap();
-                s.orderid_to_key.remove(&oid);
             }
             let p = PlaceOrder {
                 msg_type: "place_order",
-                ts_ns: send_ns,
+                ts_ns: send_ns_wall,
                 strike: tick.strike,
                 expiry: tick.expiry.clone(),
                 right: tick.right.clone(),
@@ -494,26 +503,41 @@ fn on_tick(
                 price,
                 order_ref: "corsair_trader_rust".into(),
             };
-            let body = match rmp_serde::to_vec_named(&p) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let frame = ipc::protocol::pack_frame(&body);
-            commands_ring.lock().unwrap().write_frame(&frame);
-            // Update local incumbency tracking.
-            let okey = (
-                TraderState::strike_key(tick.strike),
-                tick.expiry.clone(),
-                tick.right.clone(),
-                side.as_str().to_string(),
-            );
-            let mut s = state.lock().unwrap();
-            s.our_orders.insert(okey, OurOrder {
-                price,
-                send_ns,
-                place_monotonic_ns: now_mono,
-                order_id: None,
-            });
+            if let Ok(body) = rmp_serde::to_vec_named(&p) {
+                frames.push(ipc::protocol::pack_frame(&body));
+            }
+            let okey = (TraderState::strike_key(tick.strike),
+                        tick.expiry.clone(), tick.right.clone(),
+                        side.as_str().to_string());
+            places_to_track.push((
+                okey,
+                OurOrder {
+                    price,
+                    send_ns: send_ns_wall,
+                    place_monotonic_ns: now_mono,
+                    order_id: None,
+                },
+                cancel_old_oid,
+            ));
+        }
+    }
+
+    // Single ring lock for ALL outbound frames in this tick.
+    {
+        let mut ring = commands_ring.lock().unwrap();
+        for frame in &frames {
+            ring.write_frame(frame);
+        }
+    }
+
+    // Single state lock for all incumbency updates.
+    {
+        let mut s = state.lock().unwrap();
+        for (key, order, cancel_old_oid) in places_to_track {
+            if let Some(oid) = cancel_old_oid {
+                s.orderid_to_key.remove(&oid);
+            }
+            s.our_orders.insert(key, order);
         }
     }
 }

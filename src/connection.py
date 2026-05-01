@@ -151,16 +151,26 @@ class IBKRConnection:
             _fa_orderid_idx: dict = {}
 
             def _fa_orderKey(clientId_cb, orderId_cb, permId_cb):
-                # Fast path: orderId already resolved + cached entry is
-                # valid (still in wrapper.trades). The membership check
-                # IS necessary — pre-population at placeOrder uses
-                # `(_client_id_self, oid)` which differs from the
-                # FA-rewritten key wrapper.trades actually uses. Without
-                # this check we'd return the wrong tuple forever for
-                # FA-routed orders.
+                # Three-state cache: tuple = known canonical key,
+                # 0 (sentinel) = known dead (walked, not found, don't
+                # walk again), missing = first sight.
+                #
+                # Without the dead-cache, ib_insync's terminal-trade
+                # cleanup creates a leak: trade gets evicted from
+                # wrapper.trades, late status events for that orderId
+                # then bypass the fast path (membership check fails) and
+                # walk again every time. py-spy 2026-05-01 showed this
+                # at 27% self-time despite the orderId-only cache.
                 cached = _fa_orderid_idx.get(orderId_cb)
-                if cached is not None and cached in ib.wrapper.trades:
+                if isinstance(cached, tuple) and cached in ib.wrapper.trades:
                     return cached
+                if cached == 0:
+                    # Known-dead orderId: skip walks, return rewritten.
+                    return _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
+                if cached is not None and cached not in ib.wrapper.trades:
+                    # Cached tuple but trade was evicted. Mark dead.
+                    _fa_orderid_idx[orderId_cb] = 0
+                    return _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
                 if orderId_cb <= 0:
                     return _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
                 # First-sight: try rewritten key.
@@ -189,9 +199,12 @@ class IBKRConnection:
                             and t.order.orderId == orderId_cb):
                         _fa_orderid_idx[orderId_cb] = existing_key
                         return existing_key
-                # Not found within walk cap — cache rewritten key as
-                # fallback so we don't repeat on every late event.
-                _fa_orderid_idx[orderId_cb] = key
+                # Not found in wrapper.trades — mark this orderId as
+                # dead so we don't walk again. The walk cap catches
+                # pathological cases; this catches steady-state churn
+                # where many late events fire for already-evicted
+                # trades.
+                _fa_orderid_idx[orderId_cb] = 0
                 return key
 
             ib.wrapper.orderKey = _fa_orderKey
