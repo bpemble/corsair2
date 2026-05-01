@@ -130,8 +130,11 @@ pub fn decide_on_tick(
         return out;
     }
 
-    // Pre-compute theo once per tick (side-independent).
-    let (iv, theo) = match compute_theo(fit_forward, strike, tte, &vp_msg.params) {
+    // Pre-compute theo once per tick (side-independent within a right).
+    // BUT theo IS right-dependent (calls and puts have different prices
+    // even at the same iv). Pass the option's right.
+    let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    let (iv, theo) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
         Some(v) => v,
         None => {
             counters.skip_other += 1;
@@ -159,13 +162,37 @@ pub fn decide_on_tick(
     let edge = state.min_edge_ticks as f64 * state.tick_size;
 
     for side in [Side::Buy, Side::Sell] {
-        let target = match side {
+        let mut target = match side {
             Side::Buy => theo - edge,
             Side::Sell => theo + edge,
         };
         if target <= 0.0 {
             counters.skip_target_nonpositive += 1;
             continue;
+        }
+        // Tick-jump (improve on incumbent BBO). When our naive
+        // theo±edge target is at or behind the existing best, try
+        // to jump 1 tick ahead — provided this still gives positive
+        // edge vs theo. Without this, when the market spread is
+        // 2 ticks wide and our edge is 2 ticks, we end up AT the
+        // market BBO, never improving and rarely capturing spread.
+        // 2026-05-01 user observation: "tick-jumping not effective".
+        match side {
+            Side::Buy => {
+                // Try to be 1 tick above current bid if possible.
+                let jumped = bid + state.tick_size;
+                // Accept the jump only if it's still below theo
+                // (i.e., we keep some edge — not crossing it).
+                if target < jumped && jumped < theo {
+                    target = jumped;
+                }
+            }
+            Side::Sell => {
+                let jumped = ask - state.tick_size;
+                if target > jumped && jumped > theo {
+                    target = jumped;
+                }
+            }
         }
         // Cross-protect: don't cross existing best on the opposite side.
         match side {
@@ -298,10 +325,16 @@ pub fn compute_risk_gates(state: &TraderState, now_monotonic_ns: u64) -> (bool, 
 }
 
 /// Compute theo via SVI (or future SABR). Returns (iv, theo) or None.
+/// CRITICAL: theo MUST use the option's actual right ('C' or 'P') —
+/// call price ≠ put price. Bug 2026-05-01: passing 'C' for both
+/// produced wildly wrong put theos (call price for OTM puts is
+/// MUCH less than put price), making us SELL puts BELOW the bid
+/// and BUY puts ABOVE the ask.
 pub fn compute_theo(
     forward: f64,
     strike: f64,
     tte: f64,
+    right: char,
     params: &VolParams,
 ) -> Option<(f64, f64)> {
     if forward <= 0.0 || strike <= 0.0 || tte <= 0.0 {
@@ -319,9 +352,7 @@ pub fn compute_theo(
             params.sigma?,
         ),
         "sabr" => {
-            // SABR not yet ported into this binary's pricing module.
-            // The broker only ever fits SVI in production today; SABR
-            // path is used for tests. Punt: return None to skip.
+            // SABR not yet ported. SVI is production.
             return None;
         }
         _ => return None,
@@ -329,7 +360,7 @@ pub fn compute_theo(
     if iv <= 0.0 || iv.is_nan() {
         return None;
     }
-    let theo = black76_price(forward, strike, tte, iv, 0.0, 'C'); // right doesn't matter; same vol
+    let theo = black76_price(forward, strike, tte, iv, 0.0, right);
     if theo <= 0.0 {
         return None;
     }
