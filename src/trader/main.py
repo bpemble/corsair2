@@ -71,6 +71,23 @@ STALENESS_TICKS = 1               # cancel when off-by-more-than 1 tick vs theo
 # places/sec total and pushed IPC p99 to 700-1900ms.
 COOLDOWN_NS = 250_000_000         # 250 ms
 
+# Dead-band + GTD-refresh logic (cleanup pass 5, 2026-05-01). Mirrors
+# the broker's _send_or_update pattern. The broker has been doing this
+# for ages; the trader was using strict same-price equality which let
+# 1-tick theo wiggle drive 50 places/sec to IBKR (place_rtt_us p50 ~1s).
+#
+# Three rules, in priority order:
+#   1. If the new target price is within DEAD_BAND_TICKS of the resting
+#      order's price AND the resting order is fresh (GTD won't expire
+#      soon), skip — no re-place needed.
+#   2. If the resting order's GTD is within GTD_REFRESH_LEAD_S of
+#      expiry, force a re-place even within the dead-band — that's the
+#      "keep the quote alive" branch.
+#   3. Outside the dead-band → always re-place (price actually moved).
+DEAD_BAND_TICKS = 1               # ≥1-tick price move re-fires
+GTD_LIFETIME_S = 5.0              # must match broker's _dispatch_place_order GTD
+GTD_REFRESH_LEAD_S = 1.5          # re-place when ≤1.5s remains
+
 # Cleanup pass 3 (2026-05-01) defensive constants. Trader will refuse
 # to quote outside this band of ATM strikes — wing extrapolation of
 # the SVI surface is least reliable there, and that's where the
@@ -402,23 +419,43 @@ class Trader:
                     self.decisions_made["risk_block_sell"] += 1
                     continue
                 key = (float(strike), expiry, right, side)
-                # Skip if we already have an order at exactly this price
-                # for this key (prevents amend churn). Strict equality
-                # check; price comparison after tick-quantization.
                 existing = self._our_orders_by_key.get(key)
-                if existing is not None and existing.get("price") == d["price"]:
-                    continue
-                # Per-key cooldown (cleanup pass 4, 2026-05-01): block
-                # re-placement at the same key within COOLDOWN_S of the
-                # last attempt, regardless of price change. Prevents the
-                # 80-places/sec churn that built up IPC backpressure to
-                # 700ms p99 — theo bouncing 1 tick was triggering re-
-                # placements every option update. With the existing
-                # 5s GTD as the natural order lifetime, 250ms cooldown
-                # bounds re-placement rate at 4Hz/key without losing
-                # responsiveness.
+                send_ns_now = time.monotonic_ns()
                 last_place_ns = self._last_place_ns.get(key, 0)
-                if (send_ns_now := time.monotonic_ns()) - last_place_ns < COOLDOWN_NS:
+
+                # Dead-band + GTD-refresh logic (cleanup pass 5,
+                # 2026-05-01). Replaces the strict same-price equality
+                # check with a tick-band check, plus a force-refresh
+                # branch when the resting order's GTD is about to
+                # expire. Mirrors broker's _send_or_update — the
+                # standard market-maker pattern of "only send when the
+                # price actually moved meaningfully OR the existing
+                # order is about to expire". Big rate reduction vs the
+                # earlier strict-equality + cooldown stack: at quiet
+                # markets, only ~1 place per (5-1.5)s = 3.5s per key
+                # (the GTD refresh) instead of every theo wiggle.
+                if existing is not None:
+                    rest_price = existing.get("price")
+                    age_s = ((send_ns_now - last_place_ns) / 1e9
+                             if last_place_ns else float("inf"))
+                    in_band = (rest_price is not None
+                               and abs(d["price"] - rest_price)
+                               < DEAD_BAND_TICKS * self.state.tick_size)
+                    needs_gtd_refresh = age_s > (
+                        GTD_LIFETIME_S - GTD_REFRESH_LEAD_S
+                    )
+                    if in_band and not needs_gtd_refresh:
+                        # Quote price is close enough AND GTD has time
+                        # left → no need to re-place.
+                        self.decisions_made["skip_in_band"] += 1
+                        continue
+
+                # Hard cooldown floor as a defensive backstop. With
+                # dead-band catching the common "1-tick wiggle" case,
+                # cooldown rarely fires now — but keep it to bound any
+                # pathological edge case. 250ms < GTD_REFRESH_LEAD_S so
+                # GTD-refresh is never blocked by cooldown.
+                if send_ns_now - last_place_ns < COOLDOWN_NS:
                     self.decisions_made["skip_cooldown"] += 1
                     continue
                 # NEW: dark-book ON-PLACE guard — re-check the latest
