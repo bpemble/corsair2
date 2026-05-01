@@ -169,9 +169,19 @@ class IBKRConnection:
                             and t.order.orderId == orderId_cb):
                         _fa_orderid_idx[orderId_cb] = existing_key
                         return existing_key
-                # Unknown orderId. Don't cache (would trap us with a
-                # wrong answer if the trade appears later under a
-                # different key).
+                # Not in wrapper.trades — orderId is for an order that
+                # was already evicted (terminal cleanup), or one we
+                # didn't place. Cache the rewritten key anyway so we
+                # don't repeat the walk on every late event for this
+                # orderId. Returning a "best-guess" key is safe: if
+                # ib_insync doesn't find the trade under this key, it
+                # ignores the event (which is what we want for stale
+                # orderIds). Caching covers cancel-before-replace's
+                # tail of late status events for cancelled orders.
+                # 2026-05-01 py-spy: this branch was hot at 60% self
+                # because we walked wrapper.trades repeatedly for
+                # orderIds that would never match.
+                _fa_orderid_idx[orderId_cb] = key
                 return key
 
             ib.wrapper.orderKey = _fa_orderKey

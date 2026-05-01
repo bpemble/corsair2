@@ -249,11 +249,15 @@ class SHMServer:
                                 )
             else:
                 idle_iters += 1
-                # Adaptive: short sleep first, longer if sustained idle.
-                if idle_iters < 50:
-                    await asyncio.sleep(_POLL_BACKOFF_US / 1_000_000)
+                # Tighter adaptive polling — see SHMClient.run for
+                # rationale. Hot loop yields without blocking; cool
+                # uses short sleep; idle sleeps longer.
+                if idle_iters < 200:
+                    await asyncio.sleep(0)
+                elif idle_iters < 500:
+                    await asyncio.sleep(0.0005)
                 else:
-                    await asyncio.sleep(_POLL_LONG_BACKOFF_US / 1_000_000)
+                    await asyncio.sleep(0.005)
 
     def publish(self, msg: dict) -> bool:
         if self._events._mm is None:
@@ -310,10 +314,26 @@ class SHMClient:
                             )
             else:
                 idle_iters += 1
-                if idle_iters < 50:
-                    await asyncio.sleep(_POLL_BACKOFF_US / 1_000_000)
+                # Tighter adaptive polling (cleanup pass 9, 2026-05-01)
+                # to cut p99 outliers. asyncio.sleep(0.0001) gets
+                # rounded up to the event-loop tick (~5ms typical),
+                # producing the IPC p99 = 5ms tail. The tight branch
+                # below uses asyncio.sleep(0) which yields without
+                # any blocking sleep — only relinquishes for one
+                # event-loop turn. That cuts wake-up latency to ~50us
+                # when the loop has other ready callbacks.
+                if idle_iters < 200:
+                    # Hot: pure yield, no blocking. Loop processes
+                    # other tasks then comes back. p50 ~10-50us.
+                    await asyncio.sleep(0)
+                elif idle_iters < 500:
+                    # Cool: short blocking sleep. Lets CPU idle a bit
+                    # but still wakes within ~5ms of any new write.
+                    await asyncio.sleep(0.0005)  # 500us request
                 else:
-                    await asyncio.sleep(_POLL_LONG_BACKOFF_US / 1_000_000)
+                    # Idle: longer sleep. Saves power, accepts higher
+                    # latency on resumption.
+                    await asyncio.sleep(0.005)  # 5ms
 
     def send(self, msg: dict) -> bool:
         if self._commands._mm is None:

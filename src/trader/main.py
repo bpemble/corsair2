@@ -525,31 +525,39 @@ class Trader:
                             bsz <= 0 or asz <= 0):
                         self.decisions_made["skip_dark_at_place"] += 1
                         continue
-                # Cancel-before-replace (cleanup pass 6, 2026-05-01).
-                # Without this, every re-place leaves the OLD orderId
-                # at IBKR pending GTD-expiry (5s). Multiple stale orders
-                # at the same key churn IBKR's order book and bloat
-                # place_rtt_us (1+s p50). Sending an explicit cancel
-                # immediately before the new place tells IBKR to drop
-                # the stale order, freeing the slot.
+                # Cancel-before-replace (cleanup pass 6, 2026-05-01),
+                # tightened in pass 9 (2026-05-01): only cancel when
+                # the old order has substantial GTD remaining. If the
+                # order was placed within the last GTD_LIFETIME_S -
+                # CANCEL_THRESHOLD_S, GTD will let it expire on its
+                # own — sending an explicit cancel doubles our IBKR
+                # API call rate (which contributes to place_rtt_us
+                # >1s) for no functional benefit when expiry is
+                # imminent.
                 #
                 # Skip cancel if old orderId unknown (place_ack hasn't
-                # arrived yet) — the old order will GTD-expire on its
-                # own. Skip if existing entry was already an unacked
-                # request (orderId=None) since we have nothing to
-                # cancel yet anyway.
+                # arrived yet) — old order will GTD-expire either way.
                 old_oid = existing.get("orderId") if existing else None
-                if old_oid is not None:
+                old_age_s = (
+                    (send_ns_now - last_place_ns) / 1e9
+                    if last_place_ns else float("inf")
+                )
+                CANCEL_THRESHOLD_S = 1.0  # cancel only if >1s GTD left
+                gtd_remaining = GTD_LIFETIME_S - old_age_s
+                if old_oid is not None and gtd_remaining > CANCEL_THRESHOLD_S:
                     self.client.send({
                         "type": "cancel_order",
                         "ts_ns": time.time_ns(),
                         "orderId": old_oid,
                     })
-                    # Drop the orderId→key mapping; the cancel ack
-                    # would do this too but we want to short-circuit
-                    # the staleness loop from trying to re-cancel.
                     self._orderid_to_key.pop(old_oid, None)
                     self.decisions_made["replace_cancel"] += 1
+                elif old_oid is not None:
+                    # Old order is about to GTD-expire; skip cancel,
+                    # just drop our local tracking so the new place
+                    # doesn't try to amend it.
+                    self._orderid_to_key.pop(old_oid, None)
+                    self.decisions_made["replace_skip_cancel_near_gtd"] += 1
 
                 # Cleanup gap #2 — trader-side TTT instrumentation.
                 # Measure broker-tick-emit (wall clock) → trader-place-
