@@ -751,7 +751,9 @@ async def main():
         try:
             broker_ipc = BrokerIPC()
             await broker_ipc.start()
-            broker_ipc.set_broker_config(config)
+            # Use per-product config so .product resolves correctly (main
+            # config has .products list).
+            broker_ipc.set_broker_config(engines[0]["config"])
             broker_ipc.attach_to_ib(ib)
             for eng in engines:
                 eng["md"].set_broker_ipc(broker_ipc)
@@ -1096,9 +1098,10 @@ async def main():
                     cur_margin = margin_coord.get_current_margin()
                     cap = float(config.constraints.capital)
                     margin_pct = cur_margin / cap if cap > 0 else 0.0
-                    od = float(getattr(portfolio, "options_delta", 0.0)
-                               or portfolio.delta_for_product(
-                                   config.product.underlying_symbol))
+                    # Use per-product config for product symbol (main
+                    # config has .products list, not .product).
+                    prod_sym = primary["config"].product.underlying_symbol
+                    od = float(portfolio.delta_for_product(prod_sym))
                     hq = (primary.get("hedge").hedge_qty
                           if primary.get("hedge") is not None else 0)
                     broker_ipc.publish_risk_state(
