@@ -133,22 +133,45 @@ class IBKRConnection:
             # state — observed 2026-04-30: _fa_orderKey grew from 0.8% to
             # 8.4% of CPU over 58min as wrapper.trades accumulated; pre-
             # population eliminates the per-orderId-once linear cost.
+            # Cache by orderId only (cleanup pass 8, 2026-05-01). The
+            # earlier int→tuple cache failed because the FA rewrite
+            # produced wrapper.trades keys that didn't match our pre-
+            # populated `(_client_id_self, oid)` tuple, so the
+            # tuple-membership check `cached in ib.wrapper.trades`
+            # MISSED on the FA path even when we'd seen the orderId
+            # before. Each event then walked wrapper.trades fully —
+            # py-spy showed _fa_orderKey at 82% self time after 1.5h
+            # of cut-over with cancel-before-replace doubling order
+            # count.
+            #
+            # New design: cache by orderId only, TRUST the cache once
+            # filled. We only walk wrapper.trades on first-sight of
+            # any orderId, then cache the canonical tuple permanently.
+            # No tuple-membership re-check on the hot path.
             _fa_orderid_idx: dict = {}
 
             def _fa_orderKey(clientId_cb, orderId_cb, permId_cb):
+                # Fast path: orderId already resolved — return cached
+                # tuple WITHOUT re-checking wrapper.trades membership.
+                cached = _fa_orderid_idx.get(orderId_cb)
+                if cached is not None:
+                    return cached
+                if orderId_cb <= 0:
+                    return _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
+                # First-sight: try rewritten key.
                 key = _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
                 if key in ib.wrapper.trades:
+                    _fa_orderid_idx[orderId_cb] = key
                     return key
-                if orderId_cb <= 0:
-                    return key
-                cached = _fa_orderid_idx.get(orderId_cb)
-                if cached is not None and cached in ib.wrapper.trades:
-                    return cached
+                # FA-rewritten case: walk once, cache permanently.
                 for existing_key, t in ib.wrapper.trades.items():
                     if (isinstance(existing_key, tuple)
                             and t.order.orderId == orderId_cb):
                         _fa_orderid_idx[orderId_cb] = existing_key
                         return existing_key
+                # Unknown orderId. Don't cache (would trap us with a
+                # wrong answer if the trade appears later under a
+                # different key).
                 return key
 
             ib.wrapper.orderKey = _fa_orderKey
