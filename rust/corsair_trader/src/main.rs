@@ -112,6 +112,26 @@ async fn main() -> std::io::Result<()> {
     let events_ring = Arc::new(Mutex::new(events_ring));
     let commands_ring = Arc::new(Mutex::new(commands_ring));
 
+    // Staleness loop — cancels resting orders whose price has drifted
+    // too far from current theo. Mirrors src/trader/main.py's
+    // staleness_loop. Without it, an order placed at theo-edge can sit
+    // through a theo move and become uncompetitive (or worse, become
+    // adverse). Runs at 10Hz (matches Python's STALENESS_INTERVAL_S).
+    {
+        let state = Arc::clone(&state);
+        let counters = Arc::clone(&counters);
+        let commands_ring = Arc::clone(&commands_ring);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if !places_orders() {
+                    continue;
+                }
+                staleness_check(&state, &counters, &commands_ring);
+            }
+        });
+    }
+
     // Spawn telemetry loop (10s cadence).
     {
         let state = Arc::clone(&state);
@@ -441,6 +461,129 @@ fn on_tick(
                 place_monotonic_ns: now_mono,
                 order_id: None,
             });
+        }
+    }
+}
+
+/// Periodic staleness check — cancel any resting order whose
+/// current theo has drifted more than STALENESS_TICKS from the
+/// order's price. Mirrors Python's staleness_loop in
+/// src/trader/main.py. Runs at 10Hz from a tokio task.
+fn staleness_check(
+    state: &Arc<Mutex<TraderState>>,
+    counters: &Arc<Mutex<DecisionCounters>>,
+    commands_ring: &Arc<Mutex<Ring>>,
+) {
+    use crate::decision::{compute_theo, time_to_expiry_years, STALENESS_TICKS};
+
+    // Snapshot the orders to check (avoid holding lock during sends).
+    // For each (key, OurOrder), compute current theo using fit-time
+    // forward + vol_surface. Cancel if order is too far off.
+    struct ToCancel {
+        order_id: i64,
+        key: (u64, String, String, String),
+        reason_dark: bool,
+    }
+    let mut cancels: Vec<ToCancel> = Vec::new();
+
+    {
+        let s = state.lock().unwrap();
+        let tick_size = s.tick_size;
+        let threshold = STALENESS_TICKS as f64 * tick_size;
+        for (key, order) in s.our_orders.iter() {
+            let order_id = match order.order_id {
+                Some(o) => o,
+                None => continue, // unack'd; can't cancel yet
+            };
+            let strike = f64::from_bits(key.0);
+            let expiry = &key.1;
+            let right = &key.2;
+            let side = &key.3;
+
+            // Look up vol surface for this option.
+            let vp = s
+                .vol_surfaces
+                .get(&(expiry.clone(), right.clone()))
+                .or_else(|| s.vol_surfaces.get(&(expiry.clone(), "C".to_string())))
+                .or_else(|| s.vol_surfaces.get(&(expiry.clone(), "P".to_string())));
+            let vp = match vp {
+                Some(v) => v,
+                None => continue,
+            };
+            let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+            let tte = match time_to_expiry_years(expiry) {
+                Some(t) if t > 0.0 => t,
+                _ => continue,
+            };
+            // Use fit-time forward (anchored point for SVI).
+            let res = match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
+                Some(v) => v,
+                None => continue,
+            };
+            let theo = res.1;
+
+            // Stale if our price is too unfavorable vs current theo.
+            // BUY: bad when we'd pay above theo (price > theo).
+            // SELL: bad when we'd sell below theo (price < theo).
+            let drift = if side == "BUY" {
+                order.price - theo
+            } else {
+                theo - order.price
+            };
+            if drift > threshold {
+                cancels.push(ToCancel {
+                    order_id,
+                    key: key.clone(),
+                    reason_dark: false,
+                });
+                continue;
+            }
+
+            // Dark-book ON-REST guard (mirror Python). Cancel if
+            // latest tick state for this contract has gone dark.
+            let opt_key = (key.0, expiry.clone(), right.clone());
+            if let Some(latest) = s.options.get(&opt_key) {
+                let bid_alive = matches!(latest.bid, Some(b) if b > 0.0);
+                let ask_alive = matches!(latest.ask, Some(a) if a > 0.0);
+                let bsz = latest.bid_size.unwrap_or(0);
+                let asz = latest.ask_size.unwrap_or(0);
+                let market_dark = !bid_alive || !ask_alive || bsz <= 0 || asz <= 0;
+                if market_dark {
+                    cancels.push(ToCancel {
+                        order_id,
+                        key: key.clone(),
+                        reason_dark: true,
+                    });
+                }
+            }
+        }
+    }
+
+    if cancels.is_empty() {
+        return;
+    }
+
+    // Send cancels and update local state.
+    {
+        let mut s = state.lock().unwrap();
+        let mut c = counters.lock().unwrap();
+        for tc in cancels {
+            let cancel = CancelOrder {
+                msg_type: "cancel_order",
+                ts_ns: now_ns_wall(),
+                order_id: tc.order_id,
+            };
+            if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+                let frame = ipc::protocol::pack_frame(&body);
+                commands_ring.lock().unwrap().write_frame(&frame);
+            }
+            s.our_orders.remove(&tc.key);
+            s.orderid_to_key.remove(&tc.order_id);
+            if tc.reason_dark {
+                c.staleness_cancel_dark += 1;
+            } else {
+                c.staleness_cancel += 1;
+            }
         }
     }
 }
