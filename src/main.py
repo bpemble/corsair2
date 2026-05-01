@@ -111,7 +111,8 @@ def _validate_safety_config(cfg) -> None:
 
 
 def _safe_write_snapshot(md, quotes, portfolio, sabr, margin, ib,
-                         account_id, eng_config, hedge, eng_name):
+                         account_id, eng_config, hedge, eng_name,
+                         broker_ipc=None):
     """Wrapper around write_chain_snapshot for run_in_executor.
 
     Phase 4 (mm_service_split.md): the snapshot build is one of the
@@ -122,7 +123,8 @@ def _safe_write_snapshot(md, quotes, portfolio, sabr, margin, ib,
     """
     try:
         write_chain_snapshot(md, quotes, portfolio, sabr, margin, ib,
-                             account_id, eng_config, hedge=hedge)
+                             account_id, eng_config, hedge=hedge,
+                             broker_ipc=broker_ipc)
     except RuntimeError as e:
         # Specific catch for "dictionary changed size during iteration"
         # which can fire if the main loop adds/drops a subscription
@@ -1116,6 +1118,7 @@ async def main():
                     eng["md"], eng["quotes"], portfolio, eng["sabr"],
                     eng["margin"], ib, config.account.account_id,
                     eng["config"], eng.get("hedge"), eng["name"],
+                    broker_ipc,  # surfaces trader's TTT during cut-over
                 )
             last_snapshot_write = mono
 

@@ -329,12 +329,30 @@ class Trader:
         fit_forward = (vp_msg or {}).get("forward")
         decision_forward = float(fit_forward) if fit_forward else forward
 
-        # NEW: ATM-window restriction. Don't quote deep wings where SVI
+        # ATM-window restriction. Don't quote deep wings where SVI
         # extrapolation is least reliable — that's where 2026-05-01
         # adverse fills concentrated. Use current spot (not fit_F) for
         # the ATM anchor; we want recently-tracked strikes.
         if abs(float(strike) - forward) > MAX_STRIKE_OFFSET_USD:
             self.decisions_made["skip_off_atm"] += 1
+            return
+
+        # OTM-ONLY restriction (cleanup pass 4b, 2026-05-01). Spec §12
+        # in CLAUDE.md: asymmetric scope — calls quote only K >= F,
+        # puts only K <= F. ITM strikes have thin flow + wide spreads;
+        # quoting them consumes order budget without generating fill
+        # volume. Live observation (cut-over): trader was placing both
+        # BUY+SELL on K=5.6 even with F=5.96 — that's a deep ITM call
+        # we shouldn't have been quoting. Tolerance is one half-tick on
+        # the strike grid ($0.025 = half a strike-tick at HG's $0.05
+        # strike spacing) so the ATM strike still quotes both rights
+        # when F falls slightly above/below it.
+        atm_tol = 0.025
+        if right == "C" and float(strike) < forward - atm_tol:
+            self.decisions_made["skip_itm"] += 1
+            return
+        if right == "P" and float(strike) > forward + atm_tol:
+            self.decisions_made["skip_itm"] += 1
             return
 
         # NEW: extract bid/ask sizes for the thin-book guard.

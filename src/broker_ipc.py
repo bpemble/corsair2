@@ -42,6 +42,10 @@ class BrokerIPC:
         # through these handlers. Wired via set_order_dispatchers().
         self._place_order_dispatcher: Optional[Callable[[dict], None]] = None
         self._cancel_order_dispatcher: Optional[Callable[[dict], None]] = None
+        # Last trader telemetry payload — surfaced in snapshot.json's
+        # latency block during cut-over so the dashboard reflects
+        # actual end-to-end latency the trader is seeing.
+        self.last_trader_telemetry: Optional[dict] = None
 
     def set_order_dispatchers(
         self,
@@ -261,6 +265,11 @@ class BrokerIPC:
                 msg.get("ttt_p50_us"), msg.get("ttt_p99_us"),
                 msg.get("n_options"), msg.get("n_active_orders"),
             )
+            # Cache trader telemetry so snapshot.py can surface it on
+            # the dashboard during cut-over (broker's quote_engine TTT
+            # is empty when the trader owns order flow). Latest-write-
+            # wins; size is bounded by Counter dict footprint.
+            self.last_trader_telemetry = msg
         elif t == "welcome":
             logger.warning("trader welcome: version=%s", msg.get("trader_version"))
             # Send a hello back with broker state seed: version + config

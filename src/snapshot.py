@@ -147,8 +147,54 @@ def _hedge_block(hedge, state):
     }
 
 
+def _latency_with_trader_overlay(quotes, broker_ipc):
+    """Build the dashboard latency block. During cut-over the broker's
+    quote engine is suspended so its ttt_us histogram is empty; we
+    overlay the trader's recent ttt_p50_us / ttt_p99_us / ttt_n into
+    the same block so the dashboard surfaces something useful.
+
+    Trader-source samples are tagged with ``source: "trader"`` (vs the
+    broker's default unset/source: "broker"); dashboard can render them
+    differently if it wants. When broker has its own samples (cut-over
+    OFF) we keep the broker block as-is and just attach the trader
+    block alongside.
+    """
+    base = quotes.get_latency_snapshot()
+    if broker_ipc is None:
+        return base
+    tel = getattr(broker_ipc, "last_trader_telemetry", None)
+    if not tel:
+        return base
+    trader_ttt_n = tel.get("ttt_n") or 0
+    if trader_ttt_n <= 0:
+        return base
+    trader_block = {
+        "n": trader_ttt_n,
+        "p50": tel.get("ttt_p50_us"),
+        "p99": tel.get("ttt_p99_us"),
+        # No min/max/p10/p25/p75/p90 from trader telemetry — fill with None
+        # so the dashboard's expected schema doesn't break.
+        "min": None, "max": None,
+        "p10": None, "p25": None, "p75": None, "p90": None,
+        "source": "trader",
+    }
+    # If broker's TTT histogram is empty (typical during cut-over),
+    # replace with trader's. Keep place_rtt_us / amend_us as-is —
+    # broker still has those even when its quote engine is gated off.
+    if base.get("ttt_us", {}).get("n", 0) == 0:
+        base["ttt_us"] = trader_block
+    base["trader_ipc_us"] = {
+        "n": tel.get("ipc_n") or 0,
+        "p50": tel.get("ipc_p50_us"),
+        "p99": tel.get("ipc_p99_us"),
+        "source": "trader",
+    }
+    return base
+
+
 def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
-                         ib, account_id, config, hedge=None):
+                         ib, account_id, config, hedge=None,
+                         broker_ipc=None):
     """Write a JSON snapshot of the full option chain for the dashboard.
 
     Multi-product: every per-product invocation (primary + each observer)
@@ -156,6 +202,12 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     table doesn't mix HG and ETH rows. Uses each position's own
     ``multiplier`` for MtM math so a 25000-multiplier HG row doesn't get
     rendered with ETH's 50, or vice versa.
+
+    ``broker_ipc`` (optional): when in cut-over mode the broker's quote-
+    engine TTT histogram is empty (its quote engine is suspended).
+    Surface trader-side TTT samples from broker_ipc.last_trader_telemetry
+    in the snapshot's latency block so the dashboard still has a
+    meaningful end-to-end latency view.
     """
     state = market_data.state
     if state.underlying_price <= 0:
@@ -340,7 +392,7 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "expiries": expiries_list,
         "chains": chains_data,
         "account": account,
-        "latency": quotes.get_latency_snapshot(),
+        "latency": _latency_with_trader_overlay(quotes, broker_ipc),
         "limits": limits,
         "portfolio": {
             # Delta breakdown: options_delta + hedge_delta = effective_delta.
