@@ -61,6 +61,16 @@ services:
       # the trader process. Default empty → no IPC server, no trader
       # interaction, identical to pre-split behavior.
       CORSAIR_BROKER_MODE: "${CORSAIR_BROKER_MODE:-}"
+      # Phase 5+: IPC transport choice. "socket" (default) uses an
+      # asyncio Unix domain socket (~330μs p50); "shm" uses
+      # memory-mapped ring buffers with polling (~50-100μs p50).
+      # Both broker and trader must agree.
+      CORSAIR_IPC_TRANSPORT: "${CORSAIR_IPC_TRANSPORT:-socket}"
+      # Phase 3 cut-over: when "1", broker's quote engine stops
+      # placing orders; trader's place_order/cancel_order commands
+      # over IPC drive all option order flow. Default unset →
+      # broker quotes as today, trader logs only.
+      CORSAIR_TRADER_PLACES_ORDERS: "${CORSAIR_TRADER_PLACES_ORDERS:-}"
     volumes:
       - ./logs:/app/logs
       - ./logs-paper:/app/logs-paper      # v1.4 §9.5 paper JSONL streams
@@ -125,6 +135,18 @@ services:
     environment:
       LOG_LEVEL: "${TRADER_LOG_LEVEL:-INFO}"
       CORSAIR_IPC_SOCKET: "${CORSAIR_IPC_SOCKET:-/app/data/corsair_ipc.sock}"
+      CORSAIR_IPC_TRANSPORT: "${CORSAIR_IPC_TRANSPORT:-socket}"
+      CORSAIR_CONFIG: "${CORSAIR_CONFIG:-config/hg_v1_4_paper.yaml}"
+      # Phase 3 cut-over: when "1", trader sends place_order /
+      # cancel_order commands to the broker over IPC. The broker
+      # must also have CORSAIR_TRADER_PLACES_ORDERS=1 (its env block
+      # above) for the dispatcher side to be wired. Default unset →
+      # trader logs decisions only (Phase 2 behavior).
+      CORSAIR_TRADER_PLACES_ORDERS: "${CORSAIR_TRADER_PLACES_ORDERS:-}"
+      # Phase 6: when "python", forces the pure-Python decide_quote path
+      # in the trader (default uses the Rust corsair_pricing.decide_quote
+      # for SABR; SVI always falls through to Python).
+      CORSAIR_TRADER_BACKEND: "${CORSAIR_TRADER_BACKEND:-}"
     volumes:
       - ./logs-paper:/app/logs-paper      # event JSONL output
       - ./data:/app/data                  # IPC socket lives here

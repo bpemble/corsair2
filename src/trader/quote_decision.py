@@ -4,6 +4,11 @@ Independent implementation that *intends* to match the broker's quote
 engine. Not a refactor of the broker's path — purposefully separate so
 parity drift is the signal we measure.
 
+Phase 6: ``decide`` delegates to the Rust ``corsair_pricing.decide_quote``
+when the model is SABR. SVI and any unforeseen model fall back to the
+pure-Python path below. The Python fallback also serves as the parity
+reference for tests.
+
 Inputs come from forwarded events: option price book, vol surface,
 underlying. Outputs a structured decision per (strike, expiry, right,
 side):
@@ -23,11 +28,9 @@ What the broker does that we *don't* yet model (deliberate v2 simplifications):
     - modify-storm guard
     - GTD lifetime / minimum-order-lifetime guards
     - active_orders incumbency (we'd amend if already resting)
-
-Parity gap → next iteration. v2 captures the core "where would I quote"
-question; the guards above mostly just skip-or-defer.
 """
 
+import os
 from typing import Optional
 
 # Rust hot-path pricing (already in production for the broker).
@@ -35,6 +38,15 @@ import corsair_pricing as _rs
 
 # SABR implied-vol formula (Hagan 2002). Free function; no broker state.
 from ..sabr import sabr_implied_vol, svi_implied_vol, time_to_expiry_years
+
+
+# Phase 6 toggle. Default ON when the Rust extension is importable;
+# operator can force the Python path with CORSAIR_TRADER_BACKEND=python
+# for parity debugging or when the Rust version is found wanting.
+_USE_RS_DECIDE = (
+    hasattr(_rs, "decide_quote")
+    and os.environ.get("CORSAIR_TRADER_BACKEND", "").lower() != "python"
+)
 
 
 def compute_theo(
@@ -99,16 +111,45 @@ def decide(
 
     Returns a dict with keys: action, side, strike, expiry, right,
     price, theo, iv, reason. Always returns a dict — never raises.
+
+    Delegates to the Rust ``corsair_pricing.decide_quote`` for the SABR
+    fast path; SVI and edge cases use the pure-Python implementation
+    below (still the reference for parity tests).
     """
-    base = {
-        "side": side, "strike": strike, "expiry": expiry, "right": right,
-        "price": None, "theo": None, "iv": None,
-    }
     if tte is None:
         try:
             tte = time_to_expiry_years(expiry)
         except Exception:
-            return {**base, "action": "skip", "reason": "tte_calc_failed"}
+            return {
+                "side": side, "strike": strike, "expiry": expiry,
+                "right": right, "price": None, "theo": None, "iv": None,
+                "action": "skip", "reason": "tte_calc_failed",
+            }
+
+    if _USE_RS_DECIDE and (vol_params or {}).get("model") == "sabr":
+        # Rust hot path. SVI / unknown models fall through to Python
+        # (the Rust impl returns "model_not_in_rust" → we honor that
+        # and rerun in Python).
+        try:
+            d = _rs.decide_quote(
+                forward, strike, expiry, right, side,
+                vol_params, market_bid, market_ask,
+                int(min_edge_ticks), float(tick_size), float(tte),
+            )
+            if d.get("reason") != "model_not_in_rust":
+                return d
+        except Exception:
+            # Rust raised — log once per process and fall through.
+            import logging
+            logging.getLogger(__name__).debug(
+                "rs.decide_quote failed; using Python", exc_info=True,
+            )
+
+    # Pure-Python path (also the parity reference).
+    base = {
+        "side": side, "strike": strike, "expiry": expiry, "right": right,
+        "price": None, "theo": None, "iv": None,
+    }
 
     if not vol_params:
         return {**base, "action": "skip", "reason": "no_vol_surface"}

@@ -17,9 +17,9 @@ and prints "hello" frames. Phase 2 fills in the forwarders below.
 import logging
 import os
 import time
-from typing import Callable
+from typing import Callable, Optional
 
-from .ipc import IPCServer, DEFAULT_SOCKET_PATH
+from .ipc import make_server
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,27 @@ def _ts_ns() -> int:
 class BrokerIPC:
     """Owns the IPCServer + the subscriptions that publish to it."""
 
-    def __init__(self, socket_path: str = DEFAULT_SOCKET_PATH) -> None:
-        self.server = IPCServer(socket_path)
+    def __init__(self) -> None:
+        self.server = make_server()
         self._unsubscribers: list[Callable[[], None]] = []
         self._command_log: list[dict] = []  # phase 2: just log, don't act
+        # Phase 3 cut-over: when the trader takes over order placement,
+        # the broker dispatches its place_order/cancel_order commands
+        # through these handlers. Wired via set_order_dispatchers().
+        self._place_order_dispatcher: Optional[Callable[[dict], None]] = None
+        self._cancel_order_dispatcher: Optional[Callable[[dict], None]] = None
+
+    def set_order_dispatchers(
+        self,
+        place_handler: Callable[[dict], None],
+        cancel_handler: Callable[[dict], None],
+    ) -> None:
+        """Wire the broker-side handlers that turn trader commands into
+        ib.placeOrder / ib.cancelOrder calls. Called from main.py only
+        when CORSAIR_TRADER_PLACES_ORDERS=1.
+        """
+        self._place_order_dispatcher = place_handler
+        self._cancel_order_dispatcher = cancel_handler
 
     async def start(self) -> None:
         await self.server.start()
@@ -222,10 +239,27 @@ class BrokerIPC:
                 "ts_ns": _ts_ns(),
                 "broker_version": "v1",
             })
-        elif t in ("place_order", "cancel_order", "ping"):
+        elif t == "place_order":
+            # Phase 3: dispatch to ib.placeOrder when wired. If no
+            # dispatcher is set (broker pre-cutover), fall back to
+            # logging — same as Phase 2.
+            if self._place_order_dispatcher is not None:
+                try:
+                    self._place_order_dispatcher(msg)
+                except Exception:
+                    logger.exception("place_order dispatch failed")
+            else:
+                self._command_log.append(msg)
+        elif t == "cancel_order":
+            if self._cancel_order_dispatcher is not None:
+                try:
+                    self._cancel_order_dispatcher(msg)
+                except Exception:
+                    logger.exception("cancel_order dispatch failed")
+            else:
+                self._command_log.append(msg)
+        elif t == "ping":
             self._command_log.append(msg)
-            if len(self._command_log) % 100 == 0:
-                logger.info("ipc command log size: %d", len(self._command_log))
 
 
 def _safe_float(x):

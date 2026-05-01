@@ -27,7 +27,7 @@ import time
 from collections import Counter, deque
 from datetime import date, datetime, timezone
 
-from ..ipc import IPCClient, DEFAULT_SOCKET_PATH
+from ..ipc import make_client
 from .quote_decision import decide as decide_quote
 
 logging.basicConfig(
@@ -47,6 +47,11 @@ TELEMETRY_INTERVAL_S = 10.0
 # the config sync.
 DECISION_MIN_EDGE_TICKS = 2
 DECISION_TICK_SIZE = 0.0005
+
+# Phase 3 cut-over: when set, trader doesn't just log decisions — it
+# actually sends place_order/cancel_order commands to the broker.
+# Toggle via env so we can A/B vs broker-quoting.
+PLACES_ORDERS = os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1"
 
 
 class TraderState:
@@ -119,8 +124,8 @@ class JSONLWriter:
 
 
 class Trader:
-    def __init__(self, socket_path: str) -> None:
-        self.client = IPCClient(socket_path)
+    def __init__(self) -> None:
+        self.client = make_client()
         self.state = TraderState()
         self.event_log = JSONLWriter(EVENTS_LOG_DIR, "trader_events")
         # Separate JSONL stream for quote decisions — kept distinct from
@@ -129,6 +134,10 @@ class Trader:
         # Counters for the telemetry payload — parity gap surfaces in
         # logs but operator should also see it on the broker dashboard.
         self.decisions_made: Counter = Counter()
+        # Phase 3: track our just-sent place_order requests so the
+        # next tick on the same key doesn't churn-amend if the price
+        # didn't change.
+        self._our_orders_by_key: dict = {}
 
     async def on_event(self, msg: dict) -> None:
         recv_ns = time.monotonic_ns()
@@ -167,7 +176,9 @@ class Trader:
 
     def _decide_on_tick(self, tick_msg: dict, recv_ns: int) -> None:
         """Emit v2 quote decisions for the (strike, expiry, right) of a
-        tick event. Both sides (BUY+SELL) are evaluated independently."""
+        tick event. Both sides (BUY+SELL) are evaluated independently.
+        When CORSAIR_TRADER_PLACES_ORDERS=1, also send place_order
+        commands to the broker."""
         forward = self.state.underlying_price
         if forward <= 0:
             return
@@ -176,10 +187,11 @@ class Trader:
         right = tick_msg.get("right")
         if strike is None or expiry is None or right is None:
             return
-        # Look up vol params for this expiry. We pick the BUY-side
-        # surface arbitrarily — broker fits one surface per (expiry,
-        # side); for parity v2 we'll use whichever side's params arrived
-        # most recently. Phase 3 will track both.
+        if self.state.kills:
+            # Don't quote into a halt
+            return
+        if self.state.weekend_paused:
+            return
         vp_msg = self.state.vol_surface.get(expiry)
         vol_params = (vp_msg or {}).get("params")
         bid = tick_msg.get("bid")
@@ -206,6 +218,33 @@ class Trader:
                 "forward": forward,
                 "decision": d,
             })
+
+            # Phase 3 cut-over: if we own order flow, send the command.
+            # v3 keeps it simple — every "place" decision sends a fresh
+            # order. Phase 3b will add incumbency tracking so we amend
+            # rather than churn.
+            if PLACES_ORDERS and d.get("action") == "place" and d.get("price"):
+                key = (float(strike), expiry, right, side)
+                # Skip if we already have an order at exactly this price
+                # for this key (prevents amend churn). Strict equality
+                # check; price comparison after tick-quantization.
+                existing = self._our_orders_by_key.get(key)
+                if existing is not None and existing.get("price") == d["price"]:
+                    continue
+                self.client.send({
+                    "type": "place_order",
+                    "ts_ns": time.time_ns(),
+                    "strike": float(strike),
+                    "expiry": expiry,
+                    "right": right,
+                    "side": side,
+                    "qty": 1,
+                    "price": d["price"],
+                    "orderRef": "corsair_trader",
+                })
+                self._our_orders_by_key[key] = {
+                    "price": d["price"], "ts_ns": time.time_ns(),
+                }
 
     def _apply(self, msg: dict) -> None:
         t = msg.get("type")
@@ -306,10 +345,9 @@ class Trader:
 
 
 async def main() -> None:
-    socket_path = os.environ.get("CORSAIR_IPC_SOCKET", DEFAULT_SOCKET_PATH)
-    logger.info("Trader starting; broker socket=%s", socket_path)
-
-    trader = Trader(socket_path)
+    transport = os.environ.get("CORSAIR_IPC_TRANSPORT", "socket")
+    logger.info("Trader starting; transport=%s", transport)
+    trader = Trader()
     stop = asyncio.Event()
 
     def _signal_handler(*_):

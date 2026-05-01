@@ -110,6 +110,55 @@ def _validate_safety_config(cfg) -> None:
     )
 
 
+def _safe_write_snapshot(md, quotes, portfolio, sabr, margin, ib,
+                         account_id, eng_config, hedge, eng_name):
+    """Wrapper around write_chain_snapshot for run_in_executor.
+
+    Phase 4 (mm_service_split.md): the snapshot build is one of the
+    documented sources of TTT spikes when run on the asyncio loop
+    (5-10ms of synchronous Python per 4Hz tick). Running it in the
+    default executor frees the loop. Errors are swallowed here so a
+    snapshot failure doesn't poison the executor's exception state.
+    """
+    try:
+        write_chain_snapshot(md, quotes, portfolio, sabr, margin, ib,
+                             account_id, eng_config, hedge=hedge)
+    except RuntimeError as e:
+        # Specific catch for "dictionary changed size during iteration"
+        # which can fire if the main loop adds/drops a subscription
+        # between this thread's GIL slices. Best-effort skip.
+        if "changed size during iteration" in str(e):
+            logger.debug("snapshot %s: state mutated during build; "
+                         "next cycle will recover", eng_name)
+        else:
+            logger.warning("Snapshot %s error: %s", eng_name, e)
+    except Exception as e:
+        logger.warning("Snapshot %s error: %s", eng_name, e)
+
+
+def _safe_daily_state_save(session_day, portfolio, seen_exec_ids_list) -> None:
+    """Wrapper around daily_state.save for run_in_executor.
+
+    Phase 4: json.dump on a ~50-key dict was running on the asyncio loop
+    every second; the loop-block detector caught 70-120ms blocks from
+    it. Off-load to executor; portfolio reads here are atomic dict
+    accesses under the GIL.
+    """
+    try:
+        daily_state.save(
+            session_day,
+            fills_today=portfolio.fills_today,
+            spread_capture_today=portfolio.spread_capture_today,
+            spread_capture_mid_today=portfolio.spread_capture_mid_today,
+            daily_pnl=portfolio.daily_pnl,
+            realized_pnl=portfolio.realized_pnl_persisted,
+            seen_exec_ids=seen_exec_ids_list,
+            session_open_nlv=portfolio.session_open_nlv,
+        )
+    except Exception as e:
+        logger.warning("daily_state save error: %s", e)
+
+
 def _reconcile_positions(portfolio, ib, account_id: str, config) -> list:
     """Compare in-memory portfolio against IBKR's authoritative position view.
 
@@ -675,6 +724,9 @@ async def main():
     # publishes ticks. Phase 2: trader receives + logs only; broker still
     # owns all order placement.
     broker_ipc: BrokerIPC | None = None
+    trader_places_orders = (
+        os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1"
+    )
     if is_broker_mode_enabled():
         try:
             broker_ipc = BrokerIPC()
@@ -687,6 +739,73 @@ async def main():
                     broker_ipc.publish_vol_surface
                 )
             logger.warning("BROKER MODE: IPC server up; trader can connect")
+
+            # Phase 3 cut-over: wire dispatchers that turn trader commands
+            # into real ib.placeOrder / ib.cancelOrder calls. Only when
+            # CORSAIR_TRADER_PLACES_ORDERS=1 is set.
+            if trader_places_orders:
+                primary_eng = engines[0]
+                quotes_obj = primary_eng["quotes"]
+
+                def _dispatch_place_order(msg: dict) -> None:
+                    """Trader → broker place_order command. Synchronously
+                    constructs an ib_insync LimitOrder + the option's
+                    Contract and calls ib.placeOrder via the existing
+                    token-bucketed wrapper. Telemetry is already captured
+                    on the broker side via openOrderEvent."""
+                    try:
+                        strike = float(msg["strike"])
+                        expiry = msg["expiry"]
+                        right = msg["right"]
+                        side = msg["side"]
+                        qty = int(msg.get("qty", 1))
+                        price = float(msg["price"])
+                        # Pull the Contract from market_data (already
+                        # qualified). Falls back to None if not subscribed.
+                        md = primary_eng["md"]
+                        ckey = (strike, expiry, right)
+                        contract = md._option_contracts.get(ckey)
+                        if contract is None:
+                            logger.warning(
+                                "trader place_order: no contract for %s — drop", ckey)
+                            return
+                        from ib_insync import LimitOrder
+                        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+                        # Match broker quote engine's GTD-30s pattern.
+                        # IBKR's "yyyymmdd-hh:mm:ss" UTC format. Without
+                        # a goodTillDate, GTD orders are rejected with
+                        # Error 391 (observed during initial Phase 3
+                        # cut-over deploy).
+                        gtd = (_dt.now(_tz.utc) + _td(seconds=30)).strftime(
+                            "%Y%m%d-%H:%M:%S")
+                        order = LimitOrder(
+                            action=side,
+                            totalQuantity=qty,
+                            lmtPrice=price,
+                            tif="GTD",
+                            goodTillDate=gtd,
+                            account=config.account.account_id,
+                            orderRef=msg.get("orderRef") or "corsair_trader",
+                        )
+                        quotes_obj._try_place_order(contract, order)
+                    except Exception:
+                        logger.exception("dispatch_place_order failed")
+
+                def _dispatch_cancel_order(msg: dict) -> None:
+                    try:
+                        oid = int(msg["orderId"])
+                        trade = quotes_obj._canonical_trade(oid)
+                        if trade is not None:
+                            quotes_obj._try_cancel_order(trade.order)
+                    except Exception:
+                        logger.exception("dispatch_cancel_order failed")
+
+                broker_ipc.set_order_dispatchers(
+                    _dispatch_place_order, _dispatch_cancel_order
+                )
+                logger.warning(
+                    "PHASE 3 CUT-OVER ACTIVE: broker quote engine SUSPENDED; "
+                    "trader owns option order flow")
         except Exception:
             logger.exception("broker_ipc start failed; continuing without trader split")
             broker_ipc = None
@@ -889,7 +1008,9 @@ async def main():
         # Full-refresh quote update for secondary engines. The primary's
         # quote update runs below through the event-driven (dirty-set) path
         # so it can ride tick bursts without waiting the full cycle.
-        if not (risk.killed or weekend_paused):
+        # Phase 3 cut-over: when trader_places_orders is True, the broker
+        # stops driving quote updates entirely — trader is in charge.
+        if not (risk.killed or weekend_paused or trader_places_orders):
             for eng in engines[1:]:
                 try:
                     eng["quotes"].update_quotes(portfolio)
@@ -903,31 +1024,33 @@ async def main():
         # recoverable.
         mono = _time.monotonic()
         if (mono - last_snapshot_write) >= snapshot_interval:
+            # Phase 4: snapshot build is ~5-10ms of synchronous Python on
+            # 24-strike chains. Pushing to the default executor frees the
+            # asyncio loop for tick callbacks. Race risk: state.options
+            # could mutate during iteration in the worker. Mitigation:
+            # write_chain_snapshot iterates over copies (state.expiries
+            # is a list, get_all_strikes returns a sorted copy) and
+            # individual dict reads are atomic under the GIL.
+            _loop = asyncio.get_running_loop()
             for eng in engines:
-                try:
-                    write_chain_snapshot(
-                        eng["md"], eng["quotes"], portfolio, eng["sabr"],
-                        eng["margin"], ib, config.account.account_id,
-                        eng["config"], hedge=eng.get("hedge"),
-                    )
-                except Exception as e:
-                    logger.warning("Snapshot %s error: %s", eng["name"], e)
+                _loop.run_in_executor(
+                    None, _safe_write_snapshot,
+                    eng["md"], eng["quotes"], portfolio, eng["sabr"],
+                    eng["margin"], ib, config.account.account_id,
+                    eng["config"], eng.get("hedge"), eng["name"],
+                )
             last_snapshot_write = mono
 
         if (mono - last_daily_state_save) >= 1.0:
-            try:
-                daily_state.save(
-                    session_day,
-                    fills_today=portfolio.fills_today,
-                    spread_capture_today=portfolio.spread_capture_today,
-                    spread_capture_mid_today=portfolio.spread_capture_mid_today,
-                    daily_pnl=portfolio.daily_pnl,
-                    realized_pnl=portfolio.realized_pnl_persisted,
-                    seen_exec_ids=list(fills._seen_exec_ids),
-                    session_open_nlv=portfolio.session_open_nlv,
-                )
-            except Exception as e:
-                logger.warning("daily_state save error: %s", e)
+            # Phase 4: daily_state.save was a documented spike source —
+            # loop-block detector caught 70-120ms blocks from
+            # json.dump on the loop. Off-load to executor.
+            _loop = asyncio.get_running_loop()
+            _loop.run_in_executor(
+                None, _safe_daily_state_save,
+                session_day, portfolio,
+                list(fills._seen_exec_ids),  # copy under our control
+            )
             last_daily_state_save = mono
 
         # v1.4 §9.5: margin_snapshots.jsonl (default 60s cadence).
@@ -1091,7 +1214,9 @@ async def main():
             else:
                 dirty = set()  # nothing to do this cycle
 
-        if dirty is None or dirty:
+        if (dirty is None or dirty) and not trader_places_orders:
+            # Phase 3 cut-over: skip primary update_quotes when trader
+            # owns order flow.
             try:
                 quotes.update_quotes(portfolio, dirty=dirty)
                 quotes.consecutive_quote_errors = 0
