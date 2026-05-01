@@ -76,24 +76,47 @@ def compute_theo(
     if forward <= 0 or strike <= 0 or tte <= 0:
         return None
     model = vol_params.get("model")
+    # Prefer the Rust path when available — both SABR and SVI are now
+    # in corsair_pricing (cleanup pass 7). The Python path remains as
+    # the parity reference and the env-toggle escape hatch.
+    use_rust = _USE_RS_DECIDE
     try:
         if model == "sabr":
-            iv = sabr_implied_vol(
-                forward, strike, tte,
-                float(vol_params["alpha"]),
-                float(vol_params["beta"]),
-                float(vol_params["rho"]),
-                float(vol_params["nu"]),
-            )
+            if use_rust and hasattr(_rs, "sabr_implied_vol"):
+                iv = _rs.sabr_implied_vol(
+                    forward, strike, tte,
+                    float(vol_params["alpha"]),
+                    float(vol_params["beta"]),
+                    float(vol_params["rho"]),
+                    float(vol_params["nu"]),
+                )
+            else:
+                iv = sabr_implied_vol(
+                    forward, strike, tte,
+                    float(vol_params["alpha"]),
+                    float(vol_params["beta"]),
+                    float(vol_params["rho"]),
+                    float(vol_params["nu"]),
+                )
         elif model == "svi":
-            iv = svi_implied_vol(
-                forward, strike, tte,
-                float(vol_params["a"]),
-                float(vol_params["b"]),
-                float(vol_params["rho"]),
-                float(vol_params["m"]),
-                float(vol_params["sigma"]),
-            )
+            if use_rust and hasattr(_rs, "svi_implied_vol"):
+                iv = _rs.svi_implied_vol(
+                    forward, strike, tte,
+                    float(vol_params["a"]),
+                    float(vol_params["b"]),
+                    float(vol_params["rho"]),
+                    float(vol_params["m"]),
+                    float(vol_params["sigma"]),
+                )
+            else:
+                iv = svi_implied_vol(
+                    forward, strike, tte,
+                    float(vol_params["a"]),
+                    float(vol_params["b"]),
+                    float(vol_params["rho"]),
+                    float(vol_params["m"]),
+                    float(vol_params["sigma"]),
+                )
         else:
             return None
     except Exception:

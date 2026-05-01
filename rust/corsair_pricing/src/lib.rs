@@ -152,6 +152,35 @@ fn brent<F: Fn(f64) -> f64>(f: &F, mut a: f64, mut b: f64, xtol: f64, max_iter: 
 /// Hagan 2002 SABR implied vol approximation.
 ///
 /// Mirrors `src/sabr.py:sabr_implied_vol`. ATM is detected at
+/// SVI raw total variance: w(k) = a + b * (rho * (k - m) + sqrt((k - m)^2 + sigma^2))
+/// where k = log(K/F). Mirrors src/sabr.py:svi_total_variance for parity.
+#[inline(always)]
+fn svi_total_variance_inner(k: f64, a: f64, b: f64, rho: f64, m: f64, sigma: f64) -> f64 {
+    let dk = k - m;
+    a + b * (rho * dk + (dk * dk + sigma * sigma).sqrt())
+}
+
+/// SVI implied vol from log-moneyness — mirrors src/sabr.py:svi_implied_vol.
+/// Returns 0.0 for invalid inputs and 0.001 for non-positive variance
+/// (matches Python's safe-floor behavior). The 0.001 floor is what
+/// keeps Black76 from blowing up on early-fit junk parameters.
+#[pyfunction]
+#[pyo3(signature = (f, k_strike, t, a, b, rho, m, sigma))]
+fn svi_implied_vol(
+    f: f64, k_strike: f64, t: f64,
+    a: f64, b: f64, rho: f64, m: f64, sigma: f64,
+) -> f64 {
+    if t <= 0.0 || k_strike <= 0.0 || f <= 0.0 {
+        return 0.0;
+    }
+    let k = (k_strike / f).ln();
+    let w = svi_total_variance_inner(k, a, b, rho, m, sigma);
+    if w <= 0.0 {
+        return 0.001;
+    }
+    (w / t).sqrt()
+}
+
 /// |F-K| < 1e-7 * F (matches the Python `eps = 1e-7` branch).
 #[pyfunction]
 fn sabr_implied_vol(
@@ -241,7 +270,7 @@ fn decide_quote(
         return Ok(dict.into());
     }
 
-    // Extract model field; only "sabr" handled in Rust for v1.
+    // Extract model field; SABR + SVI now both handled in Rust.
     let model: String = vol_params
         .get_item("model")
         .ok()
@@ -253,8 +282,18 @@ fn decide_quote(
         let p_rho: f64 = vol_params.get_item("rho")?.extract()?;
         let nu: f64 = vol_params.get_item("nu")?.extract()?;
         sabr_implied_vol(forward, strike, tte, alpha, beta, p_rho, nu)
+    } else if model == "svi" {
+        // SVI: a + b * (rho * (k - m) + sqrt((k-m)^2 + sigma^2)),
+        // where k = log(K/F). Caller MUST pass fit-time forward (not
+        // current spot) — see src/trader/quote_decision.py docstring.
+        let a: f64 = vol_params.get_item("a")?.extract()?;
+        let b: f64 = vol_params.get_item("b")?.extract()?;
+        let p_rho: f64 = vol_params.get_item("rho")?.extract()?;
+        let m: f64 = vol_params.get_item("m")?.extract()?;
+        let sigma: f64 = vol_params.get_item("sigma")?.extract()?;
+        svi_implied_vol(forward, strike, tte, a, b, p_rho, m, sigma)
     } else {
-        // SVI or unknown — punt back to Python.
+        // Unknown model — punt back to Python.
         dict.set_item("action", "skip")?;
         dict.set_item("reason", "model_not_in_rust")?;
         return Ok(dict.into());
@@ -347,6 +386,7 @@ fn corsair_pricing(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(black76_price, m)?)?;
     m.add_function(wrap_pyfunction!(implied_vol, m)?)?;
     m.add_function(wrap_pyfunction!(sabr_implied_vol, m)?)?;
+    m.add_function(wrap_pyfunction!(svi_implied_vol, m)?)?;
     m.add_function(wrap_pyfunction!(decide_quote, m)?)?;
     Ok(())
 }
