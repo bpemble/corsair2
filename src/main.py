@@ -33,6 +33,7 @@ from .logging_utils import CSVLogger
 from .weekend import friday_shutdown, monday_startup
 from .snapshot import write_chain_snapshot
 from . import daily_state
+from .broker_ipc import BrokerIPC, is_broker_mode_enabled
 from .watchdog import (
     safe_discover_and_subscribe,
     watchdog_loop,
@@ -666,6 +667,25 @@ async def main():
                       csv_logger=csv_logger),
         name="watchdog",
     )
+
+    # Broker IPC for the trader split (mm_service_split.md). Opt-in via
+    # CORSAIR_BROKER_MODE=1; default off → no behavior change. When on,
+    # the IPC server listens on /app/data/corsair_ipc.sock, ib_insync
+    # event subscriptions get forwarded, and per-product market_data
+    # publishes ticks. Phase 2: trader receives + logs only; broker still
+    # owns all order placement.
+    broker_ipc: BrokerIPC | None = None
+    if is_broker_mode_enabled():
+        try:
+            broker_ipc = BrokerIPC()
+            await broker_ipc.start()
+            broker_ipc.attach_to_ib(ib)
+            for eng in engines:
+                eng["md"].set_broker_ipc(broker_ipc)
+            logger.warning("BROKER MODE: IPC server up; trader can connect")
+        except Exception:
+            logger.exception("broker_ipc start failed; continuing without trader split")
+            broker_ipc = None
 
     # Diagnostic: detect synchronous blocks on the asyncio loop ≥ 50ms
     # and capture the main-thread stack mid-block. Used to localize the

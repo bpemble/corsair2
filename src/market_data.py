@@ -214,6 +214,11 @@ class MarketDataManager:
         self.quotes = None
         self._option_tickers: dict[OptionKey, Ticker] = {}
         self._underlying_ticker: Ticker | None = None
+        # Broker IPC forwarder (Phase 1+2 of mm_service_split). When set,
+        # every ticker subscription also publishes ticks to the trader
+        # process via Unix socket. Default None → no broker mode → zero
+        # behavior change. Set by main.py once at startup.
+        self._broker_ipc = None
         self._underlying_contract: Future | None = None
         self._option_contracts: dict[OptionKey, FuturesOption] = {}
         # ATM at the last recenter pass. recenter_strike_window short-circuits
@@ -357,6 +362,11 @@ class MarketDataManager:
         # Subscribe to market data
         ticker = self.ib.reqMktData(self._underlying_contract, genericTickList="", snapshot=False)
         self._underlying_ticker = ticker
+        if self._broker_ipc is not None:
+            try:
+                self._broker_ipc.attach_underlying(ticker)
+            except Exception:
+                logger.exception("broker attach_underlying failed")
 
         # Set up callback for underlying price updates
         ticker.updateEvent += self._on_underlying_tick
@@ -643,6 +653,7 @@ class MarketDataManager:
 
             # Set up callback
             ticker.updateEvent += lambda t, k=key: self._on_option_tick(t, k)
+            self._attach_broker_option_cb(ticker, key)
 
         # Total streaming lines = 1 (underlying) + len(option_tickers).
         # IBKR paper default cap is ~100 lines; surface the count so
@@ -708,6 +719,7 @@ class MarketDataManager:
                 continue
             self._option_tickers[key] = ticker
             ticker.updateEvent += lambda t, k=key: self._on_option_tick(t, k)
+            self._attach_broker_option_cb(ticker, key)
             added += 1
         if added:
             logger.info(
@@ -835,6 +847,7 @@ class MarketDataManager:
                     continue
                 self._option_tickers[key] = ticker
                 ticker.updateEvent += lambda t, k=key: self._on_option_tick(t, k)
+                self._attach_broker_option_cb(ticker, key)
                 added += 1
 
         # DROP: cancel market data (and depth, if present) for strikes that
@@ -918,6 +931,36 @@ class MarketDataManager:
                 self._depth_tickers[key] = t
             except Exception as e:
                 logger.warning("reqMktDepth rotate failed for %s: %s", key, e)
+
+    def set_broker_ipc(self, broker_ipc) -> None:
+        """Wire a broker IPC forwarder to publish ticks to the trader.
+
+        Idempotent — calling with the same forwarder is a no-op. Calling
+        with None disables forwarding (no-op for already-subscribed
+        tickers; future ones won't get the broker callback).
+        """
+        self._broker_ipc = broker_ipc
+        # Backfill existing subscriptions: every ticker we already have
+        # gets the broker callback added now.
+        if broker_ipc is None:
+            return
+        for key, ticker in self._option_tickers.items():
+            self._attach_broker_option_cb(ticker, key)
+        if self._underlying_ticker is not None:
+            try:
+                broker_ipc.attach_underlying(self._underlying_ticker)
+            except Exception:
+                logger.exception("set_broker_ipc: attach_underlying failed")
+
+    def _attach_broker_option_cb(self, ticker, key) -> None:
+        """Attach the broker forwarder to an option ticker, no-op when
+        broker mode is off."""
+        if self._broker_ipc is None:
+            return
+        try:
+            self._broker_ipc.attach_ticker(ticker, key[0], key[1], key[2])
+        except Exception:
+            logger.exception("attach_broker_option_cb failed for %s", key)
 
     def _on_option_tick(self, ticker: Ticker, key: OptionKey):
         """Process an option quote update."""

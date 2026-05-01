@@ -56,6 +56,11 @@ services:
       CORSAIR_LOOP_BLOCK_THRESHOLD_MS: "${CORSAIR_LOOP_BLOCK_THRESHOLD_MS:-50}"
       CORSAIR_LOOP_BLOCK_PING_MS: "${CORSAIR_LOOP_BLOCK_PING_MS:-10}"
       CORSAIR_LOOP_BLOCK_DISABLED: "${CORSAIR_LOOP_BLOCK_DISABLED:-}"
+      # Broker IPC mode (mm_service_split.md). When "1", corsair runs as
+      # the broker: starts the IPC server, forwards gateway events to
+      # the trader process. Default empty → no IPC server, no trader
+      # interaction, identical to pre-split behavior.
+      CORSAIR_BROKER_MODE: "${CORSAIR_BROKER_MODE:-}"
     volumes:
       - ./logs:/app/logs
       - ./logs-paper:/app/logs-paper      # v1.4 §9.5 paper JSONL streams
@@ -95,6 +100,36 @@ services:
       - ./logs-paper:/app/logs-paper:ro  # v1.4 §9.5 paper JSONL streams
       - ./data:/app/data:ro
       - ./config:/app/config:ro
+
+  # ── Trader (mm_service_split Phase 1+2) ─────────────────────────────
+  # Connects to the broker (corsair) over a Unix socket in the shared
+  # data volume. Phase 2 reads forwarded events (ticks, fills, order
+  # acks) and writes to logs-paper/trader_events-YYYY-MM-DD.jsonl;
+  # phase 3 will own order placement.
+  #
+  # Reuses the corsair image — same Python env (pricing.py, sabr.py,
+  # corsair_pricing Rust extension all available). Different command.
+  #
+  # Started ALONGSIDE corsair when CORSAIR_BROKER_MODE=1; otherwise
+  # this service starts but its IPCClient retries connect-loop
+  # forever (harmless). To disable entirely, run
+  # `docker compose up -d corsair dashboard ib-gateway` and skip trader.
+  trader:
+    image: corsair-corsair
+    profiles: ["broker-split"]            # opt-in: docker compose --profile broker-split up -d
+    depends_on:
+      corsair:
+        condition: service_healthy
+    network_mode: host
+    env_file: .env
+    environment:
+      LOG_LEVEL: "${TRADER_LOG_LEVEL:-INFO}"
+      CORSAIR_IPC_SOCKET: "${CORSAIR_IPC_SOCKET:-/app/data/corsair_ipc.sock}"
+    volumes:
+      - ./logs-paper:/app/logs-paper      # event JSONL output
+      - ./data:/app/data                  # IPC socket lives here
+    command: ["python3", "-m", "src.trader.main"]
+    restart: unless-stopped
 
 volumes:
   ib-gateway-data:

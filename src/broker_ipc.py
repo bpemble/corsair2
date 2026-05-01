@@ -1,0 +1,241 @@
+"""Broker-side IPC forwarder.
+
+Wraps an ``IPCServer`` and subscribes to ib_insync events. Each callback
+serializes the event into the IPC wire format and publishes to the
+trader. Opt-in via ``CORSAIR_BROKER_MODE=1``; default off → zero
+behavior change.
+
+Phase 2 scope: forwards ticker updates, fills, order acks, kills, vol
+surface updates. Trader-side commands (``place_order`` etc.) are
+received via the IPC server's command handler but only logged in this
+phase — actual order placement stays on the broker until Phase 3.
+
+Phase 1 (just plumbing) doesn't need any of this — the trader connects
+and prints "hello" frames. Phase 2 fills in the forwarders below.
+"""
+
+import logging
+import os
+import time
+from typing import Callable
+
+from .ipc import IPCServer, DEFAULT_SOCKET_PATH
+
+logger = logging.getLogger(__name__)
+
+
+def _ts_ns() -> int:
+    """Wall-clock ns. Used for IPC latency measurement across processes —
+    monotonic_ns isn't comparable across pid boundaries."""
+    return time.time_ns()
+
+
+class BrokerIPC:
+    """Owns the IPCServer + the subscriptions that publish to it."""
+
+    def __init__(self, socket_path: str = DEFAULT_SOCKET_PATH) -> None:
+        self.server = IPCServer(socket_path)
+        self._unsubscribers: list[Callable[[], None]] = []
+        self._command_log: list[dict] = []  # phase 2: just log, don't act
+
+    async def start(self) -> None:
+        await self.server.start()
+        self.server.set_command_handler(self._on_command)
+
+    async def stop(self) -> None:
+        for unsub in self._unsubscribers:
+            try:
+                unsub()
+            except Exception:
+                pass
+        self._unsubscribers.clear()
+        await self.server.stop()
+
+    # ── Subscriptions ──────────────────────────────────────────────────
+
+    def attach_to_ib(self, ib) -> None:
+        """Subscribe to ib_insync events that the trader needs.
+
+        Called once at boot, after the IB connection is up. We hold the
+        bound methods so they can be unsubscribed cleanly on shutdown.
+        """
+        # orderStatusEvent fires per status change. We forward every one
+        # the trader might care about; trader filters internally.
+        order_status_cb = self._on_order_status
+        ib.orderStatusEvent += order_status_cb
+        self._unsubscribers.append(lambda: ib.orderStatusEvent.__isub__(order_status_cb))
+
+        # execDetailsEvent fires per execution. Trader uses these for
+        # position updates (Phase 3) and parity comparisons (Phase 2).
+        exec_cb = self._on_exec_details
+        ib.execDetailsEvent += exec_cb
+        self._unsubscribers.append(lambda: ib.execDetailsEvent.__isub__(exec_cb))
+
+    def attach_ticker(self, ticker, strike: float, expiry: str, right: str) -> None:
+        """Subscribe to one option ticker's updateEvent.
+
+        Called from market_data.py as each option subscription is added,
+        only when broker mode is active.
+        """
+        cb = self._make_tick_callback(strike, expiry, right)
+        ticker.updateEvent += cb
+        # No unsub bookkeeping for tickers — the existing market_data
+        # cleanup path (cancel_option_subscription) already drops the
+        # ticker; the cb goes with it.
+
+    def attach_underlying(self, ticker) -> None:
+        cb = self._on_underlying_tick
+        ticker.updateEvent += cb
+
+    # ── Forwarders (publish API for non-event sources like SABR fits) ──
+
+    def publish_vol_surface(self, expiry: str, params: dict) -> None:
+        self.server.publish({
+            "type": "vol_surface",
+            "ts_ns": _ts_ns(),
+            "expiry": expiry,
+            "params": params,
+        })
+
+    def publish_kill(self, source: str, reason: str, kill_type: str) -> None:
+        self.server.publish({
+            "type": "kill",
+            "ts_ns": _ts_ns(),
+            "source": source,
+            "reason": reason,
+            "kill_type": kill_type,
+        })
+
+    def publish_resume(self, source: str) -> None:
+        self.server.publish({
+            "type": "resume",
+            "ts_ns": _ts_ns(),
+            "source": source,
+        })
+
+    def publish_weekend_pause(self, paused: bool) -> None:
+        self.server.publish({
+            "type": "weekend_pause",
+            "ts_ns": _ts_ns(),
+            "paused": paused,
+        })
+
+    # ── Internal callbacks ─────────────────────────────────────────────
+
+    def _make_tick_callback(self, strike: float, expiry: str, right: str):
+        srv = self.server
+        def _cb(ticker):
+            try:
+                srv.publish({
+                    "type": "tick",
+                    "ts_ns": _ts_ns(),
+                    "strike": strike,
+                    "expiry": expiry,
+                    "right": right,
+                    "bid": _safe_float(ticker.bid),
+                    "ask": _safe_float(ticker.ask),
+                    "bid_size": _safe_int(ticker.bidSize),
+                    "ask_size": _safe_int(ticker.askSize),
+                    "last": _safe_float(ticker.last),
+                })
+            except Exception:
+                logger.debug("tick forward failed", exc_info=True)
+        return _cb
+
+    def _on_underlying_tick(self, ticker) -> None:
+        try:
+            self.server.publish({
+                "type": "underlying_tick",
+                "ts_ns": _ts_ns(),
+                "price": _safe_float(getattr(ticker, "marketPrice", lambda: None)()),
+                "bid": _safe_float(ticker.bid),
+                "ask": _safe_float(ticker.ask),
+                "last": _safe_float(ticker.last),
+            })
+        except Exception:
+            logger.debug("underlying tick forward failed", exc_info=True)
+
+    def _on_order_status(self, trade) -> None:
+        try:
+            self.server.publish({
+                "type": "order_ack",
+                "ts_ns": _ts_ns(),
+                "orderId": trade.order.orderId,
+                "status": trade.orderStatus.status,
+                "filled": float(trade.orderStatus.filled or 0),
+                "remaining": float(trade.orderStatus.remaining or 0),
+                "lmtPrice": float(getattr(trade.order, "lmtPrice", 0) or 0),
+                "side": trade.order.action,
+                "qty": float(trade.order.totalQuantity or 0),
+                "orderRef": getattr(trade.order, "orderRef", "") or "",
+            })
+        except Exception:
+            logger.debug("order_status forward failed", exc_info=True)
+
+    def _on_exec_details(self, trade, fill) -> None:
+        try:
+            ex = fill.execution
+            self.server.publish({
+                "type": "fill",
+                "ts_ns": _ts_ns(),
+                "orderId": trade.order.orderId,
+                "exec_id": ex.execId,
+                "side": ex.side,
+                "qty": float(ex.shares or 0),
+                "price": float(ex.price or 0),
+                "symbol": getattr(fill.contract, "localSymbol", "") or "",
+                "secType": getattr(fill.contract, "secType", "") or "",
+            })
+        except Exception:
+            logger.debug("fill forward failed", exc_info=True)
+
+    def _on_command(self, msg: dict) -> None:
+        """Trader → broker commands. Phase 2: log only.
+        Phase 3: dispatch to placeOrder / cancelOrder."""
+        t = msg.get("type")
+        if t == "telemetry":
+            logger.info(
+                "trader telemetry: events=%s ipc_p50=%sus ipc_p99=%sus opts=%s orders=%s",
+                sum((msg.get("events") or {}).values()),
+                msg.get("ipc_p50_us"), msg.get("ipc_p99_us"),
+                msg.get("n_options"), msg.get("n_active_orders"),
+            )
+        elif t == "welcome":
+            logger.warning("trader welcome: version=%s", msg.get("trader_version"))
+            # Send a hello back with broker state seed (Phase 3 will
+            # include open orders and positions).
+            self.server.publish({
+                "type": "hello",
+                "ts_ns": _ts_ns(),
+                "broker_version": "v1",
+            })
+        elif t in ("place_order", "cancel_order", "ping"):
+            self._command_log.append(msg)
+            if len(self._command_log) % 100 == 0:
+                logger.info("ipc command log size: %d", len(self._command_log))
+
+
+def _safe_float(x):
+    if x is None:
+        return None
+    try:
+        f = float(x)
+        if f != f:  # NaN
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(x):
+    if x is None:
+        return None
+    try:
+        i = int(x)
+        return i
+    except (TypeError, ValueError):
+        return None
+
+
+def is_broker_mode_enabled() -> bool:
+    return os.environ.get("CORSAIR_BROKER_MODE", "").strip() == "1"
