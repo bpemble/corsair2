@@ -131,6 +131,12 @@ def decide(
     # bail. Below that, broker's surface refit (every ~60s) is the
     # right cure. Above that, surface extrapolation is too suspect.
     max_forward_drift_ticks: int = 200,
+    # Pre-computed theo (cleanup pass 7, 2026-05-01). Theo doesn't
+    # depend on side; trader can compute it once per tick and pass
+    # in. Skips compute_theo entirely on this call. Saves ~0.5ms per
+    # decision in the SVI Python path (which is the common case).
+    pre_iv: Optional[float] = None,
+    pre_theo: Optional[float] = None,
 ) -> dict:
     """Make a single (strike, expiry, right, side) quote decision.
 
@@ -179,10 +185,17 @@ def decide(
     if not vol_params:
         return {**base, "action": "skip", "reason": "no_vol_surface"}
 
-    res = compute_theo(forward, strike, tte, right, vol_params)
-    if res is None:
-        return {**base, "action": "skip", "reason": "theo_unavailable"}
-    iv, theo = res
+    # Use pre-computed theo when caller supplied it (cleanup pass 7).
+    # Theo doesn't depend on side, so the trader computes it once per
+    # tick and passes in for both BUY and SELL decisions. Saves the
+    # ~0.5ms SVI Python compute on the second call.
+    if pre_iv is not None and pre_theo is not None:
+        iv, theo = pre_iv, pre_theo
+    else:
+        res = compute_theo(forward, strike, tte, right, vol_params)
+        if res is None:
+            return {**base, "action": "skip", "reason": "theo_unavailable"}
+        iv, theo = res
     base["theo"] = theo
     base["iv"] = iv
 

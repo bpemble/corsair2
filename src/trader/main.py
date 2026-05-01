@@ -395,6 +395,35 @@ class Trader:
         bid_size = tick_msg.get("bid_size")
         ask_size = tick_msg.get("ask_size")
 
+        # Cleanup pass 7 (2026-05-01) optimization: hoist the
+        # all-blocking risk gates out of the per-side loop. When
+        # risk_blocks_all is True, BOTH BUY and SELL get blocked
+        # anyway, so running decide_quote twice (Python SVI path,
+        # ~0.5ms each) is pure waste. Saves ~1ms TTT when margin or
+        # delta is bumping a limit. Per-side blocks (buy / sell only)
+        # still need the inner check since one direction may be open.
+        if PLACES_ORDERS and risk_blocks_all:
+            self.decisions_made["risk_block"] += 2  # BUY + SELL counted
+            return
+
+        # Pre-compute theo once per tick (cleanup pass 7). decide_quote
+        # is called twice (BUY + SELL) but theo is side-independent.
+        # Reuse cuts the Python-side SVI compute in half (~0.5ms saved
+        # per tick). For SABR (Rust path) the saving is smaller but
+        # still real (~50us). Both decide_quote() calls below will
+        # accept pre_iv/pre_theo via kwargs.
+        from .quote_decision import compute_theo as _compute_theo
+        try:
+            tte = time_to_expiry_years(expiry)
+        except Exception:
+            tte = None
+        pre_iv = pre_theo = None
+        if tte and tte > 0 and vol_params:
+            res = _compute_theo(decision_forward, float(strike),
+                                tte, right, vol_params)
+            if res is not None:
+                pre_iv, pre_theo = res
+
         for side in ("BUY", "SELL"):
             d = decide_quote(
                 forward=decision_forward,
@@ -403,6 +432,9 @@ class Trader:
                 right=right,
                 side=side,
                 vol_params=vol_params,
+                tte=tte,
+                pre_iv=pre_iv,
+                pre_theo=pre_theo,
                 market_bid=bid,
                 market_ask=ask,
                 market_bid_size=bid_size,
