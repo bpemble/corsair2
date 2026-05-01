@@ -151,10 +151,15 @@ class IBKRConnection:
             _fa_orderid_idx: dict = {}
 
             def _fa_orderKey(clientId_cb, orderId_cb, permId_cb):
-                # Fast path: orderId already resolved — return cached
-                # tuple WITHOUT re-checking wrapper.trades membership.
+                # Fast path: orderId already resolved + cached entry is
+                # valid (still in wrapper.trades). The membership check
+                # IS necessary — pre-population at placeOrder uses
+                # `(_client_id_self, oid)` which differs from the
+                # FA-rewritten key wrapper.trades actually uses. Without
+                # this check we'd return the wrong tuple forever for
+                # FA-routed orders.
                 cached = _fa_orderid_idx.get(orderId_cb)
-                if cached is not None:
+                if cached is not None and cached in ib.wrapper.trades:
                     return cached
                 if orderId_cb <= 0:
                     return _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
@@ -163,24 +168,29 @@ class IBKRConnection:
                 if key in ib.wrapper.trades:
                     _fa_orderid_idx[orderId_cb] = key
                     return key
-                # FA-rewritten case: walk once, cache permanently.
+                # FA-rewritten case: walk to find the trade.
+                # 2026-05-01: capped iteration. With cancel-before-replace
+                # at trader-driven rates (~24 IBKR cmds/sec), wrapper.trades
+                # grows unbounded across the session. py-spy showed
+                # _fa_orderKey at 27% self-time despite the orderId-only
+                # cache — first-sight events on EACH new orderId still walk
+                # the full dict. Capping the walk bounds worst-case TTT
+                # tail at the cost of occasionally missing the right key
+                # for an event from a distant past order; ib_insync silently
+                # drops events whose key it can't find, which is the safe
+                # behavior for terminal/orphan trades anyway.
+                _MAX_WALK = 500
+                walked = 0
                 for existing_key, t in ib.wrapper.trades.items():
+                    walked += 1
+                    if walked > _MAX_WALK:
+                        break
                     if (isinstance(existing_key, tuple)
                             and t.order.orderId == orderId_cb):
                         _fa_orderid_idx[orderId_cb] = existing_key
                         return existing_key
-                # Not in wrapper.trades — orderId is for an order that
-                # was already evicted (terminal cleanup), or one we
-                # didn't place. Cache the rewritten key anyway so we
-                # don't repeat the walk on every late event for this
-                # orderId. Returning a "best-guess" key is safe: if
-                # ib_insync doesn't find the trade under this key, it
-                # ignores the event (which is what we want for stale
-                # orderIds). Caching covers cancel-before-replace's
-                # tail of late status events for cancelled orders.
-                # 2026-05-01 py-spy: this branch was hot at 60% self
-                # because we walked wrapper.trades repeatedly for
-                # orderIds that would never match.
+                # Not found within walk cap — cache rewritten key as
+                # fallback so we don't repeat on every late event.
                 _fa_orderid_idx[orderId_cb] = key
                 return key
 

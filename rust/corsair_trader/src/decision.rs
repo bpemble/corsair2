@@ -172,24 +172,27 @@ pub fn decide_on_tick(
         }
         // Tick-jump (improve on incumbent BBO). When our naive
         // theo±edge target is at or behind the existing best, try
-        // to jump 1 tick ahead — provided this still gives positive
-        // edge vs theo. Without this, when the market spread is
-        // 2 ticks wide and our edge is 2 ticks, we end up AT the
-        // market BBO, never improving and rarely capturing spread.
-        // 2026-05-01 user observation: "tick-jumping not effective".
+        // to jump 1 tick ahead — provided this still gives at least
+        // `edge` (min_edge_ticks * tick_size) edge vs theo.
+        //
+        // Without the edge constraint, jumping into a tight market
+        // compresses our edge to 1 tick or less. User report
+        // 2026-05-01: "edge as low as 0.0005" (1 tick). The fix
+        // preserves the configured min_edge_ticks invariant: never
+        // place a quote with less than `edge` of edge to theo,
+        // whether naive or jumped.
         match side {
             Side::Buy => {
-                // Try to be 1 tick above current bid if possible.
                 let jumped = bid + state.tick_size;
-                // Accept the jump only if it's still below theo
-                // (i.e., we keep some edge — not crossing it).
-                if target < jumped && jumped < theo {
+                // Only jump if naive is at-or-behind incumbent AND
+                // jumping still keeps min_edge_ticks of edge.
+                if target < jumped && (theo - jumped) >= edge {
                     target = jumped;
                 }
             }
             Side::Sell => {
                 let jumped = ask - state.tick_size;
-                if target > jumped && jumped > theo {
+                if target > jumped && (jumped - theo) >= edge {
                     target = jumped;
                 }
             }
