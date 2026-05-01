@@ -280,10 +280,17 @@ class Trader:
             or self.state.vol_surface.get((expiry, "P"))
         )
         vol_params = (vp_msg or {}).get("params")
+        # CRITICAL: use the fit-time forward, not current spot. SVI's
+        # `m` is anchored on log-moneyness relative to the fit forward;
+        # broker's get_theo uses surface.forward (fit-time), so we must
+        # too. Falls back to current spot when no fit yet — decision
+        # would be skipped on no_vol_surface anyway.
+        fit_forward = (vp_msg or {}).get("forward")
+        decision_forward = float(fit_forward) if fit_forward else forward
 
         for side in ("BUY", "SELL"):
             d = decide_quote(
-                forward=forward,
+                forward=decision_forward,
                 strike=float(strike),
                 expiry=expiry,
                 right=right,
@@ -519,9 +526,12 @@ class Trader:
                 vol_params = vp_msg.get("params")
                 if not vol_params:
                     continue
+                # Use fit-time forward (same reasoning as _decide_on_tick)
+                fit_forward = vp_msg.get("forward")
+                eval_forward = float(fit_forward) if fit_forward else forward
                 try:
                     tte = time_to_expiry_years(expiry)
-                    res = compute_theo(forward, strike, tte, right, vol_params)
+                    res = compute_theo(eval_forward, strike, tte, right, vol_params)
                 except Exception:
                     continue
                 if res is None:

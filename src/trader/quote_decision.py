@@ -58,6 +58,19 @@ def compute_theo(
 ) -> Optional[tuple[float, float]]:
     """Compute (iv, theo) for one option given fitted vol params.
 
+    ``forward`` MUST be the fit-time forward (the F that the SVI/SABR
+    parameterization was calibrated against), NOT the current underlying
+    spot. SVI's `m` is in log-moneyness units relative to the fit
+    forward; using a different forward at evaluation time silently
+    reanchors the wing flex point and produces theos that diverge from
+    the broker's (which uses surface.forward in get_theo).
+
+    Live evidence 2026-05-01 ~03:43: trader was passing current spot
+    instead of fit forward; theo at K=5.6 came back as 0.0337 vs
+    broker's 0.0275 at the same instant — a 23% gap on a deep wing put.
+    Caused 28 trader-driven adverse fills with -$3.4K negative edge
+    and ultimately tripped the daily P&L halt at -$33K.
+
     Returns None if inputs are invalid or the surface model is unknown.
     """
     if forward <= 0 or strike <= 0 or tte <= 0:
