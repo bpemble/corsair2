@@ -5,7 +5,7 @@
 //! Returns a `Decision` enum the caller acts on.
 
 use crate::messages::{TickMsg, VolParams};
-use crate::pricing::{black76_price, svi_implied_vol};
+use crate::pricing::{black76_price, sabr_implied_vol, svi_implied_vol};
 use crate::state::{DecisionCounters, OurOrder, TraderState};
 
 // Constants matching Python's src/trader/main.py.
@@ -354,10 +354,15 @@ pub fn compute_theo(
             params.m?,
             params.sigma?,
         ),
-        "sabr" => {
-            // SABR not yet ported. SVI is production.
-            return None;
-        }
+        "sabr" => sabr_implied_vol(
+            forward,
+            strike,
+            tte,
+            params.alpha?,
+            params.beta?,
+            params.rho?,
+            params.nu?,
+        ),
         _ => return None,
     };
     if iv <= 0.0 || iv.is_nan() {

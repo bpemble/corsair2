@@ -14,6 +14,7 @@
 
 mod decision;
 mod ipc;
+mod jsonl;
 mod messages;
 mod pricing;
 mod state;
@@ -92,6 +93,20 @@ async fn main() -> std::io::Result<()> {
     events_ring.open_notify(&events_notify_path, /* as_writer */ false)?;
     commands_ring.open_notify(&commands_notify_path, /* as_writer */ true)?;
     log::warn!("SHM client connected to {} (notify-fifo enabled)", base);
+
+    // JSONL writers — background tasks, hot path enqueues only.
+    let log_dir = std::env::var("CORSAIR_LOGS_DIR")
+        .unwrap_or_else(|_| "/app/logs-paper".into());
+    let events_log = jsonl::JsonlWriter::start(
+        std::path::PathBuf::from(&log_dir),
+        "trader_events",
+    );
+    let decisions_log = jsonl::JsonlWriter::start(
+        std::path::PathBuf::from(&log_dir),
+        "trader_decisions",
+    );
+    let events_log = Arc::new(events_log);
+    let decisions_log = Arc::new(decisions_log);
 
     // Send welcome.
     let welcome = Welcome {
@@ -186,7 +201,10 @@ async fn main() -> std::io::Result<()> {
             let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
             for body in frames {
                 event_count += 1;
-                process_event(&state, &counters, &commands_ring, &body);
+                process_event(
+                    &state, &counters, &commands_ring,
+                    &body, &events_log, &decisions_log,
+                );
             }
             continue;
         }
@@ -223,6 +241,8 @@ fn process_event(
     counters: &Arc<Mutex<DecisionCounters>>,
     commands_ring: &Arc<Mutex<Ring>>,
     body: &[u8],
+    events_log: &Arc<jsonl::JsonlWriter>,
+    decisions_log: &Arc<jsonl::JsonlWriter>,
 ) {
     let recv_wall_ns = now_ns_wall();
     // Decode just the type field first.
@@ -233,6 +253,16 @@ fn process_event(
             return;
         }
     };
+    // Mirror Python's trader_events JSONL schema:
+    // {"recv_ts": ISO, "event": <full msgpack body as a JSON object>}.
+    // Decoded msgpack to serde_json::Value for the log line.
+    if let Ok(event_value) = rmp_serde::from_slice::<serde_json::Value>(body) {
+        let line = serde_json::json!({
+            "recv_ts": chrono::Utc::now().to_rfc3339(),
+            "event": event_value,
+        });
+        events_log.write(line);
+    }
     if let Some(emit_ns) = generic.ts_ns {
         let lat = recv_wall_ns.saturating_sub(emit_ns) / 1000;
         if lat < 5_000_000 {
@@ -256,7 +286,7 @@ fn process_event(
             if tick.ts_ns.is_none() {
                 tick.ts_ns = generic.ts_ns;
             }
-            on_tick(state, counters, commands_ring, &tick);
+            on_tick(state, counters, commands_ring, &tick, decisions_log);
         }
         "underlying_tick" => {
             let ut: UnderlyingTickMsg = match serde_json::from_value(generic.extra.clone()) {
@@ -382,6 +412,7 @@ fn on_tick(
     counters: &Arc<Mutex<DecisionCounters>>,
     commands_ring: &Arc<Mutex<Ring>>,
     tick: &TickMsg,
+    decisions_log: &Arc<jsonl::JsonlWriter>,
 ) {
     let key = (TraderState::strike_key(tick.strike), tick.expiry.clone(), tick.right.clone());
     state.lock().unwrap().options.insert(key, tick.clone());
@@ -392,6 +423,28 @@ fn on_tick(
         let mut c = counters.lock().unwrap();
         decide_on_tick(&mut s, &mut c, tick, now_mono)
     };
+
+    // Log decisions to JSONL — one line per Place outcome (mirrors
+    // Python's per-side decision log; skips counted in telemetry).
+    let recv_ts = chrono::Utc::now().to_rfc3339();
+    for d in &decisions {
+        if let Decision::Place { side, price, cancel_old_oid } = d {
+            decisions_log.write(serde_json::json!({
+                "recv_ts": recv_ts,
+                "trigger_ts_ns": tick.ts_ns,
+                "forward": state.lock().unwrap().underlying_price,
+                "decision": {
+                    "action": "place",
+                    "side": side.as_str(),
+                    "strike": tick.strike,
+                    "expiry": tick.expiry,
+                    "right": tick.right,
+                    "price": price,
+                    "cancel_old_oid": cancel_old_oid,
+                },
+            }));
+        }
+    }
 
     if decisions.is_empty() {
         return;

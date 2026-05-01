@@ -25,6 +25,53 @@ pub fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) ->
     }
 }
 
+/// SABR Hagan (2002) implied vol. Mirror of src/sabr.py:sabr_implied_vol.
+pub fn sabr_implied_vol(
+    f: f64, k: f64, t: f64,
+    alpha: f64, beta: f64, rho: f64, nu: f64,
+) -> f64 {
+    if t <= 0.0 || alpha <= 0.0 || f <= 0.0 || k <= 0.0 {
+        return if alpha > 0.0 { alpha } else { 0.01 };
+    }
+    const EPS: f64 = 1e-7;
+
+    // ATM case.
+    if (f - k).abs() < EPS * f {
+        let fmid = f;
+        let fmid_beta = fmid.powf(1.0 - beta);
+        let term1 = alpha / fmid_beta;
+        let p1 = ((1.0 - beta).powi(2) / 24.0) * alpha * alpha
+            / fmid.powf(2.0 - 2.0 * beta);
+        let p2 = 0.25 * rho * beta * nu * alpha / fmid_beta;
+        let p3 = (2.0 - 3.0 * rho * rho) * nu * nu / 24.0;
+        return term1 * (1.0 + (p1 + p2 + p3) * t);
+    }
+
+    let fk = f * k;
+    let fk_beta = fk.powf((1.0 - beta) / 2.0);
+    let log_fk = (f / k).ln();
+
+    let z = (nu / alpha) * fk_beta * log_fk;
+    let xz = if z.abs() < EPS {
+        1.0
+    } else {
+        let sqrt_term = (1.0 - 2.0 * rho * z + z * z).sqrt();
+        z / ((sqrt_term + z - rho) / (1.0 - rho)).ln()
+    };
+
+    let one_minus_beta = 1.0 - beta;
+    let denom1 = fk_beta
+        * (1.0
+            + one_minus_beta.powi(2) / 24.0 * log_fk.powi(2)
+            + one_minus_beta.powi(4) / 1920.0 * log_fk.powi(4));
+
+    let p1 = one_minus_beta.powi(2) / 24.0 * alpha * alpha / fk.powf(one_minus_beta);
+    let p2 = 0.25 * rho * beta * nu * alpha / fk_beta;
+    let p3 = (2.0 - 3.0 * rho * rho) * nu * nu / 24.0;
+
+    (alpha / denom1) * xz * (1.0 + (p1 + p2 + p3) * t)
+}
+
 /// SVI raw total variance. Mirrors svi_total_variance in src/sabr.py.
 #[inline(always)]
 fn svi_total_variance(k: f64, a: f64, b: f64, rho: f64, m: f64, sigma: f64) -> f64 {
