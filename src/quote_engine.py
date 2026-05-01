@@ -1485,6 +1485,23 @@ class QuoteManager:
                          (self.ib.client.clientId, trade.order.orderId))
         except Exception:
             pass
+        # Capture TTT + arm RTT/fill timers regardless of caller — broker's
+        # quote engine path AND Phase 3 cut-over's _dispatch_place_order
+        # both go through here, so this is the only spot that sees every
+        # placement. Pulls strike/expiry/right from the contract since
+        # the (strike, expiry, right) tuple is what _decision_tick_ns is
+        # keyed by.
+        try:
+            c = contract
+            strike = float(getattr(c, "strike", 0.0) or 0.0)
+            expiry = getattr(c, "lastTradeDateOrContractMonth", "") or ""
+            right = getattr(c, "right", "") or ""
+            if strike and expiry and right:
+                self._record_send_latency(
+                    strike, expiry, right, trade.order.orderId,
+                )
+        except Exception:
+            pass
         return trade
 
     def _try_cancel_order(self, order_obj) -> bool:

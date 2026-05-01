@@ -727,10 +727,31 @@ async def main():
     trader_places_orders = (
         os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1"
     )
+    # Cleanup #4: startup-time config sanity check. The mm_service_split
+    # env vars MUST be propagated through docker-compose's `environment:`
+    # block — host shell exports alone don't reach the container without
+    # a corresponding entry. Surface mis-configured combinations loudly
+    # at boot rather than letting them silently no-op.
+    if trader_places_orders and not is_broker_mode_enabled():
+        logger.critical(
+            "CONFIG ERROR: CORSAIR_TRADER_PLACES_ORDERS=1 set but "
+            "CORSAIR_BROKER_MODE is not — broker won't start IPC server, "
+            "so the trader's place_order commands will hit nothing. "
+            "Set CORSAIR_BROKER_MODE=1 too, or unset the trader flag."
+        )
+    if is_broker_mode_enabled():
+        logger.warning(
+            "mm_service_split flags: BROKER_MODE=%s TRADER_PLACES_ORDERS=%s "
+            "IPC_TRANSPORT=%s",
+            os.environ.get("CORSAIR_BROKER_MODE", ""),
+            os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", ""),
+            os.environ.get("CORSAIR_IPC_TRANSPORT", "socket"),
+        )
     if is_broker_mode_enabled():
         try:
             broker_ipc = BrokerIPC()
             await broker_ipc.start()
+            broker_ipc.set_broker_config(config)
             broker_ipc.attach_to_ib(ib)
             for eng in engines:
                 eng["md"].set_broker_ipc(broker_ipc)

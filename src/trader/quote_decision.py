@@ -161,6 +161,14 @@ def decide(
     base["theo"] = theo
     base["iv"] = iv
 
+    # Require a two-sided market. Same reasoning as the Rust path in
+    # lib.rs:decide_quote — see that comment for the 2026-05-01
+    # incidents (~21 adverse fills) that motivated this guard.
+    bid_live = market_bid is not None and market_bid > 0
+    ask_live = market_ask is not None and market_ask > 0
+    if not bid_live or not ask_live:
+        return {**base, "action": "skip", "reason": "one_sided_or_dark"}
+
     edge = min_edge_ticks * tick_size
 
     if side == "BUY":

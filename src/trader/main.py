@@ -41,12 +41,11 @@ logger = logging.getLogger("corsair.trader")
 EVENTS_LOG_DIR = "/app/logs-paper"
 TELEMETRY_INTERVAL_S = 10.0
 
-# Quote-decision params. Mirror broker config defaults; these would
-# eventually arrive over IPC from the broker (config_snapshot event).
-# v2 ships with hard-coded HG-friendly defaults — Phase 3 will fold in
-# the config sync.
-DECISION_MIN_EDGE_TICKS = 2
-DECISION_TICK_SIZE = 0.0005
+# Default decision params, used until the broker's hello arrives with
+# the real config (mm_service_split cleanup #11). Both processes still
+# work standalone; once connected, broker's config replaces these.
+DEFAULT_MIN_EDGE_TICKS = 2
+DEFAULT_TICK_SIZE = 0.0005
 
 # Phase 3 cut-over: when set, trader doesn't just log decisions — it
 # actually sends place_order/cancel_order commands to the broker.
@@ -63,11 +62,18 @@ class TraderState:
         self.underlying_price: float = 0.0
         # Trader's view of OUR resting orders, keyed by orderId.
         self.active_orders: dict = {}
-        # Most recent vol surface params per expiry.
+        # Most recent vol surface params per (expiry, side). Cleanup
+        # #12 — broker fits surfaces per (expiry, side); we used to
+        # store by expiry only and let last-write-wins between C and P
+        # quietly clobber. Now stored as the broker emits them.
         self.vol_surface: dict = {}
         # Kill state: source -> reason. Empty means quoting allowed.
         self.kills: dict = {}
         self.weekend_paused: bool = False
+        # Decision params from broker hello (cleanup #11). Defaults
+        # cover the brief window between connect and hello arrival.
+        self.min_edge_ticks: int = DEFAULT_MIN_EDGE_TICKS
+        self.tick_size: float = DEFAULT_TICK_SIZE
         # Telemetry
         self.event_counts: Counter = Counter()
         self.ipc_latency_us: deque[int] = deque(maxlen=2000)
@@ -136,8 +142,15 @@ class Trader:
         self.decisions_made: Counter = Counter()
         # Phase 3: track our just-sent place_order requests so the
         # next tick on the same key doesn't churn-amend if the price
-        # didn't change.
+        # didn't change. Cleared on terminal order_ack so a Cancelled
+        # / Filled order doesn't leave the key permanently locked at
+        # a stale price.
         self._our_orders_by_key: dict = {}
+        # orderId → key map for the inverse lookup on order_ack.
+        # Populated when broker's order_ack returns matching orderRef.
+        # Bounded by the number of orders we've ever placed in the
+        # session (cleaned up on terminal status).
+        self._orderid_to_key: dict = {}
 
     async def on_event(self, msg: dict) -> None:
         recv_ns = time.monotonic_ns()
@@ -192,10 +205,18 @@ class Trader:
             return
         if self.state.weekend_paused:
             return
-        vp_msg = self.state.vol_surface.get(expiry)
-        vol_params = (vp_msg or {}).get("params")
+        # Vol surface lookup: prefer the side matching the option's
+        # right (broker fits per (expiry, side); call options use the
+        # call surface, puts use the put surface). Fall back to whichever
+        # side is available during warmup.
         bid = tick_msg.get("bid")
         ask = tick_msg.get("ask")
+        vp_msg = (
+            self.state.vol_surface.get((expiry, right))
+            or self.state.vol_surface.get((expiry, "C"))
+            or self.state.vol_surface.get((expiry, "P"))
+        )
+        vol_params = (vp_msg or {}).get("params")
 
         for side in ("BUY", "SELL"):
             d = decide_quote(
@@ -207,8 +228,8 @@ class Trader:
                 vol_params=vol_params,
                 market_bid=bid,
                 market_ask=ask,
-                min_edge_ticks=DECISION_MIN_EDGE_TICKS,
-                tick_size=DECISION_TICK_SIZE,
+                min_edge_ticks=self.state.min_edge_ticks,
+                tick_size=self.state.tick_size,
             )
             self.decisions_made[d.get("action", "?")] += 1
             self.decision_log.write({
@@ -244,6 +265,7 @@ class Trader:
                 })
                 self._our_orders_by_key[key] = {
                     "price": d["price"], "ts_ns": time.time_ns(),
+                    "orderId": None,  # filled in by first non-terminal order_ack
                 }
 
     def _apply(self, msg: dict) -> None:
@@ -256,16 +278,50 @@ class Trader:
         elif t == "order_ack":
             oid = msg.get("orderId")
             if oid is not None:
-                if msg.get("status") in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                terminal = msg.get("status") in (
+                    "Filled", "Cancelled", "ApiCancelled", "Inactive",
+                )
+                if terminal:
                     self.state.active_orders.pop(oid, None)
+                    # Phase 3 incumbency cleanup: drop the (strike,
+                    # expiry, right, side) → price entry so the next
+                    # tick at that price re-fires a place_order.
+                    # Without this, the trader treats the dead order's
+                    # last price as still resting and skips re-quoting.
+                    key = self._orderid_to_key.pop(oid, None)
+                    if key is not None:
+                        self._our_orders_by_key.pop(key, None)
                 else:
                     self.state.active_orders[oid] = msg
+                    # First non-terminal ack for one of our orders:
+                    # learn its key so we can clean up on terminal.
+                    if (msg.get("orderRef") or "").startswith("corsair_trader") and oid not in self._orderid_to_key:
+                        # Reverse-lookup against last few sent commands.
+                        # We sent {strike, expiry, right, side, price};
+                        # ack carries (orderId, side, lmtPrice, ...).
+                        # Match by side + price (within tick tolerance)
+                        # against _our_orders_by_key entries with no
+                        # orderId yet.
+                        ack_price = float(msg.get("lmtPrice", 0) or 0)
+                        ack_side = msg.get("side", "")
+                        for k, v in list(self._our_orders_by_key.items()):
+                            if v.get("orderId") is not None:
+                                continue
+                            if k[3] != ack_side:
+                                continue
+                            if abs(v["price"] - ack_price) < 1e-6:
+                                v["orderId"] = oid
+                                self._orderid_to_key[oid] = k
+                                break
         elif t == "fill":
             # No state mutation here in Phase 2 — broker handles position
             # bookkeeping. Just log via on_event's caller.
             pass
         elif t == "vol_surface":
-            self.state.vol_surface[msg.get("expiry")] = msg
+            # Cleanup #12: key by (expiry, side) so call+put surfaces
+            # don't clobber each other.
+            key = (msg.get("expiry"), msg.get("side"))
+            self.state.vol_surface[key] = msg
         elif t == "kill":
             self.state.kills[msg.get("source", "?")] = msg.get("reason", "?")
         elif t == "resume":
@@ -277,6 +333,17 @@ class Trader:
             pass
         elif t == "hello":
             logger.warning("broker hello: %s", msg)
+            # Cleanup #11: pull config from the broker rather than
+            # using the hard-coded defaults.
+            cfg = msg.get("config") or {}
+            if "min_edge_ticks" in cfg:
+                self.state.min_edge_ticks = int(cfg["min_edge_ticks"])
+            if "tick_size" in cfg:
+                self.state.tick_size = float(cfg["tick_size"])
+            logger.warning(
+                "trader config from broker: min_edge_ticks=%d tick_size=%g",
+                self.state.min_edge_ticks, self.state.tick_size,
+            )
         else:
             logger.debug("unknown event type: %s", t)
 

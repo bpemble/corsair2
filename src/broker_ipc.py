@@ -232,12 +232,16 @@ class BrokerIPC:
             )
         elif t == "welcome":
             logger.warning("trader welcome: version=%s", msg.get("trader_version"))
-            # Send a hello back with broker state seed (Phase 3 will
-            # include open orders and positions).
+            # Send a hello back with broker state seed: version + config
+            # snapshot the trader needs for its decision logic. Cleanup
+            # #11 — replaces the hard-coded constants in trader/main.py
+            # with values from the broker's authoritative config.
+            cfg = self._build_config_snapshot()
             self.server.publish({
                 "type": "hello",
                 "ts_ns": _ts_ns(),
                 "broker_version": "v1",
+                "config": cfg,
             })
         elif t == "place_order":
             # Phase 3: dispatch to ib.placeOrder when wired. If no
@@ -260,6 +264,32 @@ class BrokerIPC:
                 self._command_log.append(msg)
         elif t == "ping":
             self._command_log.append(msg)
+
+    # ── Config snapshot (sent in hello to trader) ─────────────────────
+    def _build_config_snapshot(self) -> dict:
+        """Pack broker config values that the trader needs into a dict
+        for the welcome→hello handshake. Subset only — fields trader's
+        decision logic actually reads."""
+        cfg = getattr(self, "_broker_config", None)
+        if cfg is None:
+            return {}
+        try:
+            quoting = getattr(cfg, "quoting", object())
+            return {
+                "min_edge_ticks": int(getattr(quoting, "min_edge_ticks", 2)),
+                "tick_size": float(getattr(quoting, "tick_size", 0.0005)),
+                "underlying_symbol": str(getattr(
+                    cfg.product, "underlying_symbol", "HG")),
+                "multiplier": int(getattr(cfg.product, "multiplier", 25000)),
+            }
+        except Exception:
+            logger.debug("config snapshot build failed", exc_info=True)
+            return {}
+
+    def set_broker_config(self, config) -> None:
+        """Stash a reference to the live config so welcome→hello can
+        pack it. Set once at boot from main.py."""
+        self._broker_config = config
 
 
 def _safe_float(x):

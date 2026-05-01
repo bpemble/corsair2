@@ -274,6 +274,31 @@ fn decide_quote(
     dict.set_item("iv", iv)?;
     dict.set_item("theo", theo)?;
 
+    // CRITICAL: require a TWO-SIDED market before quoting.
+    //
+    // Option markets at thin strikes (deep ITM/OTM) often have only
+    // one side displayed. If we BUY at theo-edge into a one-sided
+    // ask-only market, our limit can become the SOLE bid in the
+    // book — when an MM later dumps inventory, our order fills at
+    // an unfavorable price even though the snapshot we acted on
+    // looked sane. 21 trader-driven fills on 2026-05-01 (01:26 +
+    // 01:43) had this exact shape: BUY HXEM6 deep ITM puts at theo
+    // prices, then market thinned, fills landed at bid=0/ask=0
+    // states with edge -$300 to -$850 each.
+    //
+    // Stricter rule: BOTH bid AND ask must be live before placing
+    // either side. This eliminates one-sided liquidity traps at
+    // the cost of missing some quoting opportunities at the wings.
+    // Acceptable trade-off — the wings weren't giving us positive
+    // edge anyway.
+    let bid_live = market_bid.map(|b| b > 0.0).unwrap_or(false);
+    let ask_live = market_ask.map(|a| a > 0.0).unwrap_or(false);
+    if !bid_live || !ask_live {
+        dict.set_item("action", "skip")?;
+        dict.set_item("reason", "one_sided_or_dark")?;
+        return Ok(dict.into());
+    }
+
     let edge = (min_edge_ticks as f64) * tick_size;
 
     let result = match side {
