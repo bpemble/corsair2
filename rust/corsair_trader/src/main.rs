@@ -1,0 +1,489 @@
+//! Corsair trader binary — Rust port of src/trader/main.py.
+//!
+//! Connects to broker via SHM IPC (events ring + commands ring +
+//! notification FIFOs), processes ticks, makes quote decisions, and
+//! sends place_order / cancel_order commands.
+//!
+//! Hot path is single-threaded; tokio is used for concurrent
+//! background tasks (telemetry, staleness loop, FIFO read polling).
+//!
+//! Env vars:
+//!   CORSAIR_TRADER_PLACES_ORDERS=1    actually send place_orders
+//!   CORSAIR_IPC_TRANSPORT=shm         must be shm (we don't support socket)
+//!   CORSAIR_LOG_LEVEL=info|debug|...
+
+mod decision;
+mod ipc;
+mod messages;
+mod pricing;
+mod state;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::decision::{decide_on_tick, Decision};
+use crate::ipc::shm::{wait_for_rings, Ring, DEFAULT_RING_CAPACITY};
+use crate::messages::*;
+use crate::state::{DecisionCounters, OurOrder, TraderState};
+
+const VERSION: &str = "rust-v1";
+
+fn now_ns_wall() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn now_ns_monotonic() -> u64 {
+    use std::time::Instant;
+    static mut START: Option<Instant> = None;
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe { START = Some(Instant::now()) });
+    let start = unsafe { START.unwrap() };
+    Instant::now().duration_since(start).as_nanos() as u64
+}
+
+fn places_orders() -> bool {
+    std::env::var("CORSAIR_TRADER_PLACES_ORDERS")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> std::io::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
+    log::warn!("corsair_trader (Rust) {} starting", VERSION);
+
+    let transport = std::env::var("CORSAIR_IPC_TRANSPORT")
+        .unwrap_or_else(|_| "shm".into());
+    if transport != "shm" {
+        log::error!(
+            "corsair_trader (Rust) only supports CORSAIR_IPC_TRANSPORT=shm, got {}",
+            transport
+        );
+        std::process::exit(2);
+    }
+
+    let base = std::env::var("CORSAIR_IPC_BASE")
+        .unwrap_or_else(|_| "/app/data/corsair_ipc".into());
+    let events_path = PathBuf::from(format!("{}.events", base));
+    let commands_path = PathBuf::from(format!("{}.commands", base));
+    let events_notify_path = PathBuf::from(format!("{}.events.notify", base));
+    let commands_notify_path = PathBuf::from(format!("{}.commands.notify", base));
+
+    log::info!("Waiting for broker SHM rings at {}...", base);
+    wait_for_rings(&base).await?;
+    log::warn!("SHM rings present; opening");
+
+    let mut events_ring = Ring::open(&events_path, DEFAULT_RING_CAPACITY)?;
+    let mut commands_ring = Ring::open(&commands_path, DEFAULT_RING_CAPACITY)?;
+    // Wait for FIFO files (broker creates them when it opens rings).
+    for _ in 0..50 {
+        if events_notify_path.exists() && commands_notify_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    events_ring.open_notify(&events_notify_path, /* as_writer */ false)?;
+    commands_ring.open_notify(&commands_notify_path, /* as_writer */ true)?;
+    log::warn!("SHM client connected to {} (notify-fifo enabled)", base);
+
+    // Send welcome.
+    let welcome = Welcome {
+        msg_type: "welcome",
+        ts_ns: now_ns_wall(),
+        trader_version: VERSION,
+    };
+    let body = rmp_serde::to_vec_named(&welcome).expect("welcome encode");
+    let frame = ipc::protocol::pack_frame(&body);
+    if !commands_ring.write_frame(&frame) {
+        log::error!("welcome write_frame failed (commands ring full?)");
+    }
+
+    // Shared state behind a mutex; hot path is single-thread but
+    // background tasks (telemetry, staleness) need access.
+    let state = Arc::new(Mutex::new(TraderState::new()));
+    let counters = Arc::new(Mutex::new(DecisionCounters::default()));
+    let events_ring = Arc::new(Mutex::new(events_ring));
+    let commands_ring = Arc::new(Mutex::new(commands_ring));
+
+    // Spawn telemetry loop (10s cadence).
+    {
+        let state = Arc::clone(&state);
+        let counters = Arc::clone(&counters);
+        let commands_ring = Arc::clone(&commands_ring);
+        tokio::spawn(async move {
+            let mut total_events: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let (tel, n_events) = build_telemetry(&state, &counters, &mut total_events);
+                let body = match rmp_serde::to_vec_named(&tel) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("telemetry encode failed: {}", e);
+                        continue;
+                    }
+                };
+                let frame = ipc::protocol::pack_frame(&body);
+                let mut ring = commands_ring.lock().unwrap();
+                ring.write_frame(&frame);
+                drop(ring);
+                log::info!(
+                    "telemetry: events={} ipc_p50={:?} ipc_p99={:?} ttt_p50={:?} ttt_p99={:?} \
+                     opts={} orders={} decisions={}",
+                    n_events,
+                    tel.ipc_p50_us,
+                    tel.ipc_p99_us,
+                    tel.ttt_p50_us,
+                    tel.ttt_p99_us,
+                    tel.n_options,
+                    tel.n_active_orders,
+                    tel.decisions,
+                );
+            }
+        });
+    }
+
+    // Hot loop: tight read of events ring + decision dispatch.
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut event_count: u64 = 0;
+
+    // Set up async wake-up via the events FIFO.
+    use tokio::io::unix::AsyncFd;
+    let evt_fifo_fd = events_ring.lock().unwrap().notify_r_fd().expect("events fifo");
+    let evt_async_fd = AsyncFd::new(EvtFd(evt_fifo_fd))?;
+
+    loop {
+        // Drain ring.
+        let chunk = events_ring.lock().unwrap().read_available();
+        if !chunk.is_empty() {
+            buf.extend_from_slice(&chunk);
+            let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
+            for body in frames {
+                event_count += 1;
+                process_event(&state, &counters, &commands_ring, &body);
+            }
+            continue;
+        }
+        // Drain FIFO bytes (coalesce notifications).
+        events_ring.lock().unwrap().drain_notify();
+
+        // Wait for next notification or 100ms timeout.
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            evt_async_fd.readable(),
+        )
+        .await
+        {
+            Ok(Ok(mut guard)) => {
+                guard.clear_ready();
+            }
+            _ => {
+                // timeout or error — fall through to the polling re-read
+            }
+        }
+    }
+}
+
+/// Newtype wrapper so AsyncFd can take a RawFd.
+struct EvtFd(std::os::fd::RawFd);
+impl std::os::fd::AsRawFd for EvtFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+fn process_event(
+    state: &Arc<Mutex<TraderState>>,
+    counters: &Arc<Mutex<DecisionCounters>>,
+    commands_ring: &Arc<Mutex<Ring>>,
+    body: &[u8],
+) {
+    let recv_wall_ns = now_ns_wall();
+    // Decode just the type field first.
+    let generic: GenericMsg = match rmp_serde::from_slice(body) {
+        Ok(g) => g,
+        Err(e) => {
+            log::debug!("malformed msg, ignoring: {}", e);
+            return;
+        }
+    };
+    if let Some(emit_ns) = generic.ts_ns {
+        let lat = recv_wall_ns.saturating_sub(emit_ns) / 1000;
+        if lat < 5_000_000 {
+            let mut s = state.lock().unwrap();
+            s.ipc_us.push_back(lat);
+            if s.ipc_us.len() > 2000 {
+                s.ipc_us.pop_front();
+            }
+        }
+    }
+
+    match generic.msg_type.as_str() {
+        "tick" => {
+            let mut tick: TickMsg = match serde_json::from_value(generic.extra.clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            // ts_ns lives at the outer-message level in the wire format
+            // (broker_ipc.py emits it there); copy it down so on_tick's
+            // TTT computation has the broker's emit timestamp.
+            if tick.ts_ns.is_none() {
+                tick.ts_ns = generic.ts_ns;
+            }
+            on_tick(state, counters, commands_ring, &tick);
+        }
+        "underlying_tick" => {
+            let ut: UnderlyingTickMsg = match serde_json::from_value(generic.extra.clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            state.lock().unwrap().underlying_price = ut.price;
+        }
+        "vol_surface" => {
+            let vs: VolSurfaceMsg = match serde_json::from_value(generic.extra.clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            state.lock().unwrap().vol_surfaces.insert(
+                (vs.expiry.clone(), vs.side.clone()),
+                crate::state::VolSurfaceEntry {
+                    forward: vs.forward,
+                    params: vs.params,
+                },
+            );
+        }
+        "risk_state" => {
+            let r: RiskStateMsg = match serde_json::from_value(generic.extra.clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let mut s = state.lock().unwrap();
+            s.risk_effective_delta = Some(r.effective_delta);
+            s.risk_margin_pct = Some(r.margin_pct);
+            s.risk_state_age_monotonic_ns = now_ns_monotonic();
+        }
+        "place_ack" => {
+            let p: PlaceAckMsg = match serde_json::from_value(generic.extra.clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let key = (
+                TraderState::strike_key(p.strike),
+                p.expiry.clone(),
+                p.right.clone(),
+                p.side.clone(),
+            );
+            let mut s = state.lock().unwrap();
+            if let Some(o) = s.our_orders.get_mut(&key) {
+                o.order_id = Some(p.order_id);
+            } else {
+                s.our_orders.insert(
+                    key.clone(),
+                    OurOrder {
+                        price: p.price,
+                        send_ns: now_ns_wall(),
+                        place_monotonic_ns: now_ns_monotonic(),
+                        order_id: Some(p.order_id),
+                    },
+                );
+            }
+            s.orderid_to_key.insert(p.order_id, key);
+        }
+        "order_ack" => {
+            let a: OrderAckMsg = match serde_json::from_value(generic.extra.clone()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let oid = match a.order_id {
+                Some(o) => o,
+                None => return,
+            };
+            let status = a.status.unwrap_or_default();
+            let terminal = matches!(status.as_str(), "Filled" | "Cancelled" | "ApiCancelled" | "Inactive");
+            if terminal {
+                let mut s = state.lock().unwrap();
+                if let Some(key) = s.orderid_to_key.remove(&oid) {
+                    s.our_orders.remove(&key);
+                }
+            }
+        }
+        "kill" => {
+            let extra = &generic.extra;
+            let src = extra.get("source").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let reason = extra.get("reason").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            state.lock().unwrap().kills.insert(src, reason);
+        }
+        "resume" => {
+            let extra = &generic.extra;
+            let src = extra.get("source").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            state.lock().unwrap().kills.remove(&src);
+        }
+        "weekend_pause" => {
+            let extra = &generic.extra;
+            let paused = extra.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+            state.lock().unwrap().weekend_paused = paused;
+        }
+        "hello" => {
+            let extra = &generic.extra;
+            log::warn!("broker hello: {}", extra);
+            if let Some(cfg) = extra.get("config").and_then(|v| v.as_object()) {
+                let mut s = state.lock().unwrap();
+                if let Some(v) = cfg.get("min_edge_ticks").and_then(|x| x.as_i64()) {
+                    s.min_edge_ticks = v as i32;
+                }
+                if let Some(v) = cfg.get("tick_size").and_then(|x| x.as_f64()) {
+                    s.tick_size = v;
+                }
+                if let Some(v) = cfg.get("delta_ceiling").and_then(|x| x.as_f64()) {
+                    s.delta_ceiling = v;
+                }
+                if let Some(v) = cfg.get("delta_kill").and_then(|x| x.as_f64()) {
+                    s.delta_kill = v;
+                }
+                if let Some(v) = cfg.get("margin_ceiling_pct").and_then(|x| x.as_f64()) {
+                    s.margin_ceiling_pct = v;
+                }
+            }
+        }
+        _ => {
+            // Unknown / not-yet-handled type — ignore.
+        }
+    }
+}
+
+fn on_tick(
+    state: &Arc<Mutex<TraderState>>,
+    counters: &Arc<Mutex<DecisionCounters>>,
+    commands_ring: &Arc<Mutex<Ring>>,
+    tick: &TickMsg,
+) {
+    let key = (TraderState::strike_key(tick.strike), tick.expiry.clone(), tick.right.clone());
+    state.lock().unwrap().options.insert(key, tick.clone());
+
+    let now_mono = now_ns_monotonic();
+    let decisions = {
+        let mut s = state.lock().unwrap();
+        let mut c = counters.lock().unwrap();
+        decide_on_tick(&mut s, &mut c, tick, now_mono)
+    };
+
+    if decisions.is_empty() {
+        return;
+    }
+
+    if !places_orders() {
+        // Phase 2 mode: log decisions but don't send orders.
+        return;
+    }
+
+    let send_ns = now_ns_wall();
+    if let Some(emit_ns) = tick.ts_ns {
+        let lat = send_ns.saturating_sub(emit_ns) / 1000;
+        if lat < 5_000_000 {
+            let mut s = state.lock().unwrap();
+            s.ttt_us.push_back(lat);
+            if s.ttt_us.len() > 500 {
+                s.ttt_us.pop_front();
+            }
+        }
+    }
+
+    for d in decisions {
+        if let Decision::Place { side, price, cancel_old_oid } = d {
+            // Send cancel first if needed.
+            if let Some(oid) = cancel_old_oid {
+                let cancel = CancelOrder {
+                    msg_type: "cancel_order",
+                    ts_ns: now_ns_wall(),
+                    order_id: oid,
+                };
+                if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+                    let frame = ipc::protocol::pack_frame(&body);
+                    commands_ring.lock().unwrap().write_frame(&frame);
+                }
+                let mut s = state.lock().unwrap();
+                s.orderid_to_key.remove(&oid);
+            }
+            let p = PlaceOrder {
+                msg_type: "place_order",
+                ts_ns: send_ns,
+                strike: tick.strike,
+                expiry: tick.expiry.clone(),
+                right: tick.right.clone(),
+                side: side.as_str().to_string(),
+                qty: 1,
+                price,
+                order_ref: "corsair_trader_rust".into(),
+            };
+            let body = match rmp_serde::to_vec_named(&p) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let frame = ipc::protocol::pack_frame(&body);
+            commands_ring.lock().unwrap().write_frame(&frame);
+            // Update local incumbency tracking.
+            let okey = (
+                TraderState::strike_key(tick.strike),
+                tick.expiry.clone(),
+                tick.right.clone(),
+                side.as_str().to_string(),
+            );
+            let mut s = state.lock().unwrap();
+            s.our_orders.insert(okey, OurOrder {
+                price,
+                send_ns,
+                place_monotonic_ns: now_mono,
+                order_id: None,
+            });
+        }
+    }
+}
+
+fn build_telemetry(
+    state: &Arc<Mutex<TraderState>>,
+    counters: &Arc<Mutex<DecisionCounters>>,
+    total_events_running: &mut u64,
+) -> (Telemetry, u64) {
+    let s = state.lock().unwrap();
+    let c = counters.lock().unwrap();
+    let mut ipc_sorted: Vec<u64> = s.ipc_us.iter().copied().collect();
+    ipc_sorted.sort_unstable();
+    let mut ttt_sorted: Vec<u64> = s.ttt_us.iter().copied().collect();
+    ttt_sorted.sort_unstable();
+    let pct = |v: &[u64], q: f64| -> Option<u64> {
+        if v.is_empty() {
+            None
+        } else {
+            let idx = ((v.len() as f64) * q) as usize;
+            Some(v[idx.min(v.len() - 1)])
+        }
+    };
+    let n_events = s.options.len() as u64; // approx; real count in process loop
+    *total_events_running += n_events;
+    (
+        Telemetry {
+            msg_type: "telemetry",
+            ts_ns: now_ns_wall(),
+            events: serde_json::json!({}),
+            decisions: c.to_json(),
+            ipc_p50_us: pct(&ipc_sorted, 0.50),
+            ipc_p99_us: pct(&ipc_sorted, 0.99),
+            ipc_n: ipc_sorted.len(),
+            ttt_p50_us: pct(&ttt_sorted, 0.50),
+            ttt_p99_us: pct(&ttt_sorted, 0.99),
+            ttt_n: ttt_sorted.len(),
+            n_options: s.options.len(),
+            n_active_orders: s.our_orders.len(),
+            n_vol_expiries: s.vol_surfaces.len(),
+            killed: s.kills.keys().cloned().collect(),
+            weekend_paused: s.weekend_paused,
+        },
+        *total_events_running,
+    )
+}

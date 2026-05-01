@@ -1,0 +1,357 @@
+//! Decision flow — port of Python's `_decide_on_tick` in
+//! src/trader/main.py. Single function, all gates inline for cache
+//! friendliness.
+//!
+//! Returns a `Decision` enum the caller acts on.
+
+use crate::messages::{TickMsg, VolParams};
+use crate::pricing::{black76_price, svi_implied_vol};
+use crate::state::{DecisionCounters, OurOrder, TraderState};
+
+// Constants matching Python's src/trader/main.py.
+pub const MAX_STRIKE_OFFSET_USD: f64 = 0.30;
+pub const STALENESS_INTERVAL_SECS: f64 = 0.10;
+pub const STALENESS_TICKS: i32 = 1;
+pub const COOLDOWN_NS: u64 = 250_000_000; // 250ms
+pub const DEAD_BAND_TICKS: i32 = 1;
+pub const GTD_LIFETIME_S: f64 = 5.0;
+pub const GTD_REFRESH_LEAD_S: f64 = 1.5;
+pub const RISK_STATE_STALE_S: f64 = 5.0;
+pub const MIN_BBO_SIZE: i32 = 1;
+pub const MAX_FORWARD_DRIFT_TICKS: i32 = 200;
+pub const ATM_TOL_USD: f64 = 0.025; // half-strike tolerance for OTM-only
+pub const CANCEL_THRESHOLD_S: f64 = 1.0; // skip cancel-before-replace if GTD imminent
+
+#[derive(Debug)]
+pub enum Decision {
+    /// No action; reason already counted in DecisionCounters.
+    Skip,
+    /// Send place_order at this price for this side. If `cancel_old_oid`
+    /// is Some, send a cancel_order first.
+    Place {
+        side: Side,
+        price: f64,
+        cancel_old_oid: Option<i64>,
+    },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        }
+    }
+}
+
+/// Top-level decision entry point. Mirrors `_decide_on_tick` flow
+/// in Python. Returns a Vec because each tick produces up to 2
+/// decisions (BUY + SELL).
+pub fn decide_on_tick(
+    state: &mut TraderState,
+    counters: &mut DecisionCounters,
+    tick: &TickMsg,
+    now_monotonic_ns: u64,
+) -> Vec<Decision> {
+    let mut out = Vec::with_capacity(2);
+    let forward = state.underlying_price;
+    if forward <= 0.0 {
+        return out;
+    }
+    let strike = tick.strike;
+    let expiry = &tick.expiry;
+    let right = &tick.right;
+
+    // Don't quote into a halt
+    if !state.kills.is_empty() {
+        return out;
+    }
+    if state.weekend_paused {
+        return out;
+    }
+
+    // Compute risk-gate values once per tick.
+    let (risk_buy, risk_sell, risk_all) = compute_risk_gates(state, now_monotonic_ns);
+
+    // ATM-window restriction.
+    if (strike - forward).abs() > MAX_STRIKE_OFFSET_USD {
+        counters.skip_off_atm += 1;
+        return out;
+    }
+
+    // OTM-only restriction (CLAUDE.md §12).
+    let r_upper = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    if r_upper == 'C' && strike < forward - ATM_TOL_USD {
+        counters.skip_itm += 1;
+        return out;
+    }
+    if r_upper == 'P' && strike > forward + ATM_TOL_USD {
+        counters.skip_itm += 1;
+        return out;
+    }
+
+    // All-blocking risk gate hoisted before per-side loop.
+    if risk_all {
+        counters.risk_block += 2;
+        return out;
+    }
+
+    // Vol surface lookup: try (expiry, right) then either side.
+    let vp_msg = state
+        .vol_surfaces
+        .get(&(expiry.clone(), right.clone()))
+        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), "C".to_string())))
+        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), "P".to_string())));
+    let vp_msg = match vp_msg {
+        Some(v) => v.clone(),
+        None => {
+            counters.skip_no_vol_surface += 1;
+            return out;
+        }
+    };
+
+    let fit_forward = vp_msg.forward;
+    let tte = match time_to_expiry_years(expiry) {
+        Some(t) if t > 0.0 => t,
+        _ => return out,
+    };
+
+    // Forward-drift guard.
+    let drift = (forward - fit_forward).abs();
+    let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * state.tick_size;
+    if drift > max_drift {
+        counters.skip_forward_drift += 1;
+        return out;
+    }
+
+    // Pre-compute theo once per tick (side-independent).
+    let (iv, theo) = match compute_theo(fit_forward, strike, tte, &vp_msg.params) {
+        Some(v) => v,
+        None => {
+            counters.skip_other += 1;
+            return out;
+        }
+    };
+
+    // Bid/ask + sizes for the dark-book guards.
+    let bid = tick.bid.unwrap_or(0.0);
+    let ask = tick.ask.unwrap_or(0.0);
+    let bid_size = tick.bid_size.unwrap_or(0);
+    let ask_size = tick.ask_size.unwrap_or(0);
+
+    // Two-sided market check.
+    if bid <= 0.0 || ask <= 0.0 {
+        counters.skip_one_sided_or_dark += 2;
+        return out;
+    }
+    // Min BBO size check.
+    if bid_size < MIN_BBO_SIZE || ask_size < MIN_BBO_SIZE {
+        counters.skip_thin_book += 2;
+        return out;
+    }
+
+    let edge = state.min_edge_ticks as f64 * state.tick_size;
+
+    for side in [Side::Buy, Side::Sell] {
+        let target = match side {
+            Side::Buy => theo - edge,
+            Side::Sell => theo + edge,
+        };
+        if target <= 0.0 {
+            counters.skip_target_nonpositive += 1;
+            continue;
+        }
+        // Cross-protect: don't cross existing best on the opposite side.
+        match side {
+            Side::Buy => {
+                if target >= ask {
+                    counters.skip_would_cross_ask += 1;
+                    continue;
+                }
+            }
+            Side::Sell => {
+                if target <= bid {
+                    counters.skip_would_cross_bid += 1;
+                    continue;
+                }
+            }
+        }
+        // Quantize to tick.
+        let target_q =
+            (target / state.tick_size).round() * state.tick_size;
+        let target_q = (target_q * 10000.0).round() / 10000.0; // 4dp clean
+
+        // Per-side risk gate.
+        match side {
+            Side::Buy if risk_buy => {
+                counters.risk_block_buy += 1;
+                continue;
+            }
+            Side::Sell if risk_sell => {
+                counters.risk_block_sell += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let key = (
+            TraderState::strike_key(strike),
+            expiry.clone(),
+            right.clone(),
+            side.as_str().to_string(),
+        );
+
+        // Dead-band + GTD-refresh check.
+        let existing = state.our_orders.get(&key).cloned();
+        if let Some(ref ex) = existing {
+            let age_s = (now_monotonic_ns - ex.place_monotonic_ns) as f64 / 1e9;
+            let in_band = (target_q - ex.price).abs()
+                < DEAD_BAND_TICKS as f64 * state.tick_size;
+            let needs_gtd_refresh = age_s > (GTD_LIFETIME_S - GTD_REFRESH_LEAD_S);
+            if in_band && !needs_gtd_refresh {
+                counters.skip_in_band += 1;
+                continue;
+            }
+            // Cooldown floor.
+            if (now_monotonic_ns - ex.place_monotonic_ns) < COOLDOWN_NS {
+                counters.skip_cooldown += 1;
+                continue;
+            }
+        }
+
+        // Dark-book ON-PLACE re-check (latest tick state).
+        // Trivially the SAME tick state since we're acting on this tick;
+        // but kept for parity with Python where _decide_on_tick may
+        // process a tick AFTER newer ticks have been queued. In the
+        // single-thread Rust version they're identical, so skip the
+        // duplicate check.
+
+        // Cancel-before-replace: only if old order has substantial GTD left.
+        let cancel_old_oid = match &existing {
+            Some(ex) => {
+                let age_s = (now_monotonic_ns - ex.place_monotonic_ns) as f64 / 1e9;
+                let gtd_remaining = GTD_LIFETIME_S - age_s;
+                if gtd_remaining > CANCEL_THRESHOLD_S {
+                    if let Some(oid) = ex.order_id {
+                        counters.replace_cancel += 1;
+                        Some(oid)
+                    } else {
+                        None
+                    }
+                } else {
+                    if ex.order_id.is_some() {
+                        counters.replace_skip_cancel_near_gtd += 1;
+                    }
+                    None
+                }
+            }
+            None => None,
+        };
+
+        out.push(Decision::Place {
+            side,
+            price: target_q,
+            cancel_old_oid,
+        });
+        counters.place += 1;
+    }
+    out
+}
+
+/// Risk gates — return (buy_blocked, sell_blocked, all_blocked).
+/// Mirrors the Python check in _decide_on_tick.
+pub fn compute_risk_gates(state: &TraderState, now_monotonic_ns: u64) -> (bool, bool, bool) {
+    let eff = state.risk_effective_delta;
+    let age_s = if state.risk_state_age_monotonic_ns > 0 {
+        (now_monotonic_ns - state.risk_state_age_monotonic_ns) as f64 / 1e9
+    } else {
+        f64::INFINITY
+    };
+    if eff.is_none() || age_s > RISK_STATE_STALE_S {
+        return (false, false, true); // risk_all
+    }
+    let eff = eff.unwrap();
+    let mut buy = false;
+    let mut sell = false;
+    let mut all = false;
+    if eff + 1.0 >= state.delta_ceiling {
+        buy = true;
+    }
+    if eff - 1.0 <= -state.delta_ceiling {
+        sell = true;
+    }
+    if eff.abs() >= state.delta_kill - 1.0 {
+        all = true;
+    }
+    if let Some(margin_pct) = state.risk_margin_pct {
+        if margin_pct >= state.margin_ceiling_pct {
+            all = true;
+        }
+    }
+    (buy, sell, all)
+}
+
+/// Compute theo via SVI (or future SABR). Returns (iv, theo) or None.
+pub fn compute_theo(
+    forward: f64,
+    strike: f64,
+    tte: f64,
+    params: &VolParams,
+) -> Option<(f64, f64)> {
+    if forward <= 0.0 || strike <= 0.0 || tte <= 0.0 {
+        return None;
+    }
+    let iv = match params.model.as_str() {
+        "svi" => svi_implied_vol(
+            forward,
+            strike,
+            tte,
+            params.a?,
+            params.b?,
+            params.rho?,
+            params.m?,
+            params.sigma?,
+        ),
+        "sabr" => {
+            // SABR not yet ported into this binary's pricing module.
+            // The broker only ever fits SVI in production today; SABR
+            // path is used for tests. Punt: return None to skip.
+            return None;
+        }
+        _ => return None,
+    };
+    if iv <= 0.0 || iv.is_nan() {
+        return None;
+    }
+    let theo = black76_price(forward, strike, tte, iv, 0.0, 'C'); // right doesn't matter; same vol
+    if theo <= 0.0 {
+        return None;
+    }
+    Some((iv, theo))
+}
+
+/// Convert a YYYYMMDD expiry string to time-to-expiry in years.
+/// 16:00 CT = 21:00 UTC settlement. Mirrors Python's
+/// `time_to_expiry_years` in src/sabr.py.
+pub fn time_to_expiry_years(expiry: &str) -> Option<f64> {
+    if expiry.len() != 8 {
+        return None;
+    }
+    let year: i32 = expiry[0..4].parse().ok()?;
+    let month: u32 = expiry[4..6].parse().ok()?;
+    let day: u32 = expiry[6..8].parse().ok()?;
+    let exp_dt = chrono::Utc
+        .with_ymd_and_hms(year, month, day, 21, 0, 0)
+        .single()?;
+    let now = chrono::Utc::now();
+    let secs = (exp_dt - now).num_seconds() as f64;
+    Some(secs / (365.0 * 24.0 * 3600.0))
+}
+
+use chrono::TimeZone;

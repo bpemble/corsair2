@@ -147,10 +147,20 @@ services:
       # in the trader (default uses the Rust corsair_pricing.decide_quote
       # for SABR; SVI always falls through to Python).
       CORSAIR_TRADER_BACKEND: "${CORSAIR_TRADER_BACKEND:-}"
+      # Cleanup pass 11, 2026-05-01: select trader binary at runtime.
+      # CORSAIR_TRADER_LANG=rust → /usr/local/bin/corsair_trader_rust.
+      # Default ("python") uses src/trader/main.py.
+      # Rust trader requires CORSAIR_IPC_TRANSPORT=shm.
+      CORSAIR_TRADER_LANG: "${CORSAIR_TRADER_LANG:-python}"
     volumes:
       - ./logs-paper:/app/logs-paper      # event JSONL output
       - ./data:/app/data                  # IPC socket lives here
-    command: ["python3", "-m", "src.trader.main"]
+    command: ["sh", "-c",
+              "if [ \"$$CORSAIR_TRADER_LANG\" = rust ]; then \
+                  exec /usr/local/bin/corsair_trader_rust; \
+               else \
+                  exec python3 -m src.trader.main; \
+               fi"]
     restart: unless-stopped
 
 volumes:
