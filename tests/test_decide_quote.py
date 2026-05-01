@@ -132,11 +132,11 @@ def test_cross_protect_sell():
     assert d["reason"] == "would_cross_bid"
 
 
-def test_svi_falls_through_to_python():
-    """When vol_params model is SVI, Rust returns 'model_not_in_rust'
-    and decide() retries via Python. Python doesn't yet support SVI in
-    this decision module either, so result is a skip with the Python
-    reason — we just want to confirm we don't crash."""
+def test_svi_uses_rust_path():
+    """As of the SVI Rust port, decide_quote runs SVI fully in Rust.
+    Outdated docstring previously said this falls through to Python;
+    that's no longer true. Verifies the SVI path returns well-formed
+    decisions without crash and at parity with Python."""
     vp = {"model": "svi", "a": 0.01, "b": 0.05, "rho": -0.5,
           "m": 0.0, "sigma": 0.1}
     d = decide(
@@ -145,10 +145,9 @@ def test_svi_falls_through_to_python():
         market_bid=0.1, market_ask=0.12,
         min_edge_ticks=2, tick_size=0.0005, tte=0.5,
     )
-    # Python path uses svi_implied_vol from sabr.py → returns a real
-    # IV; decision is well-formed.
     assert d["action"] in ("place", "skip")
     assert "side" in d and "strike" in d
+    assert d.get("reason") != "model_not_in_rust"  # Rust now handles SVI
 
 
 def test_unknown_side_skips():

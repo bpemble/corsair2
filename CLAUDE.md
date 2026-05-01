@@ -687,3 +687,115 @@ for tuning:
 `risk_block` rate means margin or delta is near a limit — operator
 should investigate. High `staleness_cancel_dark` rate means liquidity
 is thin; consider tightening `MIN_BBO_SIZE`.
+
+## 17. Rust trader binary (cleanup pass 7-onwards, 2026-05-01)
+
+Full Rust port of `src/trader/main.py` lives at
+`rust/corsair_trader/`. The Python trader still works; the Rust
+binary is selected at runtime via env var.
+
+### What it is
+
+A 9.8 MB native binary baked into the corsair docker image at
+`/usr/local/bin/corsair_trader_rust`. Same protocol on the wire
+(msgpack frames over SHM rings + FIFO notify), same env-var
+conventions, same JSONL output format. Drop-in replacement for the
+Python trader.
+
+Feature parity: full 6-layer safety stack, dead-band, GTD-refresh,
+cancel-before-replace + skip-near-GTD, tick-jumping with edge
+constraint, staleness loop with dark-book on-rest guard, all 6
+decision counters, place_ack handling, kill/resume, JSONL streams
+(trader_events + trader_decisions, 256 MB rotation), uvloop-
+equivalent (tokio multi-thread). SVI + SABR pricing via the
+existing `corsair_pricing` Rust crate (Hagan SABR + SVI implied
+vol + Black76).
+
+### How to run
+
+Selection is at runtime via `CORSAIR_TRADER_LANG`:
+
+```bash
+# Python trader (default — backward compat)
+CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
+    CORSAIR_IPC_TRANSPORT=shm \
+    docker compose --profile broker-split up -d --force-recreate trader
+
+# Rust trader (recommended — faster hot path)
+CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
+    CORSAIR_IPC_TRANSPORT=shm CORSAIR_TRADER_LANG=rust \
+    docker compose --profile broker-split up -d --force-recreate trader
+```
+
+The Rust trader **requires** `CORSAIR_IPC_TRANSPORT=shm` — it does
+not implement the legacy Unix-socket transport. Hard exit otherwise.
+
+### Latency improvement vs Python trader
+
+Measured 2026-05-01 in steady-state cut-over:
+
+| Metric | Python trader | Rust trader | Δ |
+|---|---|---|---|
+| TTT p50 | ~380 μs | ~50 μs | 7.6× |
+| TTT p99 | ~5.6 ms | ~1-3 ms | 2-5× |
+| IPC p50 | ~110 μs | ~80 μs | 1.4× |
+| Compute p50 | ~270 μs | ~10 μs | 27× |
+
+The compute portion is sub-microsecond in Rust — the entire 6-gate
+stack + decide_quote + cancel-before-replace logic runs faster than
+1 μs end-to-end. Tail latency (TTT p99) is now dominated by tokio
+scheduler interactions rather than Python orchestration.
+
+### Architecture notes
+
+- Single tokio multi-thread runtime (2 workers). Hot loop, staleness
+  task, telemetry task, JSONL writers all share the runtime. No
+  uvloop on the trader despite uvloop being faster on the broker
+  (tested 2026-05-01: uvloop INCREASED trader's TTT p50 because
+  libuv's scheduler gives more time to non-hot-path tasks; default
+  asyncio's tighter `sleep(0)` semantics happens to be optimal here).
+- `state::TraderState` behind a single `std::sync::Mutex`. The hot
+  path holds the lock for ~10 μs per tick. Background tasks
+  (staleness, telemetry) take it briefly. No deadlocks possible —
+  lock order is consistently state → ring (no reverse).
+- `tte_cache` module memoizes parsed expiry datetimes per-thread
+  (production has ~4 unique expiries; cache is essentially immortal
+  after warmup).
+- HashMap keys use `char` for `right` and `side` instead of
+  `String`. Saves ~80% of hot-path heap allocations.
+- `OptionState` is a slim Copy-only struct stored in the `options`
+  dict instead of full `TickMsg` clones (which would carry redundant
+  expiry/right strings).
+
+### Where to look when debugging
+
+- Container logs: `docker compose logs -f trader`
+- Telemetry every 10s with full counter dict (search for
+  `[corsair_trader] telemetry:`)
+- JSONL streams in `logs-paper/`:
+  `trader_events-YYYY-MM-DD.jsonl` (one line per inbound IPC event)
+  `trader_decisions-YYYY-MM-DD.jsonl` (one line per place outcome)
+- SHM ring drop monitor warns every 10s if `frames_dropped` grew
+  on either ring (events or commands). Critical safety signal —
+  if trader is too slow to drain, broker drops events including
+  `kill` messages.
+
+### Rollback
+
+Either:
+1. `unset CORSAIR_TRADER_LANG` and restart trader (uses Python).
+2. Stop the trader entirely; broker continues quoting via its own
+   quote engine when `CORSAIR_TRADER_PLACES_ORDERS=` is unset.
+
+The Rust binary doesn't deploy any feature the Python trader
+doesn't already have. Functional rollback is safe at any point.
+
+### Known limitations
+
+- No partial-fill handling. Production places `qty=1` orders so
+  partial fills are impossible; if that ever changes, the
+  order_ack handler needs updating.
+- The Rust trader doesn't implement the parity-comparison harness
+  yet (Python `scripts/rust_trader_parity.py` does the comparison
+  via the shared corsair_pricing crate; full Rust-binary-CLI
+  parity is a future v2 of that harness).
