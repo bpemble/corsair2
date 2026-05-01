@@ -89,12 +89,25 @@ class BrokerIPC:
 
     # ── Forwarders (publish API for non-event sources like SABR fits) ──
 
-    def publish_vol_surface(self, expiry: str, params: dict) -> None:
+    def publish_vol_surface(
+        self, expiry: str, side: str, params: dict,
+        forward: float, tte: float, rmse: float,
+    ) -> None:
+        """Forward SABR/SVI fit params after a successful calibration.
+
+        Signature matches MultiExpirySABR's vol_surface_publisher
+        callback so it can be wired directly via
+        ``sabr.set_vol_surface_publisher(broker_ipc.publish_vol_surface)``.
+        """
         self.server.publish({
             "type": "vol_surface",
             "ts_ns": _ts_ns(),
             "expiry": expiry,
+            "side": side,
             "params": params,
+            "forward": forward,
+            "tte": tte,
+            "rmse": rmse,
         })
 
     def publish_kill(self, source: str, reason: str, kill_type: str) -> None:

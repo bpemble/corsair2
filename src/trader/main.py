@@ -28,6 +28,7 @@ from collections import Counter, deque
 from datetime import date, datetime, timezone
 
 from ..ipc import IPCClient, DEFAULT_SOCKET_PATH
+from .quote_decision import decide as decide_quote
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -39,6 +40,13 @@ logger = logging.getLogger("corsair.trader")
 # so analysis tools find it next to ``fills``, ``hedge_trades`` etc.
 EVENTS_LOG_DIR = "/app/logs-paper"
 TELEMETRY_INTERVAL_S = 10.0
+
+# Quote-decision params. Mirror broker config defaults; these would
+# eventually arrive over IPC from the broker (config_snapshot event).
+# v2 ships with hard-coded HG-friendly defaults — Phase 3 will fold in
+# the config sync.
+DECISION_MIN_EDGE_TICKS = 2
+DECISION_TICK_SIZE = 0.0005
 
 
 class TraderState:
@@ -61,29 +69,29 @@ class TraderState:
         self.last_event_ts: float = 0.0
 
 
-class EventLogger:
-    """Append-only JSONL writer for received events. Lock-free single-thread."""
+class JSONLWriter:
+    """Append-only JSONL writer with daily file rotation.
 
-    def __init__(self, log_dir: str) -> None:
+    Single-thread, no locks. Caller passes ``prefix`` (e.g. ``"trader_events"``)
+    and ``log_dir``; rotated path is ``{log_dir}/{prefix}-YYYY-MM-DD.jsonl``.
+    """
+
+    def __init__(self, log_dir: str, prefix: str) -> None:
         self._log_dir = log_dir
+        self._prefix = prefix
         self._fp = None
         self._date = None
 
-    def write(self, msg: dict, recv_ns: int) -> None:
+    def write(self, rec: dict) -> None:
         today = date.today().strftime("%Y-%m-%d")
         if today != self._date:
             self._roll(today)
         if self._fp is None:
             return
-        rec = {
-            "recv_ts": datetime.now(timezone.utc).isoformat(),
-            "recv_ns": recv_ns,
-            "event": msg,
-        }
         try:
             self._fp.write(json.dumps(rec, default=str) + "\n")
         except Exception:
-            logger.exception("event log write failed")
+            logger.exception("%s log write failed", self._prefix)
 
     def _roll(self, day: str) -> None:
         if self._fp is not None:
@@ -94,11 +102,11 @@ class EventLogger:
         self._date = day
         try:
             os.makedirs(self._log_dir, exist_ok=True)
-            path = os.path.join(self._log_dir, f"trader_events-{day}.jsonl")
+            path = os.path.join(self._log_dir, f"{self._prefix}-{day}.jsonl")
             self._fp = open(path, "a", buffering=1)
-            logger.info("event log opened: %s", path)
+            logger.info("%s log opened: %s", self._prefix, path)
         except Exception:
-            logger.exception("event log open failed")
+            logger.exception("%s log open failed", self._prefix)
             self._fp = None
 
     def close(self) -> None:
@@ -114,7 +122,13 @@ class Trader:
     def __init__(self, socket_path: str) -> None:
         self.client = IPCClient(socket_path)
         self.state = TraderState()
-        self.event_log = EventLogger(EVENTS_LOG_DIR)
+        self.event_log = JSONLWriter(EVENTS_LOG_DIR, "trader_events")
+        # Separate JSONL stream for quote decisions — kept distinct from
+        # raw events so parity comparison joins are obvious.
+        self.decision_log = JSONLWriter(EVENTS_LOG_DIR, "trader_decisions")
+        # Counters for the telemetry payload — parity gap surfaces in
+        # logs but operator should also see it on the broker dashboard.
+        self.decisions_made: Counter = Counter()
 
     async def on_event(self, msg: dict) -> None:
         recv_ns = time.monotonic_ns()
@@ -139,7 +153,59 @@ class Trader:
         except Exception:
             logger.exception("apply failed for %s", ev_type)
 
-        self.event_log.write(msg, recv_ns)
+        self.event_log.write({
+            "recv_ts": datetime.now(timezone.utc).isoformat(),
+            "recv_ns": recv_ns,
+            "event": msg,
+        })
+
+        # On every option tick, run the v2 quote decision for both sides
+        # and emit to trader_decisions JSONL. Skips are logged too — the
+        # parity-comparison harness compares both with broker's actuals.
+        if ev_type == "tick":
+            self._decide_on_tick(msg, recv_ns)
+
+    def _decide_on_tick(self, tick_msg: dict, recv_ns: int) -> None:
+        """Emit v2 quote decisions for the (strike, expiry, right) of a
+        tick event. Both sides (BUY+SELL) are evaluated independently."""
+        forward = self.state.underlying_price
+        if forward <= 0:
+            return
+        strike = tick_msg.get("strike")
+        expiry = tick_msg.get("expiry")
+        right = tick_msg.get("right")
+        if strike is None or expiry is None or right is None:
+            return
+        # Look up vol params for this expiry. We pick the BUY-side
+        # surface arbitrarily — broker fits one surface per (expiry,
+        # side); for parity v2 we'll use whichever side's params arrived
+        # most recently. Phase 3 will track both.
+        vp_msg = self.state.vol_surface.get(expiry)
+        vol_params = (vp_msg or {}).get("params")
+        bid = tick_msg.get("bid")
+        ask = tick_msg.get("ask")
+
+        for side in ("BUY", "SELL"):
+            d = decide_quote(
+                forward=forward,
+                strike=float(strike),
+                expiry=expiry,
+                right=right,
+                side=side,
+                vol_params=vol_params,
+                market_bid=bid,
+                market_ask=ask,
+                min_edge_ticks=DECISION_MIN_EDGE_TICKS,
+                tick_size=DECISION_TICK_SIZE,
+            )
+            self.decisions_made[d.get("action", "?")] += 1
+            self.decision_log.write({
+                "recv_ts": datetime.now(timezone.utc).isoformat(),
+                "recv_ns": recv_ns,
+                "trigger_ts_ns": tick_msg.get("ts_ns"),
+                "forward": forward,
+                "decision": d,
+            })
 
     def _apply(self, msg: dict) -> None:
         t = msg.get("type")
@@ -189,6 +255,7 @@ class Trader:
                 "type": "telemetry",
                 "ts_ns": time.time_ns(),
                 "events": dict(self.state.event_counts.most_common()),
+                "decisions": dict(self.decisions_made),
                 "ipc_p50_us": p50,
                 "ipc_p99_us": p99,
                 "ipc_n": n,
@@ -200,11 +267,14 @@ class Trader:
             }
             self.client.send(payload)
             logger.info(
-                "telemetry: events=%d ipc_p50=%sus ipc_p99=%sus opts=%d orders=%d",
+                "telemetry: events=%d ipc_p50=%sus ipc_p99=%sus opts=%d "
+                "orders=%d decisions=%s vol_expiries=%d",
                 sum(self.state.event_counts.values()),
                 p50, p99,
                 len(self.state.options),
                 len(self.state.active_orders),
+                dict(self.decisions_made),
+                len(self.state.vol_surface),
             )
 
     async def run(self) -> None:
@@ -232,6 +302,7 @@ class Trader:
             await asyncio.gather(client_task, telemetry_task, welcome_task)
         finally:
             self.event_log.close()
+            self.decision_log.close()
 
 
 async def main() -> None:

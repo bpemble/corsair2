@@ -682,6 +682,10 @@ async def main():
             broker_ipc.attach_to_ib(ib)
             for eng in engines:
                 eng["md"].set_broker_ipc(broker_ipc)
+                # Forward SABR fit params to trader after every refit.
+                eng["sabr"].set_vol_surface_publisher(
+                    broker_ipc.publish_vol_surface
+                )
             logger.warning("BROKER MODE: IPC server up; trader can connect")
         except Exception:
             logger.exception("broker_ipc start failed; continuing without trader split")

@@ -691,6 +691,11 @@ class MultiExpirySABR:
     def __init__(self, config, csv_logger=None):
         self.config = config
         self.csv_logger = csv_logger
+        # Optional callback invoked with (expiry, side, params_dict,
+        # forward, tte, rmse) after every successful calibration. Used by
+        # broker IPC to forward vol surface updates to the trader.
+        # None → no-op. Wire via set_vol_surface_publisher().
+        self._vol_surface_publisher = None
         self._surfaces: dict = {}
         self._expiries: list[str] = []
         # Async calibration runs in a subprocess (ProcessPool, not Thread)
@@ -718,6 +723,16 @@ class MultiExpirySABR:
         # no concurrency hazard. ``"elapsed"`` is the default to preserve
         # existing log behavior when callers don't pass a reason.
         self._pending_trigger_reason: str = "elapsed"
+
+    def set_vol_surface_publisher(self, publisher) -> None:
+        """Register a callback invoked after each successful fit.
+
+        Signature: ``publisher(expiry: str, side: str, params: dict,
+        forward: float, tte: float, rmse: float) -> None``.
+        Errors are swallowed in the call site so a slow / failing
+        publisher can't break calibration. Pass None to unregister.
+        """
+        self._vol_surface_publisher = publisher
 
     # ------------- expiry management -------------
 
@@ -1019,6 +1034,32 @@ class MultiExpirySABR:
                         )
                 except Exception as e:
                     logger.debug("calibration telemetry log failed: %s", e)
+            # Broker IPC: forward fitted params to the trader so it can
+            # build its own theo independently. No-op when no publisher
+            # is wired (default).
+            if self._vol_surface_publisher is not None:
+                try:
+                    if use_svi:
+                        params = {
+                            "model": "svi",
+                            "a": result.a, "b": result.b,
+                            "rho": result.rho, "m": result.m,
+                            "sigma": result.sigma,
+                        }
+                    else:
+                        params = {
+                            "model": "sabr",
+                            "alpha": result.alpha, "beta": surf.beta,
+                            "rho": result.rho, "nu": result.nu,
+                        }
+                    self._vol_surface_publisher(
+                        exp, side, params,
+                        float(res['forward']),
+                        float(time_to_expiry_years(exp)),
+                        float(result.rmse),
+                    )
+                except Exception:
+                    logger.debug("vol_surface IPC publish failed", exc_info=True)
             sp["rmse_history"].append(result.rmse)
             if len(sp["rmse_history"]) >= 5:
                 median_rmse = float(np.median(sp["rmse_history"]))
