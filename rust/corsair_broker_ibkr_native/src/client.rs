@@ -156,17 +156,27 @@ impl NativeClient {
         // 4. Send startApi. After this, the server starts streaming
         //    nextValidId, managedAccounts, and any subscribed data.
         //
-        // NOTE: the 4th field is "optionalCapabilities" (a string),
-        // NOT an account. Passing self.cfg.account here causes IBKR
-        // to reject with error 10106 ("Enabling 'DUP...' via login
-        // is not supported in TWS") and drop the connection. Account
-        // selection happens at the per-order level
-        // (PlaceOrderReq.account) and via reqAccountUpdates.
+        // Field 4 is "optionalCapabilities" per the IBKR spec.
+        // ib_insync passes its self.optCapab (default "").
+        //
+        // Empirical behavior on this FA paper account:
+        //   - account=""        → gateway drops the connection
+        //                         immediately after our follow-up
+        //                         reqs (recv=0, no bootstrap msgs).
+        //   - account=<DUP...>  → gateway sends managedAccounts +
+        //                         nextValidId + farm-status warnings,
+        //                         then a benign error 10106 that
+        //                         only fires AFTER bootstrap.
+        //
+        // Wire bytes are byte-identical between Rust and ib_insync
+        // (verified via examples/wire_dump.rs). The protocol-level
+        // difference must be elsewhere — startApi is the clearest
+        // working configuration so we go with it.
         let start_api = encode_fields(&[
             &OUT_START_API.to_string(),
             "2", // version
             &self.cfg.client_id.to_string(),
-            "", // optionalCapabilities — empty
+            self.cfg.account.as_deref().unwrap_or(""),
         ]);
         write_half.write_all(&start_api).await?;
         write_half.flush().await?;
