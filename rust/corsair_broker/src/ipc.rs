@@ -22,7 +22,7 @@
 //!   ⏸ Forward risk_state at 1Hz (straightforward — TODO)
 
 use corsair_broker_api::{
-    Broker, ContractKind, Currency, Exchange, ModifyOrderReq, OrderId,
+    ContractKind, Currency, Exchange, ModifyOrderReq, OrderId,
     OrderType, PlaceOrderReq, Side, TimeInForce,
 };
 use corsair_ipc::{ServerCommand, ServerConfig, SHMServer};
@@ -71,6 +71,8 @@ pub fn spawn_ipc(
     tokio::spawn(forward_fills(runtime.clone(), Arc::clone(&server)));
     tokio::spawn(forward_status(runtime.clone(), Arc::clone(&server)));
     tokio::spawn(forward_connection(runtime.clone(), Arc::clone(&server)));
+    tokio::spawn(forward_ticks(runtime.clone(), Arc::clone(&server)));
+    tokio::spawn(periodic_risk_state(runtime.clone(), Arc::clone(&server)));
 
     log::warn!("corsair_broker: IPC server live");
     Ok(server)
@@ -456,4 +458,160 @@ fn _suppress_dead_code(e: PlaceAckEvent<'_>) {
     let _ = e.order_id;
     let _ = e.rejected;
     let _ = e.reason;
+}
+
+// ─── Tick forwarding ─────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct TickEvent<'a> {
+    #[serde(rename = "type")]
+    ty: &'a str,
+    instrument_id: u64,
+    /// "bid" / "ask" / "last" / "bid_size" / "ask_size" / "volume"
+    kind: &'a str,
+    price: Option<f64>,
+    size: Option<u64>,
+    timestamp_ns: u64,
+}
+
+async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
+    let mut rx = {
+        let b = runtime.broker.lock().await;
+        b.subscribe_ticks_stream()
+    };
+    log::info!("ipc forward_ticks: subscribed");
+    loop {
+        match rx.recv().await {
+            Ok(tick) => {
+                let kind_str = match tick.kind {
+                    corsair_broker_api::TickKind::Bid => "bid",
+                    corsair_broker_api::TickKind::Ask => "ask",
+                    corsair_broker_api::TickKind::Last => "last",
+                    corsair_broker_api::TickKind::BidSize => "bid_size",
+                    corsair_broker_api::TickKind::AskSize => "ask_size",
+                    corsair_broker_api::TickKind::Volume => "volume",
+                };
+                let ev = TickEvent {
+                    ty: "tick",
+                    instrument_id: tick.instrument_id.0,
+                    kind: kind_str,
+                    price: tick.price,
+                    size: tick.size,
+                    timestamp_ns: tick.timestamp_ns,
+                };
+                if let Ok(body) = rmp_serde::to_vec_named(&ev) {
+                    if !server.publish(&body) {
+                        // Tick stream is high-volume; only log dropped
+                        // frames every now and then to avoid log flood.
+                        log::debug!("ipc events ring full — dropped tick");
+                    }
+                }
+            }
+            Err(RecvError::Lagged(n)) => log::warn!("forward_ticks: lagged {n}"),
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
+// ─── Periodic risk_state publish ─────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct RiskStateEvent {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    ts_ns: u64,
+    margin_usd: f64,
+    margin_pct: f64,
+    options_delta: f64,
+    hedge_delta: i32,
+    effective_delta: f64,
+    theta: f64,
+    vega: f64,
+    gamma: f64,
+    total_contracts: i64,
+    n_positions: u32,
+}
+
+/// Publish risk aggregates to the trader at 1Hz. Mirrors
+/// `BrokerIPC.publish_risk_state` in Python — same field names so
+/// the trader's existing self-gating logic works unchanged.
+async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
+    let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
+    log::info!("ipc periodic_risk_state: cadence 1s");
+    let capital = runtime.config.constraints.capital;
+    loop {
+        t.tick().await;
+        // Acquire portfolio + hedge briefly for state.
+        let (options_delta, theta, vega, gamma, total_contracts, n_positions) = {
+            let p = runtime.portfolio.lock().unwrap();
+            let agg = p.aggregate();
+            let total_contracts: i64 = p
+                .positions()
+                .iter()
+                .map(|pos| pos.quantity.abs() as i64)
+                .sum();
+            (
+                agg.total.net_delta,
+                agg.total.net_theta,
+                agg.total.net_vega,
+                agg.total.net_gamma,
+                total_contracts,
+                agg.total.gross_positions,
+            )
+        };
+        let hedge_delta: i32 = {
+            let h = runtime.hedge.lock().unwrap();
+            // Sum hedge_qty across products.
+            h.managers().iter().map(|m| m.hedge_qty()).sum()
+        };
+        let effective_delta = options_delta + (hedge_delta as f64);
+
+        // Margin: poll account_values asynchronously; if too slow,
+        // just skip this tick. (Account refreshes every ~5s in
+        // IBKR's stream so this is best-effort.)
+        let margin_usd = match {
+            let b = runtime.broker.lock().await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                b.account_values(),
+            )
+            .await
+        } {
+            Ok(Ok(snap)) => snap.maintenance_margin,
+            _ => 0.0, // unavailable this tick
+        };
+        let margin_pct = if capital > 0.0 {
+            margin_usd / capital
+        } else {
+            0.0
+        };
+
+        let ev = RiskStateEvent {
+            ty: "risk_state",
+            ts_ns: now_ns(),
+            margin_usd,
+            margin_pct,
+            options_delta,
+            hedge_delta,
+            effective_delta,
+            theta,
+            vega,
+            gamma,
+            total_contracts,
+            n_positions,
+        };
+        if let Ok(body) = rmp_serde::to_vec_named(&ev) {
+            if !server.publish(&body) {
+                log::warn!("ipc events ring full — dropped risk_state");
+            }
+        }
+    }
+}
+
+fn now_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }

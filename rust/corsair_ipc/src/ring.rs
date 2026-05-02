@@ -80,6 +80,12 @@ impl Ring {
         })
     }
 
+    /// Backwards-compat alias for `open_client`. The trader binary's
+    /// existing main.rs uses `Ring::open(path, capacity)`.
+    pub fn open(path: &Path, capacity: usize) -> io::Result<Self> {
+        Self::open_client(path, capacity)
+    }
+
     /// Server side: create the FIFO at `<ring>.notify`.
     pub fn create_notify_fifo(path: &Path) -> io::Result<()> {
         let path_str = path.to_string_lossy();
@@ -243,6 +249,23 @@ impl IntoRawFdKeep for std::fs::File {
         let fd = self.as_raw_fd();
         std::mem::forget(self);
         fd
+    }
+}
+
+/// Wait for the broker to create both ring files at the given base
+/// path. Returns once `<base>.events` and `<base>.commands` exist.
+/// The trader's startup uses this to gate connection on broker boot.
+pub async fn wait_for_rings(base: &str) -> io::Result<()> {
+    let events = format!("{}.events", base);
+    let commands = format!("{}.commands", base);
+    loop {
+        if std::path::Path::new(&events).exists()
+            && std::path::Path::new(&commands).exists()
+        {
+            return Ok(());
+        }
+        log::info!("shm: rings not ready ({events}, {commands}); retry in 1s");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 

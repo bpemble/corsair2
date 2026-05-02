@@ -20,6 +20,10 @@ log = "0.4"
 env_logger = "0.11"
 statrs = "0.17"
 ahash = "0.8"
+# Phase 5B.5: shared IPC implementation. The trader's local
+# src/ipc/ module now re-exports from corsair_ipc so both broker
+# and trader use one source of truth for the wire format.
+corsair_ipc = { path = "../corsair_ipc" }
 
 [profile.release]
 opt-level = 3

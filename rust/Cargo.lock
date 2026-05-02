@@ -346,6 +346,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "chrono",
+ "corsair_ipc",
  "env_logger",
  "libc",
  "log",
