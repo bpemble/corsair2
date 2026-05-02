@@ -371,9 +371,20 @@ fn spawn_recv_task(
                             if let Ok(id) = parse_int(ty) {
                                 if id == IN_NEXT_VALID_ID && fields.len() >= 3 {
                                     if let Ok(oid) = parse_int(&fields[2]) {
-                                        *next_order_id.lock().await = oid;
+                                        // Max-merge so an unsolicited
+                                        // re-broadcast from the gateway
+                                        // (IBKR sends nextValidId after
+                                        // every place_order) doesn't
+                                        // stomp our locally-allocated
+                                        // higher counter and cause id
+                                        // reuse.
+                                        let mut g = next_order_id.lock().await;
+                                        if oid > *g {
+                                            *g = oid;
+                                        }
                                         log::info!(
-                                            "native recv: nextValidId = {oid}"
+                                            "native recv: nextValidId = {oid} (local={})",
+                                            *g
                                         );
                                     }
                                 } else if id == IN_MANAGED_ACCTS && fields.len() >= 3 {

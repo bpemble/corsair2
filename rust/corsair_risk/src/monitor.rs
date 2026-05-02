@@ -73,9 +73,6 @@ pub enum RiskCheckOutcome {
 pub struct RiskMonitor {
     cfg: RiskConfig,
     killed: Option<KillEvent>,
-    /// One-shot warning gate: log "hedge mtm raised" only once per
-    /// session if the hedge MTM hook fails repeatedly.
-    hedge_mtm_err_logged: bool,
 }
 
 impl RiskMonitor {
@@ -101,7 +98,6 @@ impl RiskMonitor {
         Self {
             cfg,
             killed: None,
-            hedge_mtm_err_logged: false,
         }
     }
 

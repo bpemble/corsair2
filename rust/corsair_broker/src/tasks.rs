@@ -85,15 +85,22 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
     // strictly released before any .await downstream — rustc's NLL
     // is conservative across await points.
     let instr = fill.instrument_id;
+    // Lock order: portfolio THEN market_data (matches the rest of the
+    // codebase). Inverting causes deadlock when periodic_risk_check
+    // grabs portfolio→md while we hold md→portfolio.
     let matched: Option<(
         String,
         f64,
         chrono::NaiveDate,
         corsair_broker_api::Right,
     )> = {
+        let products: Vec<String> = {
+            let p = runtime.portfolio.lock().unwrap();
+            p.registry().products()
+        };
         let md = runtime.market_data.lock().unwrap();
         let mut found: Option<(String, f64, chrono::NaiveDate, corsair_broker_api::Right)> = None;
-        for prod in runtime.portfolio.lock().unwrap().registry().products() {
+        for prod in products {
             for t in md.options_for_product(&prod) {
                 if t.instrument_id == Some(instr) {
                     found = Some((prod.clone(), t.strike, t.expiry, t.right));
@@ -136,11 +143,14 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
 
     // Per-fill daily P&L halt check. Mirrors
     // FillHandler.check_daily_pnl_only in Python.
-    {
+    let halt_outcome = {
         let p = runtime.portfolio.lock().unwrap();
         let md = runtime.market_data.lock().unwrap();
         let mut r = runtime.risk.lock().unwrap();
-        let _ = r.check_daily_pnl_only(&p, &*md);
+        r.check_daily_pnl_only(&p, &*md)
+    };
+    if matches!(halt_outcome, corsair_risk::RiskCheckOutcome::Killed(_)) {
+        cancel_all_resting(runtime, "daily_halt_per_fill").await;
     }
 
     // CLAUDE.md §10: rebalance hedge on every option fill (in
@@ -314,37 +324,83 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
     log::info!("periodic_risk_check: cadence 300s");
     loop {
         t.tick().await;
-        let p = runtime.portfolio.lock().unwrap();
-        let md = runtime.market_data.lock().unwrap();
-        let mut r = runtime.risk.lock().unwrap();
-        // Compute worst per-product Greeks from aggregate.
-        let agg = p.aggregate();
-        let (worst_delta, worst_theta, worst_vega) = worst_per_product(&agg, &runtime);
-        // Pull cached IBKR maintenance margin for the kill gate
-        // (CLAUDE.md §7). Falls back to 0 only if periodic_account_poll
-        // hasn't run yet — first poll fires within 300s of boot.
-        let margin_used = runtime
-            .account
-            .lock()
-            .map(|a| a.maintenance_margin)
-            .unwrap_or(0.0);
-        let outcome = r.check(&p, margin_used, worst_delta, worst_theta, worst_vega, &*md);
+        // Compute outcome under locks; release before any await.
+        let (outcome, agg_summary) = {
+            let p = runtime.portfolio.lock().unwrap();
+            let md = runtime.market_data.lock().unwrap();
+            let mut r = runtime.risk.lock().unwrap();
+            let agg = p.aggregate();
+            let (worst_delta, worst_theta, worst_vega) =
+                worst_per_product(&agg, &runtime);
+            let margin_used = runtime
+                .account
+                .lock()
+                .map(|a| a.maintenance_margin)
+                .unwrap_or(0.0);
+            let outcome = r.check(
+                &p,
+                margin_used,
+                worst_delta,
+                worst_theta,
+                worst_vega,
+                &*md,
+            );
+            let summary = (
+                agg.total.gross_positions,
+                agg.total.long_count,
+                agg.total.short_count,
+                worst_delta,
+                worst_theta,
+                worst_vega,
+            );
+            (outcome, summary)
+        };
         match &outcome {
             corsair_risk::RiskCheckOutcome::Killed(ev) => {
                 log::error!("risk check fired kill: {ev:?}");
+                // CLAUDE.md §7/§8: every kill must cancel all resting
+                // orders. Without this, kill is cosmetic — orders
+                // continue resting until GTD-expiry.
+                cancel_all_resting(&runtime, "risk_kill").await;
             }
             corsair_risk::RiskCheckOutcome::AlreadyKilled(_) => {}
             corsair_risk::RiskCheckOutcome::Healthy => {
                 log::info!(
                     "RISK: positions={} long={} short={} delta={:+.2} theta={:+.0} vega={:+.0}",
-                    agg.total.gross_positions,
-                    agg.total.long_count,
-                    agg.total.short_count,
-                    worst_delta,
-                    worst_theta,
-                    worst_vega
+                    agg_summary.0,
+                    agg_summary.1,
+                    agg_summary.2,
+                    agg_summary.3,
+                    agg_summary.4,
+                    agg_summary.5,
                 );
             }
+        }
+    }
+}
+
+/// Cancel every live OMS order via the broker. Called from any kill
+/// path (risk check, per-fill daily-halt). Mirrors
+/// `quote_engine.cancel_all_quotes` in Python broker. Best-effort:
+/// logs cancel failures but doesn't propagate (kill semantics need
+/// to fire even if a cancel races a fill).
+async fn cancel_all_resting(runtime: &Arc<Runtime>, reason: &str) {
+    let order_ids: Vec<corsair_broker_api::OrderId> = {
+        let oms = runtime.oms.lock().unwrap();
+        oms.live_orders().filter_map(|r| r.order_id).collect()
+    };
+    if order_ids.is_empty() {
+        log::warn!("cancel_all_resting[{reason}]: no live orders");
+        return;
+    }
+    log::warn!(
+        "cancel_all_resting[{reason}]: cancelling {} orders",
+        order_ids.len()
+    );
+    let b = runtime.broker.lock().await;
+    for oid in order_ids {
+        if let Err(e) = b.cancel_order(oid).await {
+            log::warn!("cancel_all_resting[{reason}]: cancel {oid:?} failed: {e}");
         }
     }
 }
@@ -582,25 +638,30 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
 async fn daily_halt_rollover(runtime: Arc<Runtime>) {
     use chrono::Timelike;
     let mut t = interval(Duration::from_secs(60));
-    log::info!("daily_halt_rollover: armed; clears at 17:00 CT");
+    log::info!("daily_halt_rollover: armed; clears at 17:00 US/Central");
+    // Track the last day we fired so we don't double-fire if a tick
+    // lands twice in the same minute window. Day key is in CT zone.
     let mut last_fired_day: Option<chrono::NaiveDate> = None;
     loop {
         t.tick().await;
-        // chrono-tz isn't a workspace dep yet, so fall back to a fixed
-        // CST offset (UTC-6). DST note: US/Central is UTC-5 (CDT) in
-        // summer. We approximate at UTC-6 and accept ±1h drift across
-        // DST transitions. TODO: depend on chrono-tz for true zone.
-        let cst_offset = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
-        let now_cst = chrono::Utc::now().with_timezone(&cst_offset);
-        if now_cst.hour() == 17 && now_cst.minute() == 0 {
-            let today = now_cst.date_naive();
-            if last_fired_day != Some(today) {
-                let mut r = runtime.risk.lock().unwrap();
-                if r.clear_daily_halt() {
-                    log::warn!("daily_halt_rollover: cleared daily halt at 17:00 CT");
-                }
-                last_fired_day = Some(today);
+        // True US/Central with DST handling. Without this we'd be off
+        // by 1h for ~8 months of the year (CST vs CDT).
+        let now_ct = chrono::Utc::now().with_timezone(&chrono_tz::US::Central);
+        let today_ct = now_ct.date_naive();
+        // Fire on first sample at-or-past 17:00 CT each day. Robust
+        // against tick scheduling drift (the 60s interval may land
+        // anywhere in the minute) — only the first sample after the
+        // boundary fires.
+        let past_boundary = now_ct.hour() >= 17;
+        let already_fired_today = last_fired_day == Some(today_ct);
+        if past_boundary && !already_fired_today {
+            let mut r = runtime.risk.lock().unwrap();
+            if r.clear_daily_halt() {
+                log::warn!(
+                    "daily_halt_rollover: cleared daily halt at {now_ct} (US/Central)"
+                );
             }
+            last_fired_day = Some(today_ct);
         }
     }
 }

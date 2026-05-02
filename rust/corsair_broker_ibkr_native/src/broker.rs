@@ -302,26 +302,54 @@ impl NativeBroker {
             }
             InboundMsg::OpenOrder(o) => {
                 let order_id = o.order_id;
-                let ack = if let Some(open) = native_to_open_order(&o) {
+                let parsed = native_to_open_order(&o);
+                let ack = {
                     let mut s = state.lock().await;
-                    s.open_orders.insert(order_id, open);
-                    s.pending_place_acks.remove(&order_id)
-                } else {
-                    let mut s = state.lock().await;
+                    if let Some(open) = parsed {
+                        s.open_orders.insert(order_id, open);
+                    }
                     s.pending_place_acks.remove(&order_id)
                 };
                 if let Some(tx) = ack {
+                    // Resolve to Ok regardless of native_to_open_order
+                    // success — IBKR has accepted the order at the
+                    // wire level. Native_to_open_order can fail on
+                    // unfamiliar sec_types but the order is real.
                     let _ = tx.send(Ok(()));
                 }
             }
             InboundMsg::OrderStatus(o) => {
                 let parsed_status = parse_status(&o.status);
-                {
+                // ACK resolution: IBKR commonly emits OrderStatus
+                // (Submitted / PreSubmitted) before OpenOrder, so the
+                // place_order waiter must resolve here too. Resolving
+                // ONLY on terminal-or-active states (not Inactive)
+                // avoids resolving on a stale rebroadcast for an
+                // already-rejected order. ApiPending/PendingSubmit
+                // we treat as not-yet-acked.
+                let ack = if matches!(
+                    parsed_status,
+                    OrderStatus::Submitted
+                        | OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::PendingCancel
+                ) {
                     let mut s = state.lock().await;
                     if let Some(open) = s.open_orders.get_mut(&o.order_id) {
                         open.status = parsed_status;
                         open.filled_qty = o.filled as u32;
                     }
+                    s.pending_place_acks.remove(&o.order_id)
+                } else {
+                    let mut s = state.lock().await;
+                    if let Some(open) = s.open_orders.get_mut(&o.order_id) {
+                        open.status = parsed_status;
+                        open.filled_qty = o.filled as u32;
+                    }
+                    None
+                };
+                if let Some(tx) = ack {
+                    let _ = tx.send(Ok(()));
                 }
                 // Lock dropped before broadcast::send so a slow
                 // consumer cannot stall the dispatcher and back up the
@@ -495,20 +523,21 @@ fn is_contract_error(code: i32) -> bool {
     matches!(code, 200 | 321 | 322)
 }
 
-/// IBKR error codes that indicate an order was rejected at submission
-/// or shortly thereafter. The req_id field carries the orderId for
-/// these. Used by place_order ack correlation to fail synchronously
-/// instead of leaving a phantom orderId in the trader.
+/// IBKR error codes that indicate an order was REJECTED at submission.
+/// Excludes informational warnings (399 "order modified to fit risk",
+/// 461 "displaying liquid message") which leave the order live with
+/// adjusted parameters; treating those as rejects causes the trader
+/// to re-submit duplicates.
+///
+/// Code 202 ("order cancelled") is also excluded because it's the
+/// normal response to OUR cancel, not a rejection of a fresh place.
 fn is_order_error(code: i32) -> bool {
     matches!(
         code,
-        201    // order rejected by IBKR
-        | 202  // order cancelled (e.g., cancel ack)
+        201    // order rejected by IBKR (insufficient margin, etc.)
         | 203  // security symbol not found / not subscribed
-        | 399  // warning: order modified to fit risk
         | 434  // qty=0
         | 436  // FA: must specify allocation
-        | 461  // displaying liquid message
         | 10148 // OrderId not found
         | 10197 // No market for this order
     )
@@ -942,12 +971,16 @@ impl Broker for NativeBroker {
             )),
             Err(_elapsed) => {
                 // Time out — drop waiter; the order may still be live
-                // at IBKR. Caller should treat this as an unknown
-                // outcome and reconcile via open_orders().
+                // at IBKR. Use Protocol (retriable per
+                // BrokerError::is_retriable) so the trader can back
+                // off and retry rather than treating this as a fatal
+                // Internal error. Caller should also reconcile via
+                // open_orders() to discover the orphaned order.
                 self.state.lock().await.pending_place_acks.remove(&order_id);
-                Err(BrokerError::Internal(format!(
-                    "place_order ack timeout (orderId={order_id})"
-                )))
+                Err(BrokerError::Protocol {
+                    code: None,
+                    message: format!("place_order ack timeout (orderId={order_id})"),
+                })
             }
         }
     }

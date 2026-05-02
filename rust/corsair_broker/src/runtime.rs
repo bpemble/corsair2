@@ -218,11 +218,89 @@ impl Runtime {
         // names as the live-deployment hard prerequisite.
         runtime.wait_for_native_seeding().await;
 
+        // ── Resolve hedge contract per product (CLAUDE.md §10) ────
+        //
+        // Without this, hedge_contract stays None on every manager,
+        // place_hedge_order skips silently, apply_broker_fill never
+        // matches, and the entire hedge subsystem is dead — even with
+        // mode=execute. Boot-time resolution: list_chain for FUT
+        // matching the underlying symbol, skip contracts within
+        // hedge_lockout_days, pick the first surviving expiry.
+        runtime.resolve_hedge_contracts().await;
+
         // ── Seed positions from broker ────────────────────────────
         runtime.seed_positions_from_broker().await?;
 
         log::warn!("corsair_broker boot complete; tasks will start next");
         Ok(runtime)
+    }
+
+    /// Boot-time hedge contract resolution. For each product with
+    /// hedging enabled and a registered HedgeManager, call
+    /// `Broker::list_chain` to enumerate FUT contracts and pick the
+    /// first whose expiry is past the configured lockout window.
+    /// Best-effort: failure to resolve logs a warning but doesn't
+    /// fail boot — operator can manually flatten or restart once
+    /// gateway is healthy.
+    async fn resolve_hedge_contracts(self: &Arc<Self>) {
+        use chrono::Datelike;
+        let products: Vec<(String, i64)> = {
+            let h = self.hedge.lock().unwrap();
+            h.managers()
+                .iter()
+                .map(|m| {
+                    (
+                        m.config().product.clone(),
+                        m.config().lockout_days as i64,
+                    )
+                })
+                .collect()
+        };
+        if products.is_empty() {
+            return;
+        }
+        for (symbol, lockout_days) in products {
+            let min_expiry = chrono::Utc::now().date_naive()
+                + chrono::Duration::days(lockout_days);
+            let q = corsair_broker_api::ChainQuery {
+                symbol: symbol.clone(),
+                exchange: corsair_broker_api::Exchange::Comex,
+                currency: corsair_broker_api::Currency::Usd,
+                kind: Some(corsair_broker_api::ContractKind::Future),
+                min_expiry: Some(min_expiry),
+            };
+            let contracts_result = {
+                let b = self.broker.lock().await;
+                b.list_chain(q).await
+            };
+            match contracts_result {
+                Ok(mut chain) => {
+                    chain.sort_by_key(|c| c.expiry);
+                    if let Some(c) = chain.into_iter().find(|c| c.expiry >= min_expiry) {
+                        log::warn!(
+                            "hedge[{symbol}]: resolved {} ({}-{:02}-{:02})",
+                            c.local_symbol,
+                            c.expiry.year(),
+                            c.expiry.month(),
+                            c.expiry.day()
+                        );
+                        let mut h = self.hedge.lock().unwrap();
+                        if let Some(mgr) = h.for_product_mut(&symbol) {
+                            mgr.set_hedge_contract(c);
+                        }
+                    } else {
+                        log::warn!(
+                            "hedge[{symbol}]: list_chain returned no contracts past lockout ({lockout_days}d)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "hedge[{symbol}]: list_chain failed: {e} — hedge will retry on next periodic"
+                    );
+                }
+            }
+        }
     }
 
     async fn connect(self: &Arc<Self>) -> Result<(), RuntimeError> {

@@ -14,6 +14,7 @@ name = "corsair_broker"
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 corsair_broker_api = { path = "../corsair_broker_api" }
 corsair_broker_ibkr = { path = "../corsair_broker_ibkr" }
 corsair_broker_ibkr_native = { path = "../corsair_broker_ibkr_native" }
