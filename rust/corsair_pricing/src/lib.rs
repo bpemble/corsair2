@@ -11,9 +11,12 @@
 // quadratic interpolation, with the standard mflag five-condition
 // fallback to bisection).
 
-mod calibrate;
-mod greeks;
-mod span;
+// Public so other Rust crates in the workspace (e.g., corsair_position,
+// corsair_constraint) can call the math directly without going through
+// PyO3. Python wrappers in lib.rs expose a subset of this surface.
+pub mod calibrate;
+pub mod greeks;
+pub mod span;
 
 use pyo3::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
