@@ -38,6 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.server_version().await
     );
 
+    // Wait for managedAccounts + nextValidId before user reqs.
+    println!("[smoke] waiting for bootstrap...");
+    client.wait_for_bootstrap(Duration::from_secs(5)).await?;
+    println!(
+        "[smoke] bootstrap: nextValidId={}, accounts={:?}",
+        client.next_order_id().await,
+        client.managed_accounts().await
+    );
+
     // Issue lean bypass requests.
     client.send_raw(&req_account_updates(true, &account)).await?;
     client.send_raw(&req_positions()).await?;

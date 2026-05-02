@@ -154,29 +154,25 @@ impl NativeClient {
         *self.conn_time.lock().await = conn_time.clone();
 
         // 4. Send startApi. After this, the server starts streaming
-        //    nextValidId, managedAccounts, and any subscribed data.
+        //    nextValidId, managedAccounts, and any farm-status warnings.
         //
         // Field 4 is "optionalCapabilities" per the IBKR spec.
-        // ib_insync passes its self.optCapab (default "").
+        // ib_insync passes its `self.optCapab` (default ""). We do the
+        // same — passing the FA sub-account name here triggers
+        // gateway error 10106 ("Enabling 'DUP...' via login is not
+        // supported in TWS"). Account selection is per-order via the
+        // order's `account` field, not via startApi.
         //
-        // Empirical behavior on this FA paper account:
-        //   - account=""        → gateway drops the connection
-        //                         immediately after our follow-up
-        //                         reqs (recv=0, no bootstrap msgs).
-        //   - account=<DUP...>  → gateway sends managedAccounts +
-        //                         nextValidId + farm-status warnings,
-        //                         then a benign error 10106 that
-        //                         only fires AFTER bootstrap.
-        //
-        // Wire bytes are byte-identical between Rust and ib_insync
-        // (verified via examples/wire_dump.rs). The protocol-level
-        // difference must be elsewhere — startApi is the clearest
-        // working configuration so we go with it.
+        // IMPORTANT: callers MUST drain the bootstrap response
+        // (managedAccounts + nextValidId) before issuing user reqs.
+        // Sending reqs racing the bootstrap causes the gateway to
+        // disconnect silently (Phase 6.5b root cause). See
+        // `wait_for_bootstrap()` below.
         let start_api = encode_fields(&[
             &OUT_START_API.to_string(),
             "2", // version
             &self.cfg.client_id.to_string(),
-            self.cfg.account.as_deref().unwrap_or(""),
+            "",  // optionalCapabilities — leave empty
         ]);
         write_half.write_all(&start_api).await?;
         write_half.flush().await?;
@@ -197,6 +193,30 @@ impl NativeClient {
             Arc::clone(&self.msgs_recv),
         );
         Ok(())
+    }
+
+    /// Wait until the gateway has streamed managedAccounts AND
+    /// nextValidId after startApi, or until `timeout` elapses.
+    ///
+    /// **Callers MUST do this before issuing any user reqs.** The
+    /// IBKR gateway disconnects silently when reqs race the
+    /// bootstrap on FA paper accounts (Phase 6.5b root cause).
+    pub async fn wait_for_bootstrap(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), NativeError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let oid = *self.next_order_id.lock().await;
+            let accts_done = !self.managed_accounts.lock().await.is_empty();
+            if oid > 0 && accts_done {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(NativeError::HandshakeTimeout);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Send a raw frame on the wire (caller pre-encoded). Used by
