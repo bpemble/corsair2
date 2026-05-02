@@ -40,6 +40,7 @@
 //! Each message type is its own focused PR. The codec + handshake
 //! foundation built here is the load-bearing scaffolding.
 
+pub mod broker;
 pub mod client;
 pub mod codec;
 pub mod decoder;
@@ -47,6 +48,8 @@ pub mod error;
 pub mod messages;
 pub mod requests;
 pub mod types;
+
+pub use broker::{NativeBroker, NativeBrokerConfig};
 
 pub use client::{NativeClient, NativeClientConfig};
 pub use decoder::parse_inbound;
