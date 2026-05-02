@@ -1,0 +1,18 @@
+[package]
+name = "corsair_constraint"
+version = "0.1.0"
+edition = "2021"
+description = "Pre-trade constraint validation: margin + delta + theta gates."
+
+[lib]
+name = "corsair_constraint"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+corsair_broker_api = { path = "../corsair_broker_api" }
+corsair_position = { path = "../corsair_position" }
+corsair_pricing = { path = "../corsair_pricing" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
