@@ -25,6 +25,7 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(periodic_hedge(runtime.clone())));
     handles.push(tokio::spawn(periodic_snapshot(runtime.clone())));
     handles.push(tokio::spawn(periodic_account_poll(runtime.clone())));
+    handles.push(tokio::spawn(daily_halt_rollover(runtime.clone())));
 
     handles
 }
@@ -40,7 +41,7 @@ async fn pump_fills(runtime: Arc<Runtime>) {
     loop {
         match rx.recv().await {
             Ok(fill) => {
-                handle_fill(&runtime, fill);
+                handle_fill(&runtime, fill).await;
             }
             Err(RecvError::Lagged(n)) => {
                 log::warn!("pump_fills: lagged {n} frames");
@@ -53,7 +54,7 @@ async fn pump_fills(runtime: Arc<Runtime>) {
     }
 }
 
-fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::Fill) {
+async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::Fill) {
     // Try hedge first — if it accepts, the fill was a hedge fill, NOT
     // an option fill. (apply_broker_fill returns true only if the
     // instrument matches the hedge contract.)
@@ -80,31 +81,31 @@ fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::Fill) {
 
     // Otherwise it's an option fill (or an unknown instrument we
     // ignore). Look up product from market data registry to find
-    // strike/expiry/right.
-    let md = runtime.market_data.lock().unwrap();
+    // strike/expiry/right. Wrap in a scope so the MutexGuard is
+    // strictly released before any .await downstream — rustc's NLL
+    // is conservative across await points.
     let instr = fill.instrument_id;
-    // Find the option matching this instrument_id.
-    // (Phase 4.x: add an instrument_id index to MarketDataState
-    // for O(1) lookup; for now we scan registered options per
-    // product. This is at most ~60 strikes — microseconds.)
-    let mut matched: Option<(
+    let matched: Option<(
         String,
         f64,
         chrono::NaiveDate,
         corsair_broker_api::Right,
-    )> = None;
-    for prod in runtime.portfolio.lock().unwrap().registry().products() {
-        for t in md.options_for_product(&prod) {
-            if t.instrument_id == Some(instr) {
-                matched = Some((prod.clone(), t.strike, t.expiry, t.right));
+    )> = {
+        let md = runtime.market_data.lock().unwrap();
+        let mut found: Option<(String, f64, chrono::NaiveDate, corsair_broker_api::Right)> = None;
+        for prod in runtime.portfolio.lock().unwrap().registry().products() {
+            for t in md.options_for_product(&prod) {
+                if t.instrument_id == Some(instr) {
+                    found = Some((prod.clone(), t.strike, t.expiry, t.right));
+                    break;
+                }
+            }
+            if found.is_some() {
                 break;
             }
         }
-        if matched.is_some() {
-            break;
-        }
-    }
-    drop(md);
+        found
+    };
     let (product, strike, expiry, right) = match matched {
         Some(v) => v,
         None => {
@@ -140,6 +141,24 @@ fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::Fill) {
         let md = runtime.market_data.lock().unwrap();
         let mut r = runtime.risk.lock().unwrap();
         let _ = r.check_daily_pnl_only(&p, &*md);
+    }
+
+    // CLAUDE.md §10: rebalance hedge on every option fill (in
+    // addition to the 30s periodic). Without this, every option fill
+    // waits up to 30s for the periodic hedge tick — net delta drifts
+    // unhedged for that window.
+    let hedge_action = {
+        let p = runtime.portfolio.lock().unwrap();
+        let mut h = runtime.hedge.lock().unwrap();
+        h.for_product_mut(&product)
+            .map(|mgr| mgr.rebalance_on_fill(&p))
+    };
+    if let Some(corsair_hedge::HedgeAction::Place { is_buy, qty, reason, .. }) = hedge_action {
+        if matches!(runtime.mode, crate::runtime::RuntimeMode::Live) {
+            place_hedge_order(runtime, &product, is_buy, qty, &reason).await;
+        } else {
+            log::info!("hedge[{product}]: shadow Place {is_buy} qty={qty} ({reason})");
+        }
     }
 }
 
@@ -301,7 +320,15 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
         // Compute worst per-product Greeks from aggregate.
         let agg = p.aggregate();
         let (worst_delta, worst_theta, worst_vega) = worst_per_product(&agg, &runtime);
-        let outcome = r.check(&p, 0.0, worst_delta, worst_theta, worst_vega, &*md);
+        // Pull cached IBKR maintenance margin for the kill gate
+        // (CLAUDE.md §7). Falls back to 0 only if periodic_account_poll
+        // hasn't run yet — first poll fires within 300s of boot.
+        let margin_used = runtime
+            .account
+            .lock()
+            .map(|a| a.maintenance_margin)
+            .unwrap_or(0.0);
+        let outcome = r.check(&p, margin_used, worst_delta, worst_theta, worst_vega, &*md);
         match &outcome {
             corsair_risk::RiskCheckOutcome::Killed(ev) => {
                 log::error!("risk check fired kill: {ev:?}");
@@ -358,8 +385,40 @@ fn worst_per_product(
 async fn periodic_hedge(runtime: Arc<Runtime>) {
     let mut t = interval(Duration::from_secs(30));
     log::info!("periodic_hedge: cadence 30s");
+    let mut tick_count: u64 = 0;
     loop {
         t.tick().await;
+        tick_count = tick_count.wrapping_add(1);
+
+        // CLAUDE.md §10 periodic reconcile: every 4 ticks (~2 min)
+        // call broker.positions() and reconcile hedge_qty against
+        // IBKR's view. Catches divergences from non-filling IOCs.
+        // Done every 4 ticks rather than every tick to keep the
+        // periodic loop light — divergence accumulates slowly.
+        if tick_count.is_multiple_of(4) {
+            let positions_result = {
+                let b = runtime.broker.lock().await;
+                b.positions().await
+            };
+            if let Ok(positions) = positions_result {
+                let mut h = runtime.hedge.lock().unwrap();
+                for pos in positions {
+                    if pos.contract.kind != corsair_broker_api::ContractKind::Future {
+                        continue;
+                    }
+                    if let Some(mgr) = h.for_product_mut(&pos.contract.symbol) {
+                        let mult = if pos.contract.multiplier > 0.0 {
+                            pos.contract.multiplier
+                        } else {
+                            25_000.0
+                        };
+                        let avg = pos.avg_cost / mult;
+                        mgr.reconcile_with_position(pos.quantity, avg, true);
+                    }
+                }
+            }
+        }
+
         // Take a snapshot of products + forwards while holding
         // market_data + portfolio briefly, then release before
         // hitting hedge.
@@ -516,6 +575,36 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
     }
 }
 
+/// Session rollover at 17:00 CT — clears daily P&L halt (CLAUDE.md §8).
+/// `RiskMonitor::clear_daily_halt` is a noop when no daily-halt kill is
+/// active, so it's safe to fire every cycle. Implementation: tick every
+/// 60s and check if the current US/Central time is 17:00..17:01.
+async fn daily_halt_rollover(runtime: Arc<Runtime>) {
+    use chrono::Timelike;
+    let mut t = interval(Duration::from_secs(60));
+    log::info!("daily_halt_rollover: armed; clears at 17:00 CT");
+    let mut last_fired_day: Option<chrono::NaiveDate> = None;
+    loop {
+        t.tick().await;
+        // chrono-tz isn't a workspace dep yet, so fall back to a fixed
+        // CST offset (UTC-6). DST note: US/Central is UTC-5 (CDT) in
+        // summer. We approximate at UTC-6 and accept ±1h drift across
+        // DST transitions. TODO: depend on chrono-tz for true zone.
+        let cst_offset = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
+        let now_cst = chrono::Utc::now().with_timezone(&cst_offset);
+        if now_cst.hour() == 17 && now_cst.minute() == 0 {
+            let today = now_cst.date_naive();
+            if last_fired_day != Some(today) {
+                let mut r = runtime.risk.lock().unwrap();
+                if r.clear_daily_halt() {
+                    log::warn!("daily_halt_rollover: cleared daily halt at 17:00 CT");
+                }
+                last_fired_day = Some(today);
+            }
+        }
+    }
+}
+
 async fn periodic_account_poll(runtime: Arc<Runtime>) {
     let mut t = interval(Duration::from_secs(300));
     log::info!("periodic_account_poll: cadence 300s");
@@ -535,8 +624,101 @@ async fn periodic_account_poll(runtime: Arc<Runtime>) {
                     snap.buying_power,
                     snap.realized_pnl_today
                 );
+                let ibkr_actual = snap.maintenance_margin;
+                if let Ok(mut a) = runtime.account.lock() {
+                    *a = snap;
+                }
+                // CLAUDE.md §3: ibkr_scale calibration. Compute the
+                // current raw synthetic SPAN against current positions
+                // and forward, then divide IBKR's MaintMarginReq by it.
+                if ibkr_actual > 0.0 {
+                    let raw = compute_raw_synthetic_margin(&runtime);
+                    if raw > 0.0 {
+                        let mut cc = runtime.constraint.lock().unwrap();
+                        cc.update_cached_margin(ibkr_actual, raw, now_ns());
+                    }
+                }
             }
             Err(e) => log::warn!("account_values poll failed: {e}"),
         }
     }
+}
+
+fn now_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Compute raw synthetic SPAN margin for the current portfolio.
+/// Used by `periodic_account_poll` to recalibrate the ibkr_scale.
+/// Returns 0 when there are no positions, no underlying price, or no
+/// per-product config — caller treats those as "no calibration this
+/// cycle".
+fn compute_raw_synthetic_margin(runtime: &Arc<Runtime>) -> f64 {
+    use chrono::Utc;
+    let p = runtime.portfolio.lock().unwrap();
+    let md = runtime.market_data.lock().unwrap();
+    if p.position_count() == 0 {
+        return 0.0;
+    }
+
+    // Group by product: each product has its own multiplier and
+    // forward; SPAN's portfolio_margin assumes a single multiplier.
+    let mut by_product: std::collections::HashMap<String, Vec<(f64, char, f64, f64, i64)>> =
+        Default::default();
+    let now = Utc::now();
+    for pos in p.positions() {
+        let t = (pos.expiry.and_hms_opt(16, 0, 0).unwrap()
+            .and_utc()
+            - now)
+            .num_seconds() as f64
+            / (365.0 * 86400.0);
+        if t <= 0.0 {
+            continue;
+        }
+        let right_char = match pos.right {
+            corsair_broker_api::Right::Call => 'C',
+            corsair_broker_api::Right::Put => 'P',
+        };
+        // IV: prefer market-implied via greek refresh. We don't have
+        // the per-strike IV cached cheaply here, so fall back to
+        // product default_iv. The scale calibration is forgiving —
+        // raw_synthetic doesn't need to be exact, just stable.
+        let iv = p
+            .registry()
+            .get(&pos.product)
+            .map(|i| i.default_iv)
+            .unwrap_or(0.30);
+        by_product
+            .entry(pos.product.clone())
+            .or_default()
+            .push((pos.strike, right_char, t, iv, pos.quantity as i64));
+    }
+
+    let mut total = 0.0;
+    for (product, positions) in by_product {
+        let f = match md.underlying_price(&product) {
+            Some(f) => f,
+            None => continue,
+        };
+        let info = match p.registry().get(&product) {
+            Some(i) => i,
+            None => continue,
+        };
+        let cfg = corsair_pricing::span::SpanConfig {
+            up_scan_pct: 0.05,
+            down_scan_pct: 0.05,
+            vol_scan_pct: 0.25,
+            extreme_mult: 2.0,
+            extreme_cover: 0.35,
+            short_option_minimum: 50.0,
+            multiplier: info.multiplier,
+        };
+        let m = corsair_pricing::span::portfolio_margin(f, &positions, &cfg);
+        total += m.total_margin;
+    }
+    total
 }

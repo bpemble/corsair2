@@ -93,6 +93,13 @@ struct BrokerState {
     /// Pending recent_fills responses, keyed by reqId.
     pending_executions: HashMap<i32, PendingExecutionsRequest>,
 
+    /// Pending place_order acks, keyed by orderId. Resolved on the
+    /// first OpenOrder message OR an Error with req_id == orderId.
+    /// Lets place_order detect IBKR rejects synchronously instead of
+    /// returning a phantom OrderId that the trader treats as live
+    /// (P0-4 + CLAUDE.md §14 hedge_qty trust concern).
+    pending_place_acks: HashMap<i32, oneshot::Sender<Result<(), BrokerError>>>,
+
     /// reqId → InstrumentId for tick routing.
     tick_routes: HashMap<i32, InstrumentId>,
 
@@ -177,6 +184,14 @@ impl NativeBroker {
         self.state.lock().await.seeding
     }
 
+    /// Reset seeding flags before issuing a re-snapshot reqXxx pair.
+    /// Without this, a second `wait_for_seeding` returns immediately
+    /// based on the stale `done=true` from the prior bootstrap.
+    pub async fn reset_seeding_flags(&self) {
+        let mut s = self.state.lock().await;
+        s.seeding = SeedingProgress::default();
+    }
+
     /// Wait until positions, open orders, and account values have all
     /// streamed their "End" signals — meaning the initial snapshot is
     /// complete. Returns Ok even if the timeout elapses (caller
@@ -255,9 +270,16 @@ impl NativeBroker {
     ) {
         match msg {
             InboundMsg::Position(p) => {
-                if let Some(pos) = native_to_position(&p) {
+                let key = (p.account.clone(), p.contract.con_id);
+                if p.position == 0.0 {
+                    // Closed position — IBKR sends qty=0 to indicate
+                    // close. Don't leave a stale zero entry in the
+                    // cache (would inflate positions().len() and
+                    // confuse downstream seeding).
                     let mut s = state.lock().await;
-                    let key = (p.account.clone(), p.contract.con_id);
+                    s.positions.remove(&key);
+                } else if let Some(pos) = native_to_position(&p) {
+                    let mut s = state.lock().await;
                     s.positions.insert(key, pos);
                 }
             }
@@ -279,22 +301,34 @@ impl NativeBroker {
                 s.account_values.insert(key, a);
             }
             InboundMsg::OpenOrder(o) => {
-                if let Some(open) = native_to_open_order(&o) {
+                let order_id = o.order_id;
+                let ack = if let Some(open) = native_to_open_order(&o) {
                     let mut s = state.lock().await;
-                    s.open_orders.insert(o.order_id, open);
+                    s.open_orders.insert(order_id, open);
+                    s.pending_place_acks.remove(&order_id)
+                } else {
+                    let mut s = state.lock().await;
+                    s.pending_place_acks.remove(&order_id)
+                };
+                if let Some(tx) = ack {
+                    let _ = tx.send(Ok(()));
                 }
             }
             InboundMsg::OrderStatus(o) => {
+                let parsed_status = parse_status(&o.status);
                 {
                     let mut s = state.lock().await;
                     if let Some(open) = s.open_orders.get_mut(&o.order_id) {
-                        open.status = parse_status(&o.status);
+                        open.status = parsed_status;
                         open.filled_qty = o.filled as u32;
                     }
                 }
+                // Lock dropped before broadcast::send so a slow
+                // consumer cannot stall the dispatcher and back up the
+                // recv channel (P0-5).
                 let _ = channels.status.send(OrderStatusUpdate {
                     order_id: OrderId(o.order_id as u64),
-                    status: parse_status(&o.status),
+                    status: parsed_status,
                     filled_qty: o.filled as u32,
                     remaining_qty: o.remaining as u32,
                     avg_fill_price: o.avg_fill_price,
@@ -311,14 +345,21 @@ impl NativeBroker {
                 if let Some(fill) = execution_to_fill(&e) {
                     // If req_id > 0, this is a response to reqExecutions.
                     // Otherwise, it's a real-time exec from execDetailsEvent.
-                    if e.req_id > 0 {
+                    let routed_to_pending = if e.req_id > 0 {
                         let mut s = state.lock().await;
                         if let Some(p) = s.pending_executions.get_mut(&e.req_id) {
-                            p.accumulated.push(fill);
-                            return;
+                            p.accumulated.push(fill.clone());
+                            true
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+                    if !routed_to_pending {
+                        // Lock released before broadcast (P0-5).
+                        let _ = channels.fills.send(fill);
                     }
-                    let _ = channels.fills.send(fill);
                 }
             }
             InboundMsg::ExecutionEnd(req_id) => {
@@ -346,17 +387,20 @@ impl NativeBroker {
                 }
             }
             InboundMsg::TickPrice(t) => {
-                let s = state.lock().await;
-                if let Some(iid) = s.tick_routes.get(&t.req_id) {
-                    let kind = match t.tick_type {
-                        1 => Some(TickKind::Bid),
-                        2 => Some(TickKind::Ask),
-                        4 => Some(TickKind::Last),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
+                let kind = match t.tick_type {
+                    1 => Some(TickKind::Bid),
+                    2 => Some(TickKind::Ask),
+                    4 => Some(TickKind::Last),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    // Read the route, drop the lock, THEN broadcast.
+                    // Keeps tick fast-path independent of slow
+                    // broadcast consumers (P0-5).
+                    let iid_opt = state.lock().await.tick_routes.get(&t.req_id).copied();
+                    if let Some(iid) = iid_opt {
                         let _ = channels.ticks.send(Tick {
-                            instrument_id: *iid,
+                            instrument_id: iid,
                             kind,
                             price: Some(t.price),
                             size: None,
@@ -366,17 +410,17 @@ impl NativeBroker {
                 }
             }
             InboundMsg::TickSize(t) => {
-                let s = state.lock().await;
-                if let Some(iid) = s.tick_routes.get(&t.req_id) {
-                    let kind = match t.tick_type {
-                        0 => Some(TickKind::BidSize),
-                        3 => Some(TickKind::AskSize),
-                        8 => Some(TickKind::Volume),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
+                let kind = match t.tick_type {
+                    0 => Some(TickKind::BidSize),
+                    3 => Some(TickKind::AskSize),
+                    8 => Some(TickKind::Volume),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let iid_opt = state.lock().await.tick_routes.get(&t.req_id).copied();
+                    if let Some(iid) = iid_opt {
                         let _ = channels.ticks.send(Tick {
-                            instrument_id: *iid,
+                            instrument_id: iid,
                             kind,
                             price: None,
                             size: Some(t.size as u64),
@@ -387,15 +431,36 @@ impl NativeBroker {
             }
             InboundMsg::Error(e) => {
                 let be = error_to_broker_error(&e);
-                if e.req_id > 0 && is_contract_error(e.error_code) {
+                // Resolve pending contract / place_order waiters under
+                // the lock, then drop and broadcast (P0-5). Order-side
+                // error codes (200-range, 201, 202, 436) carry the
+                // orderId in req_id; on those we fail the place ack so
+                // place_order returns an error instead of a phantom OK.
+                let mut to_fail_contract = None;
+                let mut to_fail_place = None;
+                {
                     let mut s = state.lock().await;
-                    if let Some(mut p) = s.pending_contract_details.remove(&e.req_id) {
-                        if let Some(sender) = p.sender.take() {
-                            let _ = sender.send(Err(BrokerError::ContractNotFound(
-                                e.error_string.clone(),
-                            )));
+                    if e.req_id > 0 {
+                        if is_contract_error(e.error_code) {
+                            to_fail_contract = s.pending_contract_details.remove(&e.req_id);
+                        }
+                        if is_order_error(e.error_code) {
+                            to_fail_place = s.pending_place_acks.remove(&e.req_id);
                         }
                     }
+                }
+                if let Some(mut p) = to_fail_contract {
+                    if let Some(sender) = p.sender.take() {
+                        let _ = sender.send(Err(BrokerError::ContractNotFound(
+                            e.error_string.clone(),
+                        )));
+                    }
+                }
+                if let Some(tx) = to_fail_place {
+                    let _ = tx.send(Err(BrokerError::OrderRejected {
+                        order_id: Some(e.req_id as u64),
+                        reason: e.error_string.clone(),
+                    }));
                 }
                 let _ = channels.errors.send(be);
             }
@@ -428,6 +493,25 @@ fn parse_status(s: &str) -> OrderStatus {
 
 fn is_contract_error(code: i32) -> bool {
     matches!(code, 200 | 321 | 322)
+}
+
+/// IBKR error codes that indicate an order was rejected at submission
+/// or shortly thereafter. The req_id field carries the orderId for
+/// these. Used by place_order ack correlation to fail synchronously
+/// instead of leaving a phantom orderId in the trader.
+fn is_order_error(code: i32) -> bool {
+    matches!(
+        code,
+        201    // order rejected by IBKR
+        | 202  // order cancelled (e.g., cancel ack)
+        | 203  // security symbol not found / not subscribed
+        | 399  // warning: order modified to fit risk
+        | 434  // qty=0
+        | 436  // FA: must specify allocation
+        | 461  // displaying liquid message
+        | 10148 // OrderId not found
+        | 10197 // No market for this order
+    )
 }
 
 fn error_to_broker_error(e: &ErrorMsg) -> BrokerError {
@@ -777,6 +861,30 @@ impl Broker for NativeBroker {
 
     async fn disconnect(&mut self) -> BResult<()> {
         self.connected.store(false, Ordering::SeqCst);
+        // Drain pending waiters so callers don't block on their
+        // tokio::time::timeout (P1-8).
+        {
+            let mut s = self.state.lock().await;
+            for (_, mut p) in s.pending_contract_details.drain() {
+                if let Some(sender) = p.sender.take() {
+                    let _ = sender.send(Err(BrokerError::ConnectionLost(
+                        "disconnect during pending qualify".into(),
+                    )));
+                }
+            }
+            for (_, mut p) in s.pending_executions.drain() {
+                if let Some(sender) = p.sender.take() {
+                    let _ = sender.send(Err(BrokerError::ConnectionLost(
+                        "disconnect during pending executions".into(),
+                    )));
+                }
+            }
+            for (_, tx) in s.pending_place_acks.drain() {
+                let _ = tx.send(Err(BrokerError::ConnectionLost(
+                    "disconnect during pending place_order ack".into(),
+                )));
+            }
+        }
         self.client
             .disconnect()
             .await
@@ -803,14 +911,45 @@ impl Broker for NativeBroker {
                 "next_valid_id not seeded — call wait_for_bootstrap".into(),
             ));
         }
+
+        // Install a pending place_order waiter BEFORE sending the
+        // wire frame so we don't race the dispatcher.
+        let (tx, rx) = oneshot::channel::<Result<(), BrokerError>>();
+        {
+            let mut s = self.state.lock().await;
+            s.pending_place_acks.insert(order_id, tx);
+        }
+
         let cr = place_order_contract_request(&req.contract);
         let params = build_place_params(&req, &self.cfg.account)?;
         let frame = place_order(order_id, &cr, &params);
-        self.client
-            .send_raw(&frame)
-            .await
-            .map_err(Self::map_native_err)?;
-        Ok(OrderId(order_id as u64))
+        if let Err(e) = self.client.send_raw(&frame).await {
+            // Send failed; clean up waiter.
+            self.state.lock().await.pending_place_acks.remove(&order_id);
+            return Err(Self::map_native_err(e));
+        }
+
+        // Wait briefly for OpenOrder ack OR Error rejection. IBKR is
+        // typically <100ms for the first response. Beyond 2s we
+        // assume the gateway is wedged and surface a timeout — caller
+        // can retry. CLAUDE.md doesn't pin this latency; 2s is the
+        // same conservative budget the Python broker used.
+        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+            Ok(Ok(Ok(()))) => Ok(OrderId(order_id as u64)),
+            Ok(Ok(Err(broker_err))) => Err(broker_err),
+            Ok(Err(_dropped)) => Err(BrokerError::Internal(
+                "place_order ack channel dropped".into(),
+            )),
+            Err(_elapsed) => {
+                // Time out — drop waiter; the order may still be live
+                // at IBKR. Caller should treat this as an unknown
+                // outcome and reconcile via open_orders().
+                self.state.lock().await.pending_place_acks.remove(&order_id);
+                Err(BrokerError::Internal(format!(
+                    "place_order ack timeout (orderId={order_id})"
+                )))
+            }
+        }
     }
 
     async fn cancel_order(&self, id: OrderId) -> BResult<()> {

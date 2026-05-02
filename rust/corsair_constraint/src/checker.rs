@@ -62,17 +62,101 @@ pub struct ConstraintCheck {
     pub hedge_qty: i32,
 }
 
+/// Calibration bounds on the synthetic-vs-IBKR scale factor (CLAUDE.md
+/// §3). Values outside the band fall back to 1.0 so the scale never
+/// hides a real risk-model failure.
+pub const IBKR_SCALE_LOWER: f64 = 0.5;
+pub const IBKR_SCALE_UPPER: f64 = 1.25;
+
 pub struct ConstraintChecker {
     cfg: ConstraintConfig,
+    /// Synthetic-vs-IBKR margin scale factor (CLAUDE.md §3). Synthetic
+    /// SPAN runs ~25-30% high vs IBKR for short strangles; this scale
+    /// brings outputs to IBKR-equivalent. Updated every ~5min by
+    /// `update_cached_margin`. Default 1.0 (no scaling) until first
+    /// calibration lands.
+    ibkr_scale: f64,
+    /// Last-observed raw / IBKR / scale tuple. Useful for telemetry.
+    last_calibration: Option<MarginCalibration>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MarginCalibration {
+    pub raw_synthetic: f64,
+    pub ibkr_actual: f64,
+    pub scale: f64,
+    pub timestamp_ns: u64,
 }
 
 impl ConstraintChecker {
     pub fn new(cfg: ConstraintConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            ibkr_scale: 1.0,
+            last_calibration: None,
+        }
     }
 
     pub fn config(&self) -> &ConstraintConfig {
         &self.cfg
+    }
+
+    /// Current synthetic-vs-IBKR scale factor. Multiply raw synthetic
+    /// SPAN by this to get IBKR-equivalent margin.
+    pub fn ibkr_scale(&self) -> f64 {
+        self.ibkr_scale
+    }
+
+    /// Apply the IBKR scale to a raw synthetic SPAN value.
+    pub fn scale(&self, raw_synthetic: f64) -> f64 {
+        raw_synthetic * self.ibkr_scale
+    }
+
+    /// Re-calibrate the IBKR scale from a fresh account-values poll.
+    /// Skip the update if either input is non-positive (degenerate
+    /// state) or if the resulting scale is outside the safety band —
+    /// the bound prevents masking a real risk model failure (CLAUDE.md
+    /// §3). Returns the scale actually adopted.
+    pub fn update_cached_margin(
+        &mut self,
+        ibkr_actual: f64,
+        raw_synthetic: f64,
+        timestamp_ns: u64,
+    ) -> f64 {
+        if ibkr_actual <= 0.0 || raw_synthetic <= 0.0 {
+            // Don't update on degenerate inputs — keep prior scale.
+            return self.ibkr_scale;
+        }
+        let proposed = ibkr_actual / raw_synthetic;
+        let bounded = if proposed < IBKR_SCALE_LOWER || proposed > IBKR_SCALE_UPPER {
+            log::warn!(
+                "ibkr_scale: proposed={:.3} outside [{:.2}, {:.2}] — falling back to 1.0",
+                proposed,
+                IBKR_SCALE_LOWER,
+                IBKR_SCALE_UPPER
+            );
+            1.0
+        } else {
+            proposed
+        };
+        self.ibkr_scale = bounded;
+        self.last_calibration = Some(MarginCalibration {
+            raw_synthetic,
+            ibkr_actual,
+            scale: bounded,
+            timestamp_ns,
+        });
+        log::info!(
+            "ibkr_scale recalibrated: raw=${:.0} ibkr=${:.0} → scale={:.3}",
+            raw_synthetic,
+            ibkr_actual,
+            bounded
+        );
+        bounded
+    }
+
+    pub fn last_calibration(&self) -> Option<MarginCalibration> {
+        self.last_calibration
     }
 
     /// Evaluate all gates against the proposed fill.

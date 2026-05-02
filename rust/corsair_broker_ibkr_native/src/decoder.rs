@@ -316,6 +316,16 @@ fn parse_open_order(fields: &[String]) -> Result<InboundMsg, NativeError> {
             "openOrder fields={}", fields.len()
         )));
     }
+    // Parse the order body fields safely. IBKR's openOrder is
+    // ~80 fields long; we extract the ones that matter for
+    // OMS / modify_order semantics. Use .get() so we degrade
+    // gracefully if a field is missing rather than panicking.
+    let get = |idx: usize| -> &str {
+        fields.get(idx).map(|s| s.as_str()).unwrap_or("")
+    };
+    let parse_f = |idx: usize| -> f64 {
+        parse_f64(get(idx)).unwrap_or(0.0)
+    };
     Ok(InboundMsg::OpenOrder(OpenOrderMsg {
         order_id: parse_int(&fields[1])?,
         contract: ContractDecoded {
@@ -336,12 +346,20 @@ fn parse_open_order(fields: &[String]) -> Result<InboundMsg, NativeError> {
         total_quantity: parse_f64(&fields[14])?,
         order_type: fields[15].clone(),
         lmt_price: parse_f64(&fields[16])?,
-        // The rest of openOrder has many more fields; we leave
-        // tif, account, order_ref, status, filled, remaining as
-        // empty/0. Phase 6.5.x extends this when we wire OMS.
-        tif: String::new(),
-        account: String::new(),
-        order_ref: String::new(),
+        // Order body continues. ib_insync field order:
+        //   17: aux_price (used by STP / STP LMT)
+        //   18: tif
+        //   19: oca_group
+        //   20: account
+        //   21: open_close
+        //   22: origin
+        //   23: order_ref
+        // We only need tif, account, order_ref for modify path.
+        // aux_price isn't kept on OpenOrderMsg today; STP_LMT
+        // modify isn't a path corsair uses.
+        tif: get(18).to_string(),
+        account: get(20).to_string(),
+        order_ref: get(23).to_string(),
         status: String::new(),
         filled: 0.0,
         remaining: 0.0,

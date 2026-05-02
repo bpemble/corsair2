@@ -86,6 +86,13 @@ pub struct Runtime {
     pub market_data: Mutex<MarketDataState>,
     pub snapshot: Mutex<SnapshotPublisher>,
 
+    /// Cached account snapshot from `Broker::account_values()`. Updated
+    /// every ~5min by `periodic_account_poll`. Read by
+    /// `periodic_risk_check` so margin_kill has a real number to gate
+    /// on (CLAUDE.md §7) and by `IBKRMarginChecker.update_cached_margin`
+    /// equivalent to compute the synthetic-vs-IBKR scale (§3).
+    pub account: Mutex<corsair_broker_api::AccountSnapshot>,
+
     /// Send-or-update config snapshotted at construction.
     pub send_or_update_cfg: SendOrUpdateConfig,
 }
@@ -187,6 +194,14 @@ impl Runtime {
             oms: Mutex::new(oms),
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
+            account: Mutex::new(corsair_broker_api::AccountSnapshot {
+                net_liquidation: 0.0,
+                maintenance_margin: 0.0,
+                initial_margin: 0.0,
+                buying_power: 0.0,
+                realized_pnl_today: 0.0,
+                timestamp_ns: 0,
+            }),
             send_or_update_cfg,
         });
 
@@ -233,8 +248,11 @@ impl Runtime {
         }
     }
 
-    /// Read positions from the broker, seed PortfolioState. Mirrors
-    /// `seed_from_ibkr` in Python.
+    /// Read positions from the broker, seed PortfolioState (options) and
+    /// HedgeManager (futures). Mirrors `seed_from_ibkr` in Python AND
+    /// the boot reconcile step CLAUDE.md §10 names as a hard live
+    /// prerequisite. Skipping the hedge reconcile leaves hedge_qty=0
+    /// locally on every restart and triggers spurious delta_kill.
     async fn seed_positions_from_broker(self: &Arc<Self>) -> Result<(), RuntimeError> {
         let positions = {
             let b = self.broker.lock().await;
@@ -246,9 +264,13 @@ impl Runtime {
             let p = self.portfolio.lock().unwrap();
             p.registry().products()
         };
+
+        // Track hedge reconciliation per product. Populated as we walk
+        // futures positions; applied AFTER the loop so we don't hold
+        // both the portfolio and hedge locks simultaneously.
+        let mut hedge_seeds: Vec<(String, i32, f64)> = Vec::new();
+
         for pos in positions {
-            // Translate corsair_broker_api::Position into
-            // corsair_position::Position.
             if !registry_products.contains(&pos.contract.symbol) {
                 log::debug!(
                     "seed: skipping unregistered product {}",
@@ -256,43 +278,90 @@ impl Runtime {
                 );
                 continue;
             }
-            // For options we need strike + right; futures hedge state
-            // lives in HedgeManager, not PortfolioState.
-            if pos.contract.kind != corsair_broker_api::ContractKind::Option {
-                continue;
+            match pos.contract.kind {
+                corsair_broker_api::ContractKind::Option => {
+                    let right = match pos.contract.right {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let strike = match pos.contract.strike {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let multiplier = if pos.contract.multiplier > 0.0 {
+                        pos.contract.multiplier
+                    } else {
+                        log::warn!(
+                            "seed: invalid multiplier=0 for {} {} {:?}; skipping",
+                            pos.contract.symbol,
+                            strike,
+                            right
+                        );
+                        continue;
+                    };
+                    to_insert.push(corsair_position::Position {
+                        product: pos.contract.symbol.clone(),
+                        strike,
+                        expiry: pos.contract.expiry,
+                        right,
+                        quantity: pos.quantity,
+                        avg_fill_price: pos.avg_cost / multiplier,
+                        fill_time: chrono::Utc::now(),
+                        multiplier,
+                        delta: 0.0,
+                        gamma: 0.0,
+                        theta: 0.0,
+                        vega: 0.0,
+                        current_price: 0.0,
+                    });
+                }
+                corsair_broker_api::ContractKind::Future => {
+                    if pos.quantity == 0 {
+                        continue;
+                    }
+                    // avg_cost from IBKR is per-contract notional; the
+                    // hedge state stores avg_entry_F (per-unit price).
+                    let multiplier = if pos.contract.multiplier > 0.0 {
+                        pos.contract.multiplier
+                    } else {
+                        25_000.0 // HG default if missing
+                    };
+                    let avg_entry_f = pos.avg_cost / multiplier;
+                    hedge_seeds.push((
+                        pos.contract.symbol.clone(),
+                        pos.quantity,
+                        avg_entry_f,
+                    ));
+                }
             }
-            let right = match pos.contract.right {
-                Some(r) => r,
-                None => continue,
-            };
-            let strike = match pos.contract.strike {
-                Some(s) => s,
-                None => continue,
-            };
-            to_insert.push(corsair_position::Position {
-                product: pos.contract.symbol.clone(),
-                strike,
-                expiry: pos.contract.expiry,
-                right,
-                quantity: pos.quantity,
-                avg_fill_price: pos.avg_cost / pos.contract.multiplier,
-                fill_time: chrono::Utc::now(),
-                multiplier: pos.contract.multiplier,
-                delta: 0.0,
-                gamma: 0.0,
-                theta: 0.0,
-                vega: 0.0,
-                current_price: 0.0,
-            });
         }
-        let count = to_insert.len();
+
+        let opt_count = to_insert.len();
         {
             let mut p = self.portfolio.lock().unwrap();
             p.replace_positions(to_insert);
         }
+
+        // Apply hedge seeds. CLAUDE.md §10: "boot reconcile reads
+        // ib.positions(), finds the FUT position matching the resolved
+        // hedge contract by conId/localSymbol, sets hedge_qty and
+        // avg_entry_F to match." We don't yet match by conId — products
+        // with multiple hedge contracts (calendar) would need that.
+        let mut hedge_count = 0;
+        if !hedge_seeds.is_empty() {
+            let mut hedge = self.hedge.lock().unwrap();
+            for (product, qty, avg) in &hedge_seeds {
+                if let Some(mgr) = hedge.for_product_mut(product) {
+                    let changed = mgr.reconcile_with_position(*qty, *avg, false);
+                    if changed {
+                        hedge_count += 1;
+                    }
+                }
+            }
+        }
+
         log::warn!(
-            "corsair_broker seeded {} positions from broker",
-            count
+            "corsair_broker seeded {opt_count} option positions, {hedge_count} hedge reconciles from broker"
         );
         Ok(())
     }
