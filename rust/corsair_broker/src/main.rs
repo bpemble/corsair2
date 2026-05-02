@@ -47,6 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime: Arc<Runtime> = Runtime::new(cfg, mode).await?;
     let _handles = spawn_all(runtime.clone());
 
+    // Subscribe to market data so the broker has a live view (greeks,
+    // vol surface, MTM all depend on it).
+    if let Err(e) = corsair_broker::subscribe_market_data(&runtime).await {
+        log::error!("market data subscription failed: {e}");
+    }
+
     // IPC server — gated by env so we don't accidentally clobber the
     // Python broker's IPC files during shadow validation.
     if std::env::var("CORSAIR_BROKER_IPC_ENABLED")

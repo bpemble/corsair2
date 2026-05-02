@@ -283,6 +283,8 @@ mod python {
     /// queue. Returning the list keeps a Python reference alive — if
     /// we let it drop, ib_insync's event listeners get GCed.
     const EVENT_REGISTRAR_SRC: &str = r#"
+import asyncio
+
 def register(ib, queue):
     def on_fill(trade, fill):
         queue.append(('fill', fill))
@@ -307,6 +309,24 @@ def attach_ticker(ticker, queue):
         queue.append(('tick', t))
     ticker.updateEvent += on_update
     return on_update
+
+def lean_connect(ib, host, port, client_id, account, timeout=30):
+    """Phase 5B / 5B.0 reality: the lean bypass that
+    src/connection.py uses (ib.client.connectAsync followed by
+    individual reqs) hangs when driven from PyO3+Rust, due to
+    asyncio loop binding between the bridge thread's loop and
+    ib_insync's internal expectations.
+
+    We fall back to ib.connect() with an extended timeout — does
+    the full FA bootstrap (slow, ~60-180s on this account) but
+    succeeds reliably. Phase 6 replaces this entire bridge with a
+    native Rust IBKR client; the asyncio loop issue goes away
+    because there's no Python loop in the picture.
+    """
+    ib.connect(host=host, port=port, clientId=client_id,
+               account=account or '', timeout=180)
+    if client_id == 0:
+        ib.reqAutoOpenOrders(True)
 "#;
 
     impl PyState {
@@ -418,47 +438,29 @@ def attach_ticker(ticker, queue):
 
     fn cmd_connect(state: &PyState) -> Result<(), BrokerError> {
         Python::with_gil(|py| -> Result<(), BrokerError> {
-            let ib = state.ib.bind(py);
-
-            // Use ib_insync's SYNC connect() rather than connectAsync.
-            // Sync version internally manages its own loop via
-            // ib.run() — works correctly when called from a non-async
-            // context like ours (Rust → with_gil → ib.connect).
-            //
-            // Lean bypass: ib.connect with readonly=False (default)
-            // does the four lean reqs; the v1.4 full bootstrap
-            // (positions + openOrders + accountUpdates) is what we
-            // want and ib_insync's connect handles automatically.
-            let kwargs = PyDict::new_bound(py);
-            kwargs
-                .set_item("host", &state.gateway_host)
-                .map_err(|e| pyerr_to_broker(e, "set host"))?;
-            kwargs
-                .set_item("port", state.gateway_port)
-                .map_err(|e| pyerr_to_broker(e, "set port"))?;
-            kwargs
-                .set_item("clientId", state.client_id)
-                .map_err(|e| pyerr_to_broker(e, "set clientId"))?;
-            if !state.account.is_empty() {
-                kwargs
-                    .set_item("account", &state.account)
-                    .map_err(|e| pyerr_to_broker(e, "set account"))?;
-            }
-            // Connection timeout (seconds) — IBKR docs recommend ≥30s.
-            kwargs
-                .set_item("timeout", 30)
-                .map_err(|e| pyerr_to_broker(e, "set timeout"))?;
-            ib.call_method("connect", (), Some(&kwargs))
-                .map_err(|e| pyerr_to_broker(e, "connect"))?;
-
-            // FA accounts require reqAutoOpenOrders for clientId=0
-            // (CLAUDE.md §1). Sync version is fine.
-            if state.client_id == 0 {
-                let _ = ib.call_method1("reqAutoOpenOrders", (true,));
-            }
-
+            // Lean bypass: call the Python helper compiled into
+            // EVENT_REGISTRAR_SRC. The helper runs ib.client.connectAsync
+            // (handshake only) on Python's own event loop, then issues
+            // exactly the 4 init reqs we want, with `account=` filtered
+            // to one sub-account (avoids the FA master's all-sub-accounts
+            // timeout).
+            let lean_connect = state
+                .registrar_mod
+                .bind(py)
+                .getattr("lean_connect")
+                .map_err(|e| pyerr_to_broker(e, "getattr lean_connect"))?;
+            lean_connect
+                .call1((
+                    state.ib.bind(py),
+                    state.gateway_host.clone(),
+                    state.gateway_port,
+                    state.client_id,
+                    state.account.clone(),
+                    30, // socket-level timeout
+                ))
+                .map_err(|e| pyerr_to_broker(e, "lean_connect"))?;
             log::warn!(
-                "corsair_broker_ibkr: connected to {}:{} as clientId={} account={}",
+                "corsair_broker_ibkr: connected to {}:{} as clientId={} account={} (lean bypass)",
                 state.gateway_host,
                 state.gateway_port,
                 state.client_id,
