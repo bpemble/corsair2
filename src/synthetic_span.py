@@ -44,11 +44,24 @@ synthetic-vs-IBKR drift; use it to detect if the constants need a
 re-fit (e.g. after a large IV regime change).
 """
 
+import os
 from typing import Iterable, Tuple
 
 import numpy as np
 
 from .pricing import PricingEngine
+
+try:
+    import corsair_pricing as _rs
+    _HAVE_RS_SPAN = bool(
+        getattr(_rs, "span_position_risk_array", None)
+        and getattr(_rs, "span_portfolio_margin", None)
+    )
+except ImportError:
+    _rs = None
+    _HAVE_RS_SPAN = False
+_USE_RS_SPAN = (_HAVE_RS_SPAN
+                and os.environ.get("CORSAIR_SPAN", "rust") != "python")
 
 # 16-scenario SPAN scan grid: (price_fraction_of_scan, vol_fraction, cover)
 # Index 0..13 are the standard scan (price ∈ {0, ±1/3, ±2/3, ±3/3} × vol ±1)
@@ -83,6 +96,17 @@ class SyntheticSpan:
         """
         if F <= 0 or T <= 0 or iv <= 0:
             return np.zeros(16)
+
+        if _USE_RS_SPAN:
+            try:
+                arr = _rs.span_position_risk_array(
+                    F, K, T, iv, right,
+                    self.up_scan_pct, self.down_scan_pct, self.vol_scan_pct,
+                    self.extreme_mult, self.extreme_cover, self._multiplier,
+                )
+                return np.asarray(arr, dtype=np.float64)
+            except Exception:
+                pass
 
         base = PricingEngine.black76_price(F, K, T, iv, right=right)
         up_scan = F * self.up_scan_pct
@@ -128,6 +152,33 @@ class SyntheticSpan:
         Returns {scan_risk, net_option_value, short_minimum, total_margin,
                  worst_scenario}.
         """
+        # Materialize once; the iterable may be a generator and we need
+        # to pass it into Rust as a list.
+        positions_list = [
+            (float(K), str(right), float(T), float(iv), int(qty))
+            for (K, right, T, iv, qty) in positions
+        ]
+        if _USE_RS_SPAN:
+            try:
+                m = _rs.span_portfolio_margin(
+                    F, positions_list,
+                    self.up_scan_pct, self.down_scan_pct, self.vol_scan_pct,
+                    self.extreme_mult, self.extreme_cover,
+                    self.short_option_minimum, self._multiplier,
+                )
+                return {
+                    "scan_risk": float(m["scan_risk"]),
+                    "net_option_value": float(m["net_option_value"]),
+                    "long_premium": float(m["long_premium"]),
+                    "short_minimum": float(m["short_minimum"]),
+                    "total_margin": float(m["total_margin"]),
+                    "worst_scenario": int(m["worst_scenario"]),
+                }
+            except Exception:
+                pass
+
+        # Python fallback
+        positions = positions_list  # rebind for the legacy path below
         portfolio = np.zeros(16)
         nov = 0.0
         long_premium = 0.0

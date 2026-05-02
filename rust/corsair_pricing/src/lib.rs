@@ -12,6 +12,8 @@
 // fallback to bisection).
 
 mod calibrate;
+mod greeks;
+mod span;
 
 use pyo3::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
@@ -27,6 +29,15 @@ fn norm_cdf(x: f64) -> f64 {
 #[pyo3(signature = (f, k, t, sigma, r=0.0, right="C"))]
 fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: &str) -> f64 {
     let is_call = right.eq_ignore_ascii_case("C");
+    let r_char = if is_call { 'C' } else { 'P' };
+    black76_price_inner(f, k, t, sigma, r, r_char)
+}
+
+/// Inner Black-76 used by span/greeks modules — takes a char to skip
+/// the str-parse on every call. Identical numerics to black76_price.
+#[inline]
+pub(crate) fn black76_price_inner(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
+    let is_call = right == 'C' || right == 'c';
     if t <= 0.0 || sigma <= 0.0 || f <= 0.0 || k <= 0.0 {
         return if is_call {
             (f - k).max(0.0)
@@ -452,6 +463,95 @@ fn calibrate_svi(
     }
 }
 
+/// Black-76 Greeks for one option contract. Mirrors
+/// src/greeks.py:GreeksCalculator.calculate.
+///
+/// Returns a dict with keys (delta, gamma, theta, vega, iv).
+/// gamma/theta/vega are dollar-denominated via the multiplier;
+/// theta is per-calendar-day (matches the Python /365 convention).
+#[pyfunction]
+#[pyo3(signature = (f, k, t, sigma, r=0.0, right="C", multiplier=50.0))]
+fn compute_greeks(
+    py: Python<'_>,
+    f: f64, k: f64, t: f64, sigma: f64,
+    r: f64, right: &str, multiplier: f64,
+) -> PyResult<PyObject> {
+    let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    let g = greeks::compute_greeks(f, k, t, sigma, r, r_char, multiplier);
+    let dict = pyo3::types::PyDict::new_bound(py);
+    dict.set_item("delta", g.delta)?;
+    dict.set_item("gamma", g.gamma)?;
+    dict.set_item("theta", g.theta)?;
+    dict.set_item("vega", g.vega)?;
+    dict.set_item("iv", g.iv)?;
+    Ok(dict.into())
+}
+
+/// 16-element risk array (loss $ per LONG contract per scenario).
+/// Mirrors src/synthetic_span.py:position_risk_array. Returned as a
+/// Python list; convert to numpy on the call site if you need it.
+#[pyfunction]
+#[pyo3(signature = (f, k, t, iv, right,
+                    up_scan_pct, down_scan_pct, vol_scan_pct,
+                    extreme_mult, extreme_cover, multiplier))]
+#[allow(clippy::too_many_arguments)]
+fn span_position_risk_array(
+    py: Python<'_>,
+    f: f64, k: f64, t: f64, iv: f64, right: &str,
+    up_scan_pct: f64, down_scan_pct: f64, vol_scan_pct: f64,
+    extreme_mult: f64, extreme_cover: f64, multiplier: f64,
+) -> PyResult<PyObject> {
+    let cfg = span::SpanConfig {
+        up_scan_pct, down_scan_pct, vol_scan_pct,
+        extreme_mult, extreme_cover,
+        short_option_minimum: 0.0, // unused for single-position scan
+        multiplier,
+    };
+    let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    let arr = span::position_risk_array(f, k, t, iv, r_char, &cfg);
+    let list = pyo3::types::PyList::new_bound(py, arr.iter());
+    Ok(list.into())
+}
+
+/// Portfolio SPAN margin. positions = list of (strike, right, T,
+/// iv, signed_qty) tuples. Mirrors src/synthetic_span.py:portfolio_margin.
+#[pyfunction]
+#[pyo3(signature = (f, positions,
+                    up_scan_pct, down_scan_pct, vol_scan_pct,
+                    extreme_mult, extreme_cover,
+                    short_option_minimum, multiplier))]
+#[allow(clippy::too_many_arguments)]
+fn span_portfolio_margin(
+    py: Python<'_>,
+    f: f64,
+    positions: Vec<(f64, String, f64, f64, i64)>,
+    up_scan_pct: f64, down_scan_pct: f64, vol_scan_pct: f64,
+    extreme_mult: f64, extreme_cover: f64,
+    short_option_minimum: f64, multiplier: f64,
+) -> PyResult<PyObject> {
+    let cfg = span::SpanConfig {
+        up_scan_pct, down_scan_pct, vol_scan_pct,
+        extreme_mult, extreme_cover,
+        short_option_minimum, multiplier,
+    };
+    let positions_inner: Vec<(f64, char, f64, f64, i64)> = positions
+        .into_iter()
+        .map(|(k, right, t, iv, q)| {
+            let c = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+            (k, c, t, iv, q)
+        })
+        .collect();
+    let m = span::portfolio_margin(f, &positions_inner, &cfg);
+    let dict = pyo3::types::PyDict::new_bound(py);
+    dict.set_item("scan_risk", m.scan_risk)?;
+    dict.set_item("net_option_value", m.net_option_value)?;
+    dict.set_item("long_premium", m.long_premium)?;
+    dict.set_item("short_minimum", m.short_minimum)?;
+    dict.set_item("total_margin", m.total_margin)?;
+    dict.set_item("worst_scenario", m.worst_scenario)?;
+    Ok(dict.into())
+}
+
 #[pymodule]
 fn corsair_pricing(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(black76_price, m)?)?;
@@ -461,5 +561,8 @@ fn corsair_pricing(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decide_quote, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_sabr, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_svi, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_greeks, m)?)?;
+    m.add_function(wrap_pyfunction!(span_position_risk_array, m)?)?;
+    m.add_function(wrap_pyfunction!(span_portfolio_margin, m)?)?;
     Ok(())
 }

@@ -2,12 +2,26 @@
 
 Reused from Corsair v1. Computes delta, gamma, theta, and vega
 for individual options and aggregated portfolios.
+
+Rust path (default): corsair_pricing.compute_greeks. ~50× faster
+than the SciPy norm.cdf/pdf-based Python path. Set
+CORSAIR_GREEKS=python to force the SciPy fallback.
 """
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.stats import norm
+
+try:
+    import corsair_pricing as _rs
+    _HAVE_RS_GREEKS = bool(getattr(_rs, "compute_greeks", None))
+except ImportError:
+    _rs = None
+    _HAVE_RS_GREEKS = False
+_USE_RS_GREEKS = (_HAVE_RS_GREEKS
+                  and os.environ.get("CORSAIR_GREEKS", "rust") != "python")
 
 
 @dataclass
@@ -47,6 +61,25 @@ class GreeksCalculator:
             right: 'C' for call, 'P' for put.
             multiplier: Contract multiplier for dollar-denominated Greeks.
         """
+        if _USE_RS_GREEKS:
+            try:
+                g = _rs.compute_greeks(F, K, T, sigma, r, right, multiplier)
+                return Greeks(
+                    delta=float(g["delta"]), gamma=float(g["gamma"]),
+                    theta=float(g["theta"]), vega=float(g["vega"]),
+                    iv=float(g["iv"]),
+                )
+            except Exception:
+                pass  # fall through to Python on any Rust error
+        return self._calculate_python(F, K, T, sigma, r=r, right=right,
+                                       multiplier=multiplier)
+
+    def _calculate_python(
+        self,
+        F: float, K: float, T: float, sigma: float,
+        r: float = 0.0, right: str = "C", multiplier: float = 50,
+    ) -> Greeks:
+        """SciPy reference path. Kept as fallback + parity oracle."""
         is_call = right.upper() == "C"
 
         if T < 1e-10 or sigma <= 0 or F <= 0 or K <= 0:
