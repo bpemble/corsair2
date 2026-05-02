@@ -47,6 +47,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime: Arc<Runtime> = Runtime::new(cfg, mode).await?;
     let _handles = spawn_all(runtime.clone());
 
+    // IPC server — gated by env so we don't accidentally clobber the
+    // Python broker's IPC files during shadow validation.
+    if std::env::var("CORSAIR_BROKER_IPC_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let ipc_path = std::env::var("CORSAIR_BROKER_IPC_PATH")
+            .unwrap_or_else(|_| "/app/data/corsair_ipc".into());
+        let cfg = corsair_broker::IpcConfig {
+            base_path: std::path::PathBuf::from(ipc_path),
+            capacity: 1 << 20,
+        };
+        match corsair_broker::spawn_ipc(runtime.clone(), cfg) {
+            Ok(_server) => log::warn!("ipc server enabled"),
+            Err(e) => log::error!("ipc server start failed: {e}"),
+        }
+    } else {
+        log::info!(
+            "ipc server NOT enabled — set CORSAIR_BROKER_IPC_ENABLED=1 to host trader IPC"
+        );
+    }
+
     // Wait for SIGINT / SIGTERM.
     let mut sigint = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::interrupt(),

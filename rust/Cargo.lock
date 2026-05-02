@@ -191,6 +191,7 @@ dependencies = [
  "corsair_broker_ibkr",
  "corsair_constraint",
  "corsair_hedge",
+ "corsair_ipc",
  "corsair_market_data",
  "corsair_oms",
  "corsair_position",
@@ -199,6 +200,7 @@ dependencies = [
  "corsair_snapshot",
  "env_logger",
  "log",
+ "rmp-serde",
  "serde",
  "serde_yaml",
  "tempfile",
@@ -254,6 +256,20 @@ dependencies = [
  "corsair_position",
  "log",
  "serde",
+]
+
+[[package]]
+name = "corsair_ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "memmap2",
+ "nix",
+ "rmp-serde",
+ "serde",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

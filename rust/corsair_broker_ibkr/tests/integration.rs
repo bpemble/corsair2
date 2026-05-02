@@ -201,10 +201,18 @@ class IB:
     def isConnected(self):
         return self._connected
 
+    def connect(self, host='', port=0, clientId=0, account='', timeout=30):
+        # Sync version — used by corsair_broker_ibkr's bridge after
+        # Phase 5B startLoop removal. Mirrors ib_insync.IB.connect's
+        # signature.
+        CALLS.append(('connect', (host, port, clientId), {'account': account}))
+        self._connected = True
+        self.connectedEvent.emit()
+
     async def connectAsync(self, host, port, clientId, account=''):
+        # Kept for future tests that exercise the async path.
         CALLS.append(('connectAsync', (host, port, clientId), {'account': account}))
         self._connected = True
-        # Emit a connected event for the registered callbacks.
         self.connectedEvent.emit()
 
     def disconnect(self):
@@ -224,9 +232,8 @@ class IB:
     async def reqAccountUpdatesAsync(self, subscribe, account):
         CALLS.append(('reqAccountUpdatesAsync', (subscribe, account), {}))
 
-    async def qualifyContractsAsync(self, *contracts):
-        CALLS.append(('qualifyContractsAsync', contracts, {}))
-        # Assign deterministic conIds and return the same contracts.
+    def qualifyContracts(self, *contracts):
+        CALLS.append(('qualifyContracts', contracts, {}))
         out = []
         for c in contracts:
             if not c.conId:
@@ -236,11 +243,28 @@ class IB:
             out.append(c)
         return out
 
+    async def qualifyContractsAsync(self, *contracts):
+        CALLS.append(('qualifyContractsAsync', contracts, {}))
+        out = []
+        for c in contracts:
+            if not c.conId:
+                global NEXT_CON_ID
+                c.conId = NEXT_CON_ID
+                NEXT_CON_ID += 1
+            out.append(c)
+        return out
+
+    def reqContractDetails(self, contract):
+        CALLS.append(('reqContractDetails', (contract,), {}))
+        return self._build_chain(contract)
+
     async def reqContractDetailsAsync(self, contract):
         CALLS.append(('reqContractDetailsAsync', (contract,), {}))
-        # Return three synthetic months for chain queries.
+        return self._build_chain(contract)
+
+    def _build_chain(self, contract):
         details = []
-        base_month = 5  # May
+        base_month = 5
         for i in range(3):
             c = Contract(
                 secType='FUT',
@@ -279,6 +303,10 @@ class IB:
     def openTrades(self):
         CALLS.append(('openTrades', (), {}))
         return self._open_trades
+
+    def reqExecutions(self, exec_filter):
+        CALLS.append(('reqExecutions', (exec_filter,), {}))
+        return self._executions
 
     async def reqExecutionsAsync(self, exec_filter):
         CALLS.append(('reqExecutionsAsync', (exec_filter,), {}))
@@ -473,14 +501,14 @@ async fn full_lifecycle_against_fake_ib() {
     // Verify the fake recorded each call we expected.
     let calls = fake_ib_insync_calls();
     for expected in [
-        "connectAsync",
-        "qualifyContractsAsync",
+        "connect",
+        "qualifyContracts",
         "placeOrder",
         "cancelOrder",
         "accountValues",
-        "reqExecutionsAsync",
+        "reqExecutions",
         "openTrades",
-        "reqContractDetailsAsync",
+        "reqContractDetails",
         "disconnect",
     ] {
         assert!(

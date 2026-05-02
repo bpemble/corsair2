@@ -394,11 +394,99 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
         };
         for (prod, action) in actions {
             log::info!("hedge[{prod}]: {action:?}");
-            // Phase 4.x: wire HedgeAction::Place to broker.place_order
-            // when mode=Live. For now we log only; the existing Python
-            // broker still does the actual hedging.
-            let _ = runtime.mode;
+            if let corsair_hedge::HedgeAction::Place {
+                is_buy,
+                qty,
+                reason,
+                ..
+            } = action
+            {
+                // Live mode only — shadow logs but doesn't place.
+                if !matches!(runtime.mode, crate::runtime::RuntimeMode::Live) {
+                    continue;
+                }
+                place_hedge_order(&runtime, &prod, is_buy, qty, &reason).await;
+            }
         }
+    }
+}
+
+/// Place a hedge order via the broker. Resolves the hedge contract
+/// from the per-product manager's cached resolved contract; if no
+/// contract is set, logs and skips.
+async fn place_hedge_order(
+    runtime: &Arc<Runtime>,
+    product: &str,
+    is_buy: bool,
+    qty: u32,
+    reason: &str,
+) {
+    let (contract_opt, ioc_offset, hedge_tick) = {
+        let h = runtime.hedge.lock().unwrap();
+        match h.for_product(product) {
+            Some(mgr) => (
+                mgr.hedge_contract().cloned(),
+                mgr.config().ioc_tick_offset,
+                mgr.config().hedge_tick_size,
+            ),
+            None => {
+                log::warn!("hedge[{product}]: no manager registered, skipping");
+                return;
+            }
+        }
+    };
+    let contract = match contract_opt {
+        Some(c) => c,
+        None => {
+            log::warn!("hedge[{product}]: no hedge contract resolved yet, skipping");
+            return;
+        }
+    };
+    // IOC limit anchored at current underlying ± ioc_offset ticks.
+    let f = {
+        let md = runtime.market_data.lock().unwrap();
+        md.underlying_price(product).unwrap_or(0.0)
+    };
+    if f <= 0.0 {
+        log::warn!("hedge[{product}]: no underlying price, skipping");
+        return;
+    }
+    let offset = (ioc_offset as f64) * hedge_tick;
+    let lmt = if is_buy { f + offset } else { (f - offset).max(hedge_tick) };
+    let req = corsair_broker_api::PlaceOrderReq {
+        contract,
+        side: if is_buy {
+            corsair_broker_api::Side::Buy
+        } else {
+            corsair_broker_api::Side::Sell
+        },
+        qty,
+        order_type: corsair_broker_api::OrderType::Limit,
+        price: Some(lmt),
+        tif: corsair_broker_api::TimeInForce::Ioc,
+        gtd_until_utc: None,
+        client_order_ref: format!("corsair_hedge_{}", reason),
+        account: runtime
+            .config
+            .broker
+            .ibkr
+            .as_ref()
+            .map(|i| i.account.clone()),
+    };
+    let result = {
+        let b = runtime.broker.lock().await;
+        b.place_order(req).await
+    };
+    match result {
+        Ok(oid) => log::warn!(
+            "hedge[{product}]: placed {} {} @ {:.4} oid={} ({})",
+            if is_buy { "BUY" } else { "SELL" },
+            qty,
+            lmt,
+            oid,
+            reason
+        ),
+        Err(e) => log::error!("hedge[{product}]: place_order failed: {e}"),
     }
 }
 
