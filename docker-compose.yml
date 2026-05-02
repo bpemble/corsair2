@@ -28,11 +28,18 @@ services:
       retries: 6
       start_period: 120s
 
-  # ── Corsair v2 Market Maker ─────────────────────────────────────────
+  # ── Corsair v2 Market Maker (LEGACY — Python broker) ────────────────
+  # Retired 2026-05-02 by Phase 6.7 cutover. The Rust broker
+  # (`corsair-broker-rs`) is now the live runtime. This service is
+  # preserved as `--profile legacy-python-broker` for emergency
+  # rollback ONLY: `docker compose --profile legacy-python-broker up
+  # -d corsair`. Brings up ib_insync on clientId=0 — make sure to stop
+  # `corsair-broker-rs` first to avoid clientId conflict.
   corsair:
     build:
       context: .
       dockerfile: Dockerfile
+    profiles: ["legacy-python-broker"]
     restart: unless-stopped
     depends_on:
       ib-gateway:
@@ -124,34 +131,32 @@ services:
   # this service starts but its IPCClient retries connect-loop
   # forever (harmless). To disable entirely, run
   # `docker compose up -d corsair dashboard ib-gateway` and skip trader.
+  # ── Trader (Rust binary) ────────────────────────────────────────────
+  # Reads from the Rust broker's IPC and places orders against IBKR via
+  # the broker. Default-on since Phase 6.7 cutover.
   trader:
     image: corsair-corsair
-    profiles: ["broker-split"]            # opt-in: docker compose --profile broker-split up -d
     depends_on:
-      corsair:
-        condition: service_healthy
+      # Post-cutover (Phase 6.7): trader depends on the Rust broker, not
+      # the retired Python broker. Old behavior preserved by setting
+      # TRADER_BROKER_DEP=corsair via env if rollback is needed.
+      corsair-broker-rs:
+        condition: service_started
     network_mode: host
     env_file: .env
     environment:
       LOG_LEVEL: "${TRADER_LOG_LEVEL:-INFO}"
       CORSAIR_IPC_SOCKET: "${CORSAIR_IPC_SOCKET:-/app/data/corsair_ipc.sock}"
-      CORSAIR_IPC_TRANSPORT: "${CORSAIR_IPC_TRANSPORT:-socket}"
+      # Post-cutover default: SHM transport (Rust broker uses SHM rings).
+      CORSAIR_IPC_TRANSPORT: "${CORSAIR_IPC_TRANSPORT:-shm}"
       CORSAIR_CONFIG: "${CORSAIR_CONFIG:-config/hg_v1_4_paper.yaml}"
-      # Phase 3 cut-over: when "1", trader sends place_order /
-      # cancel_order commands to the broker over IPC. The broker
-      # must also have CORSAIR_TRADER_PLACES_ORDERS=1 (its env block
-      # above) for the dispatcher side to be wired. Default unset →
-      # trader logs decisions only (Phase 2 behavior).
-      CORSAIR_TRADER_PLACES_ORDERS: "${CORSAIR_TRADER_PLACES_ORDERS:-}"
-      # Phase 6: when "python", forces the pure-Python decide_quote path
-      # in the trader (default uses the Rust corsair_pricing.decide_quote
-      # for SABR; SVI always falls through to Python).
+      # Live placement now default-on after Phase 6.7 cutover. Set to
+      # empty string to disable (trader logs decisions only).
+      CORSAIR_TRADER_PLACES_ORDERS: "${CORSAIR_TRADER_PLACES_ORDERS:-1}"
       CORSAIR_TRADER_BACKEND: "${CORSAIR_TRADER_BACKEND:-}"
-      # Cleanup pass 11, 2026-05-01: select trader binary at runtime.
-      # CORSAIR_TRADER_LANG=rust → /usr/local/bin/corsair_trader_rust.
-      # Default ("python") uses src/trader/main.py.
-      # Rust trader requires CORSAIR_IPC_TRANSPORT=shm.
-      CORSAIR_TRADER_LANG: "${CORSAIR_TRADER_LANG:-python}"
+      # Post-cutover default: Rust trader binary (10x lower TTT than
+      # Python trader). Requires CORSAIR_IPC_TRANSPORT=shm.
+      CORSAIR_TRADER_LANG: "${CORSAIR_TRADER_LANG:-rust}"
     volumes:
       - ./logs-paper:/app/logs-paper      # event JSONL output
       - ./data:/app/data                  # IPC socket lives here
@@ -178,7 +183,6 @@ services:
   # work lands; otherwise the trader can't talk to it).
   corsair-broker-rs:
     image: corsair-corsair
-    profiles: ["rust-broker"]
     depends_on:
       ib-gateway:
         condition: service_healthy
@@ -189,7 +193,8 @@ services:
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
       CORSAIR_BROKER_CONFIG: "/app/config/runtime_v3.yaml"
-      CORSAIR_BROKER_SHADOW: "${CORSAIR_BROKER_SHADOW:-1}"
+      CORSAIR_BROKER_SHADOW: "${CORSAIR_BROKER_SHADOW:-0}"
+      CORSAIR_BROKER_IPC_ENABLED: "${CORSAIR_BROKER_IPC_ENABLED:-1}"
     volumes:
       - ./logs:/app/logs
       - ./logs-paper:/app/logs-paper

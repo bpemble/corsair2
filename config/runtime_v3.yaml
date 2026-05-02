@@ -1,33 +1,34 @@
-# Corsair v3 Rust runtime config — Phase 5A SHADOW deployment.
+# Corsair v3 Rust runtime config — LIVE deployment (Phase 5B.7 + 6.7).
 #
 # Maps the operational settings from config/hg_v1_4_paper.yaml into
-# the v3 schema. corsair_broker daemon (Rust) reads this; Python
-# broker continues to read hg_v1_4_paper.yaml.
+# the v3 schema. corsair_broker daemon (Rust) is now the live runtime.
 #
-# This config drives the Rust broker in SHADOW mode:
-#   - Connects to IBKR with clientId=10 (separate from Python's 0)
-#   - Ingests state independently
-#   - Publishes its own snapshot to a separate path
-#   - Does NOT place orders (CORSAIR_BROKER_SHADOW=1 default)
+# This config drives the Rust broker in LIVE mode:
+#   - Connects to IBKR via NativeBroker (native wire protocol, no
+#     ib_insync) on clientId=0 — the FA master that sees all order
+#     status messages.
+#   - Hosts the IPC server for the Rust trader binary.
+#   - Owns position book / risk monitor / hedge manager / snapshot.
+#   - Snapshot path matches the dashboard's expected path
+#     (/app/data/hg_chain_snapshot.json) so the dashboard works
+#     unchanged.
 #
-# Once Phase 5B lands (full IPC + cutover), flip CORSAIR_BROKER_SHADOW=0
-# to make this the live runtime.
+# Cutover history:
+#   2026-05-02: NativeBroker live. ib_insync retired from runtime hot
+#               path. Phase 6.5b (bootstrap-wait fix) + 6.6 (Broker
+#               trait impl) + 6.7 (runtime wiring) all landed today.
 
 broker:
+  # "ibkr" = native wire client (Phase 6 default). Use "ibkr_pyo3"
+  # for emergency rollback to the ib_insync bridge.
   kind: ibkr
   ibkr:
     gateway:
-      # Service uses host networking (network_mode: host) so 127.0.0.1
-      # is the right address for the gateway.
       host: 127.0.0.1
       port: 4002
-    # NOTE: clientId=10 (not 0) so Rust broker doesn't conflict with the
-    # live Python broker on clientId=0. Caveat: clientId=0 is the FA
-    # master client (CLAUDE.md §1) — only the master sees order status
-    # for orders placed by ANY client. Since we're in SHADOW mode and
-    # NOT placing orders, this is fine. For Phase 5B cutover, the Rust
-    # broker becomes clientId=0 and Python broker stops.
-    client_id: 10
+    # clientId=0 = FA master client. Required to see order status for
+    # orders placed by any client on the connection (CLAUDE.md §1).
+    client_id: 0
     account: DUP553657
 
 risk:
@@ -65,7 +66,7 @@ quoting:
 
 hedging:
   enabled: true
-  mode: observe                # SHADOW broker observes; doesn't place
+  mode: execute                # LIVE: place hedge orders
   tolerance_deltas: 0.5
   rebalance_on_fill: true
   rebalance_cadence_sec: 30
@@ -76,8 +77,9 @@ hedging:
   hedge_lockout_days: 30
 
 snapshot:
-  # Separate path so we don't clobber Python broker's snapshot.
-  path: /app/data/snapshot_rust.json
+  # Production path — same as Python broker's hg_chain_snapshot.json
+  # so the dashboard works without any changes.
+  path: /app/data/hg_chain_snapshot.json
   cadence_ms: 250
 
 runtime:
