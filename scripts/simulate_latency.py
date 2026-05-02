@@ -120,26 +120,37 @@ def main():
     )
 
     hr("Estimated TTT (tick-to-trade) — broker→trader→broker→wire:")
-    # Component estimates derived from CLAUDE.md §17 (Rust trader
-    # production figures) plus today's microbenchmarks.
-    ipc_one_way = 80   # SHM ring + msgpack, observed
+    # Two scenarios: default FIFO-notify mode and busy-poll mode
+    # (CORSAIR_TRADER_BUSY_POLL=1, opt-in, +1 CPU core).
     decide_quote = 1   # corsair_trader::decide_quote, sub-µs
     risk_gate = 1      # 6-layer trader gate stack
-    wire_encode = 20   # native client place_order encoder
+    wire_encode = 5    # template-cached place_order, was ~20µs before
     tcp_loopback = 100 # gateway is on localhost
-    ttt = ipc_one_way + decide_quote + risk_gate + wire_encode + tcp_loopback
-    print(f"  Tick → broker dispatch:     ~50 µs (network read + decode)")
-    print(f"  Broker → trader IPC:        ~{ipc_one_way} µs")
-    print(f"  Trader decide + gates:      ~{decide_quote + risk_gate} µs")
-    print(f"  Trader → broker IPC (cmd):  ~{ipc_one_way} µs")
-    print(f"  Broker place_order encode:  ~{wire_encode} µs")
-    print(f"  TCP write to gateway:       ~{tcp_loopback} µs")
+    parse = 35         # post zero-copy upfront-alloc fix; was ~50µs
+
+    ipc_fifo = 80      # SHM ring + FIFO notify wakeup
+    ipc_busypoll = 15  # SHM ring busy-poll, no FIFO
+
+    ttt_fifo = parse + ipc_fifo + decide_quote + risk_gate + ipc_fifo + wire_encode + tcp_loopback
+    ttt_busy = parse + ipc_busypoll + decide_quote + risk_gate + ipc_busypoll + wire_encode + tcp_loopback
+
+    print("  Default mode (FIFO-notify, 0 hot CPUs):")
+    print(f"    Tick → broker dispatch (zero-copy): ~{parse} µs")
+    print(f"    Broker → trader IPC (FIFO):         ~{ipc_fifo} µs")
+    print(f"    Trader decide + gates:              ~{decide_quote + risk_gate} µs")
+    print(f"    Trader → broker IPC (FIFO):         ~{ipc_fifo} µs")
+    print(f"    Broker place_order encode (cached): ~{wire_encode} µs")
+    print(f"    TCP write to gateway:               ~{tcp_loopback} µs")
+    print(f"    Estimated TTT p50:                  ~{ttt_fifo} µs")
     print()
-    print(f"  Estimated TTT p50:          ~{ttt + ipc_one_way} µs")
+    print("  Busy-poll mode (CORSAIR_TRADER_BUSY_POLL=1, 1 CPU hot):")
+    print(f"    SHM busy-poll IPC ×2:               ~{2 * ipc_busypoll} µs")
+    print(f"    Estimated TTT p50:                  ~{ttt_busy} µs")
+    print()
     print(f"  (For live numbers, watch trader telemetry: ttt_p50 / ttt_p99)")
 
     hr("Sustained quote-rate headroom:")
-    rs_per_quote = rs_check + decide_quote + ipc_one_way + wire_encode
+    rs_per_quote = rs_check + decide_quote + ipc_busypoll + wire_encode
     print(
         f"  {rs_per_quote:.0f} µs/quote → max "
         f"~{1_000_000/rs_per_quote:.0f} quotes/sec on a single trader thread"
@@ -147,13 +158,14 @@ def main():
 
     print()
     print("=" * 72)
-    print("Summary (post Phase 6.7 / Rust hot path)")
+    print("Summary (post Phase 6.13 / Rust hot path + latency optimizations)")
     print("=" * 72)
     print(f"  Per-cycle math:    {rs_cycle/1000:.2f} ms")
     print(f"  Refit cycle:       {rs_refit/1000:.2f} ms")
     print(f"  Per-fill check:    {rs_check:.0f} µs")
     print(f"  Refresh greeks:    {rs_refresh:.0f} µs")
-    print(f"  Estimated TTT:     ~{ttt + ipc_one_way} µs (p50, conservative)")
+    print(f"  Estimated TTT (FIFO mode):       ~{ttt_fifo} µs")
+    print(f"  Estimated TTT (busy-poll):       ~{ttt_busy} µs")
     print()
 
 

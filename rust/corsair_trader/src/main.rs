@@ -189,41 +189,74 @@ async fn main() -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut event_count: u64 = 0;
 
-    // Set up async wake-up via the events FIFO.
-    use tokio::io::unix::AsyncFd;
-    let evt_fifo_fd = events_ring.lock().unwrap().notify_r_fd().expect("events fifo");
-    let evt_async_fd = AsyncFd::new(EvtFd(evt_fifo_fd))?;
+    // Mode select: busy-poll (CORSAIR_TRADER_BUSY_POLL=1) trades 1
+    // CPU core for ~50-100µs latency reduction by skipping the FIFO
+    // wakeup path entirely. Default OFF — operators opt in.
+    let busy_poll = std::env::var("CORSAIR_TRADER_BUSY_POLL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
-    loop {
-        // Drain ring.
-        let chunk = events_ring.lock().unwrap().read_available();
-        if !chunk.is_empty() {
-            buf.extend_from_slice(&chunk);
-            let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
-            for body in frames {
-                event_count += 1;
-                process_event(
-                    &state, &counters, &commands_ring,
-                    &body, &events_log, &decisions_log,
-                );
+    if busy_poll {
+        log::warn!(
+            "CORSAIR_TRADER_BUSY_POLL=1 — busy-polling SHM ring \
+             (1 CPU core hot, lower latency)"
+        );
+        loop {
+            let chunk = events_ring.lock().unwrap().read_available();
+            if !chunk.is_empty() {
+                buf.extend_from_slice(&chunk);
+                let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
+                for body in frames {
+                    event_count += 1;
+                    process_event(
+                        &state, &counters, &commands_ring,
+                        &body, &events_log, &decisions_log,
+                    );
+                }
+                continue;
             }
-            continue;
+            // No frame ready. Yield to the tokio scheduler so other
+            // tasks (telemetry, staleness, JSONL flush) can run, but
+            // don't sleep — we want to recheck the ring immediately.
+            // tokio::task::yield_now is sub-microsecond.
+            tokio::task::yield_now().await;
         }
-        // Drain FIFO bytes (coalesce notifications).
-        events_ring.lock().unwrap().drain_notify();
+    } else {
+        // FIFO-notify mode (default): block on the events FIFO; wake
+        // when broker writes a notification byte. Lower CPU; ~50-100µs
+        // worst-case wakeup latency from FIFO + scheduler.
+        use tokio::io::unix::AsyncFd;
+        let evt_fifo_fd = events_ring.lock().unwrap().notify_r_fd().expect("events fifo");
+        let evt_async_fd = AsyncFd::new(EvtFd(evt_fifo_fd))?;
 
-        // Wait for next notification or 100ms timeout.
-        match tokio::time::timeout(
-            Duration::from_millis(100),
-            evt_async_fd.readable(),
-        )
-        .await
-        {
-            Ok(Ok(mut guard)) => {
-                guard.clear_ready();
+        loop {
+            // Drain ring.
+            let chunk = events_ring.lock().unwrap().read_available();
+            if !chunk.is_empty() {
+                buf.extend_from_slice(&chunk);
+                let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
+                for body in frames {
+                    event_count += 1;
+                    process_event(
+                        &state, &counters, &commands_ring,
+                        &body, &events_log, &decisions_log,
+                    );
+                }
+                continue;
             }
-            _ => {
-                // timeout or error — fall through to the polling re-read
+            events_ring.lock().unwrap().drain_notify();
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                evt_async_fd.readable(),
+            )
+            .await
+            {
+                Ok(Ok(mut guard)) => {
+                    guard.clear_ready();
+                }
+                _ => {
+                    // timeout or error — fall through to re-read
+                }
             }
         }
     }

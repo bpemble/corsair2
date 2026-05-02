@@ -50,6 +50,14 @@ pub fn encode_owned(fields: &[String]) -> Vec<u8> {
 /// Try to extract one complete frame from the front of `buf`.
 /// Returns Ok(Some(fields)) when a frame was decoded, or Ok(None)
 /// if more bytes are needed. Advances `buf` on successful decode.
+///
+/// Allocation note: an earlier version of this called
+/// `String::from_utf8_lossy(payload).into_owned()` upfront — copying
+/// the WHOLE payload before splitting. We now split the byte slice
+/// directly and only allocate per-field, halving the alloc volume on
+/// the hot path. UTF-8 lossy semantics are preserved (matches
+/// ib_insync's `errors=backslashreplace` for resilience to weird
+/// gateway state).
 pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Vec<String>>, NativeError> {
     if buf.len() < 4 {
         return Ok(None);
@@ -66,11 +74,17 @@ pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Vec<String>>, Nativ
         return Ok(None);
     }
     let payload = &buf[4..4 + size];
-    // Decode UTF-8, replacing bad bytes with U+FFFD (matches
-    // ib_insync's errors=backslashreplace pragma — robust to weird
-    // gateway state).
-    let s = String::from_utf8_lossy(payload).into_owned();
-    let mut fields: Vec<String> = s.split('\0').map(|s| s.to_string()).collect();
+    // Capacity hint: typical messages are 5-20 fields. Pre-allocating
+    // 16 covers the common case without overallocating.
+    let mut fields: Vec<String> = Vec::with_capacity(16);
+    for field in payload.split(|&b| b == 0) {
+        // Per-field UTF-8 conversion. `from_utf8_lossy` returns a
+        // Cow that borrows when the bytes are valid UTF-8 (the common
+        // case — IBKR fields are ASCII). into_owned() then only
+        // allocates when validation produced replacement chars.
+        // Otherwise it copies the bytes once.
+        fields.push(String::from_utf8_lossy(field).into_owned());
+    }
     // Last field is empty due to trailing \0; pop it.
     if fields.last().map(|f| f.is_empty()).unwrap_or(false) {
         fields.pop();

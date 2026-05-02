@@ -46,6 +46,7 @@ pub mod codec;
 pub mod decoder;
 pub mod error;
 pub mod messages;
+pub mod place_template;
 pub mod requests;
 pub mod types;
 
