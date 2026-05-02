@@ -30,7 +30,6 @@
 use std::sync::OnceLock;
 
 use crate::codec::{encode_bool, encode_f64, encode_int, encode_unset, write_f64, write_int};
-use crate::messages::OUT_PLACE_ORDER;
 use crate::requests::{ContractRequest, PlaceOrderParams};
 
 /// Per-instrument cached prefix bytes — fields immediately after

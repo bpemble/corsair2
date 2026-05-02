@@ -323,9 +323,6 @@ fn parse_open_order(fields: &[String]) -> Result<InboundMsg, NativeError> {
     let get = |idx: usize| -> &str {
         fields.get(idx).map(|s| s.as_str()).unwrap_or("")
     };
-    let parse_f = |idx: usize| -> f64 {
-        parse_f64(get(idx)).unwrap_or(0.0)
-    };
     Ok(InboundMsg::OpenOrder(OpenOrderMsg {
         order_id: parse_int(&fields[1])?,
         contract: ContractDecoded {

@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
+use parking_lot::Mutex as PMutex;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 use corsair_broker_api::{
@@ -172,7 +173,10 @@ pub type TickPublisher = Arc<dyn for<'a> Fn(&'a Tick) + Send + Sync + 'static>;
 pub struct NativeBroker {
     cfg: NativeBrokerConfig,
     client: Arc<NativeClient>,
-    state: Arc<Mutex<BrokerState>>,
+    /// Hot-path state. Sync mutex (parking_lot) — short critical
+    /// sections only, never held across .await. Replacing tokio's
+    /// async mutex eliminates the per-lock yield-point overhead.
+    state: Arc<PMutex<BrokerState>>,
     channels: BrokerChannels,
     capabilities: BrokerCapabilities,
     next_req_id: Arc<AtomicI32>,
@@ -183,7 +187,11 @@ pub struct NativeBroker {
     /// writes tick events directly to the underlying SHM ring AS WELL
     /// AS broadcasting on the in-process channel. corsair_broker
     /// daemon wires this on boot via `set_tick_publisher`.
-    tick_publisher: Arc<Mutex<Option<TickPublisher>>>,
+    /// Sync mutex — set_tick_publisher is the only writer (called
+    /// once at boot); dispatcher is the only reader (cheap clone of
+    /// the Arc on every event). parking_lot's contention model is
+    /// fine for this access pattern.
+    tick_publisher: Arc<PMutex<Option<TickPublisher>>>,
 }
 
 impl NativeBroker {
@@ -192,14 +200,14 @@ impl NativeBroker {
         Self {
             cfg,
             client: Arc::new(client),
-            state: Arc::new(Mutex::new(BrokerState::default())),
+            state: Arc::new(PMutex::new(BrokerState::default())),
             channels: BrokerChannels::new(),
             capabilities: BrokerCapabilities::ibkr_default(),
             next_req_id: Arc::new(AtomicI32::new(1000)),
             next_handle: Arc::new(AtomicI32::new(1)),
             connected: Arc::new(AtomicBool::new(false)),
             rx_holder: Mutex::new(Some(rx)),
-            tick_publisher: Arc::new(Mutex::new(None)),
+            tick_publisher: Arc::new(PMutex::new(None)),
         }
     }
 
@@ -211,19 +219,19 @@ impl NativeBroker {
     /// Once set, the in-process broadcast channel still fires for
     /// other consumers (market_data state) — fast-path is additive.
     pub async fn set_tick_publisher(&self, publisher: TickPublisher) {
-        *self.tick_publisher.lock().await = Some(publisher);
+        *self.tick_publisher.lock() = Some(publisher);
     }
 
     /// Snapshot the current bootstrap-seeding progress.
     pub async fn seeding_progress(&self) -> SeedingProgress {
-        self.state.lock().await.seeding
+        self.state.lock().seeding
     }
 
     /// Reset seeding flags before issuing a re-snapshot reqXxx pair.
     /// Without this, a second `wait_for_seeding` returns immediately
     /// based on the stale `done=true` from the prior bootstrap.
     pub async fn reset_seeding_flags(&self) {
-        let mut s = self.state.lock().await;
+        let mut s = self.state.lock();
         s.seeding = SeedingProgress::default();
     }
 
@@ -238,7 +246,7 @@ impl NativeBroker {
     pub async fn wait_for_seeding(&self, timeout: Duration) -> SeedingProgress {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let p = self.state.lock().await.seeding;
+            let p = self.state.lock().seeding;
             if p.positions_done && p.open_orders_done && p.account_done {
                 return p;
             }
@@ -291,8 +299,8 @@ impl NativeBroker {
                 // Snapshot the tick publisher Arc (cheap clone).
                 // None until `set_tick_publisher` is called by the
                 // corsair_broker daemon during boot.
-                let tp = tick_publisher_arc.lock().await.clone();
-                Self::route(&state, &channels, parsed, tp.as_deref()).await;
+                let tp = tick_publisher_arc.lock().clone();
+                Self::route(&state, &channels, parsed, tp.as_deref());
             }
             connected.store(false, Ordering::SeqCst);
             let _ = channels.connection.send(ConnectionEvent {
@@ -303,8 +311,11 @@ impl NativeBroker {
         });
     }
 
-    async fn route(
-        state: &Arc<Mutex<BrokerState>>,
+    /// Route a single parsed inbound message. Sync (parking_lot
+    /// state, no awaits inside). The dispatcher task awaits the
+    /// recv channel; route itself is straight-line.
+    fn route(
+        state: &Arc<PMutex<BrokerState>>,
         channels: &BrokerChannels,
         msg: InboundMsg,
         tick_publisher: Option<&(dyn Fn(&Tick) + Send + Sync)>,
@@ -317,27 +328,27 @@ impl NativeBroker {
                     // close. Don't leave a stale zero entry in the
                     // cache (would inflate positions().len() and
                     // confuse downstream seeding).
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     s.positions.remove(&key);
                 } else if let Some(pos) = native_to_position(&p) {
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     s.positions.insert(key, pos);
                 }
             }
             InboundMsg::PositionEnd => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 s.seeding.positions_done = true;
             }
             InboundMsg::OpenOrderEnd => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 s.seeding.open_orders_done = true;
             }
             InboundMsg::AccountDownloadEnd(_) => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 s.seeding.account_done = true;
             }
             InboundMsg::AccountValue(a) => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 let key = (a.key.clone(), a.currency.clone(), a.account.clone());
                 s.account_values.insert(key, a);
             }
@@ -345,7 +356,7 @@ impl NativeBroker {
                 let order_id = o.order_id;
                 let parsed = native_to_open_order(&o);
                 let ack = {
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     if let Some(open) = parsed {
                         s.open_orders.insert(order_id, open);
                     }
@@ -375,14 +386,14 @@ impl NativeBroker {
                         | OrderStatus::Cancelled
                         | OrderStatus::PendingCancel
                 ) {
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     if let Some(open) = s.open_orders.get_mut(&o.order_id) {
                         open.status = parsed_status;
                         open.filled_qty = o.filled as u32;
                     }
                     s.pending_place_acks.remove(&o.order_id)
                 } else {
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     if let Some(open) = s.open_orders.get_mut(&o.order_id) {
                         open.status = parsed_status;
                         open.filled_qty = o.filled as u32;
@@ -415,7 +426,7 @@ impl NativeBroker {
                     // If req_id > 0, this is a response to reqExecutions.
                     // Otherwise, it's a real-time exec from execDetailsEvent.
                     let routed_to_pending = if e.req_id > 0 {
-                        let mut s = state.lock().await;
+                        let mut s = state.lock();
                         if let Some(p) = s.pending_executions.get_mut(&e.req_id) {
                             p.accumulated.push(fill.clone());
                             true
@@ -432,7 +443,7 @@ impl NativeBroker {
                 }
             }
             InboundMsg::ExecutionEnd(req_id) => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 if let Some(mut p) = s.pending_executions.remove(&req_id) {
                     if let Some(sender) = p.sender.take() {
                         let _ = sender.send(Ok(std::mem::take(&mut p.accumulated)));
@@ -440,13 +451,13 @@ impl NativeBroker {
                 }
             }
             InboundMsg::ContractDetails(cd) => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 if let Some(p) = s.pending_contract_details.get_mut(&cd.req_id) {
                     p.accumulated.push(cd);
                 }
             }
             InboundMsg::ContractDetailsEnd(req_id) => {
-                let mut s = state.lock().await;
+                let mut s = state.lock();
                 if let Some(mut p) = s.pending_contract_details.remove(&req_id) {
                     let contracts: Vec<Contract> =
                         p.accumulated.iter().filter_map(native_to_contract).collect();
@@ -463,7 +474,7 @@ impl NativeBroker {
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    let iid_opt = state.lock().await.tick_routes.get(&t.req_id).copied();
+                    let iid_opt = state.lock().tick_routes.get(&t.req_id).copied();
                     if let Some(iid) = iid_opt {
                         let tick = Tick {
                             instrument_id: iid,
@@ -492,7 +503,7 @@ impl NativeBroker {
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    let iid_opt = state.lock().await.tick_routes.get(&t.req_id).copied();
+                    let iid_opt = state.lock().tick_routes.get(&t.req_id).copied();
                     if let Some(iid) = iid_opt {
                         let tick = Tick {
                             instrument_id: iid,
@@ -518,7 +529,7 @@ impl NativeBroker {
                 let mut to_fail_contract = None;
                 let mut to_fail_place = None;
                 {
-                    let mut s = state.lock().await;
+                    let mut s = state.lock();
                     if e.req_id > 0 {
                         if is_contract_error(e.error_code) {
                             to_fail_contract = s.pending_contract_details.remove(&e.req_id);
@@ -944,7 +955,7 @@ impl Broker for NativeBroker {
         // Drain pending waiters so callers don't block on their
         // tokio::time::timeout (P1-8).
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             for (_, mut p) in s.pending_contract_details.drain() {
                 if let Some(sender) = p.sender.take() {
                     let _ = sender.send(Err(BrokerError::ConnectionLost(
@@ -996,7 +1007,7 @@ impl Broker for NativeBroker {
         // wire frame so we don't race the dispatcher.
         let (tx, rx) = oneshot::channel::<Result<(), BrokerError>>();
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             s.pending_place_acks.insert(order_id, tx);
         }
 
@@ -1007,7 +1018,7 @@ impl Broker for NativeBroker {
         // cost; subsequent calls memcpy. Saves ~30 µs per call by
         // skipping the Vec<String> of 14 contract-fixed fields.
         let frame = {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             let template = s.place_templates
                 .entry(req.contract.instrument_id)
                 .or_insert_with(|| {
@@ -1018,7 +1029,7 @@ impl Broker for NativeBroker {
         };
         if let Err(e) = self.client.send_raw(&frame).await {
             // Send failed; clean up waiter.
-            self.state.lock().await.pending_place_acks.remove(&order_id);
+            self.state.lock().pending_place_acks.remove(&order_id);
             return Err(Self::map_native_err(e));
         }
 
@@ -1040,7 +1051,7 @@ impl Broker for NativeBroker {
                 // off and retry rather than treating this as a fatal
                 // Internal error. Caller should also reconcile via
                 // open_orders() to discover the orphaned order.
-                self.state.lock().await.pending_place_acks.remove(&order_id);
+                self.state.lock().pending_place_acks.remove(&order_id);
                 Err(BrokerError::Protocol {
                     code: None,
                     message: format!("place_order ack timeout (orderId={order_id})"),
@@ -1065,7 +1076,7 @@ impl Broker for NativeBroker {
         // the original contract + immutable fields; pull them from the
         // open order cache.
         let existing = {
-            let s = self.state.lock().await;
+            let s = self.state.lock();
             s.open_orders.get(&(id.0 as i32)).cloned()
         };
         let existing = existing.ok_or_else(|| {
@@ -1093,12 +1104,12 @@ impl Broker for NativeBroker {
     }
 
     async fn positions(&self) -> BResult<Vec<Position>> {
-        let s = self.state.lock().await;
+        let s = self.state.lock();
         Ok(s.positions.values().cloned().collect())
     }
 
     async fn account_values(&self) -> BResult<AccountSnapshot> {
-        let s = self.state.lock().await;
+        let s = self.state.lock();
         let mut snap = AccountSnapshot {
             net_liquidation: 0.0,
             maintenance_margin: 0.0,
@@ -1122,7 +1133,7 @@ impl Broker for NativeBroker {
     }
 
     async fn open_orders(&self) -> BResult<Vec<OpenOrder>> {
-        let s = self.state.lock().await;
+        let s = self.state.lock();
         Ok(s.open_orders.values().cloned().collect())
     }
 
@@ -1130,7 +1141,7 @@ impl Broker for NativeBroker {
         let req_id = self.alloc_req_id();
         let (tx, rx) = oneshot::channel();
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             s.pending_executions.insert(
                 req_id,
                 PendingExecutionsRequest {
@@ -1167,7 +1178,7 @@ impl Broker for NativeBroker {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(BrokerError::Internal("recent_fills channel dropped".into())),
             Err(_) => {
-                let mut s = self.state.lock().await;
+                let mut s = self.state.lock();
                 s.pending_executions.remove(&req_id);
                 Err(BrokerError::Internal("recent_fills timeout".into()))
             }
@@ -1178,7 +1189,7 @@ impl Broker for NativeBroker {
         let req_id = self.alloc_req_id();
         let (tx, rx) = oneshot::channel();
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             s.pending_contract_details.insert(
                 req_id,
                 PendingContractRequest {
@@ -1210,7 +1221,7 @@ impl Broker for NativeBroker {
                 Err(BrokerError::Internal("qualify_future channel dropped".into()))
             }
             Err(_) => {
-                let mut s = self.state.lock().await;
+                let mut s = self.state.lock();
                 s.pending_contract_details.remove(&req_id);
                 Err(BrokerError::Internal("qualify_future timeout".into()))
             }
@@ -1221,7 +1232,7 @@ impl Broker for NativeBroker {
         let req_id = self.alloc_req_id();
         let (tx, rx) = oneshot::channel();
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             s.pending_contract_details.insert(
                 req_id,
                 PendingContractRequest {
@@ -1259,7 +1270,7 @@ impl Broker for NativeBroker {
                 Err(BrokerError::Internal("qualify_option channel dropped".into()))
             }
             Err(_) => {
-                let mut s = self.state.lock().await;
+                let mut s = self.state.lock();
                 s.pending_contract_details.remove(&req_id);
                 Err(BrokerError::Internal("qualify_option timeout".into()))
             }
@@ -1270,7 +1281,7 @@ impl Broker for NativeBroker {
         let req_id = self.alloc_req_id();
         let (tx, rx) = oneshot::channel();
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             s.pending_contract_details.insert(
                 req_id,
                 PendingContractRequest {
@@ -1303,7 +1314,7 @@ impl Broker for NativeBroker {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(BrokerError::Internal("list_chain channel dropped".into())),
             Err(_) => {
-                let mut s = self.state.lock().await;
+                let mut s = self.state.lock();
                 s.pending_contract_details.remove(&req_id);
                 Err(BrokerError::Internal("list_chain timeout".into()))
             }
@@ -1314,7 +1325,7 @@ impl Broker for NativeBroker {
         let req_id = self.alloc_req_id();
         let handle = self.alloc_handle();
         {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             s.tick_routes.insert(req_id, sub.instrument_id);
             s.handle_to_req_id.insert(handle, req_id);
         }
@@ -1334,7 +1345,7 @@ impl Broker for NativeBroker {
 
     async fn unsubscribe_ticks(&self, h: TickStreamHandle) -> BResult<()> {
         let req_id = {
-            let mut s = self.state.lock().await;
+            let mut s = self.state.lock();
             let req_id = s.handle_to_req_id.remove(&h);
             if let Some(rid) = req_id {
                 s.tick_routes.remove(&rid);
@@ -1390,7 +1401,7 @@ impl Broker for NativeBroker {
         &self,
         publisher: Arc<dyn for<'a> Fn(&'a Tick) + Send + Sync + 'static>,
     ) -> bool {
-        *self.tick_publisher.lock().await = Some(publisher);
+        *self.tick_publisher.lock() = Some(publisher);
         log::warn!("NativeBroker: tick fast-path publisher installed");
         true
     }
