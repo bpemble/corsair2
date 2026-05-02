@@ -16,7 +16,7 @@ impl std::fmt::Display for OrderId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -91,7 +91,7 @@ pub struct ModifyOrderReq {
 
 /// Lifecycle states. Reflects ib_insync's `OrderStatus.status` and
 /// FIX's tag 39 (OrdStatus) one-to-one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
     /// Sent to gateway, not yet acknowledged at the exchange.
     PendingSubmit,

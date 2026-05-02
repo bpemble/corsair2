@@ -232,6 +232,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "corsair_market_data"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "corsair_broker_api",
+ "corsair_position",
+ "corsair_pricing",
+ "log",
+ "serde",
+]
+
+[[package]]
+name = "corsair_oms"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "corsair_broker_api",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "corsair_position"
 version = "0.1.0"
 dependencies = [
@@ -259,6 +281,21 @@ dependencies = [
  "corsair_position",
  "log",
  "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "corsair_snapshot"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "corsair_broker_api",
+ "corsair_hedge",
+ "corsair_position",
+ "corsair_risk",
+ "log",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

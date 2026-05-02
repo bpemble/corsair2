@@ -1,0 +1,21 @@
+[package]
+name = "corsair_snapshot"
+version = "0.1.0"
+edition = "2021"
+description = "4 Hz dashboard snapshot publisher (atomic-replace JSON file)."
+
+[lib]
+name = "corsair_snapshot"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+corsair_broker_api = { path = "../corsair_broker_api" }
+corsair_hedge = { path = "../corsair_hedge" }
+corsair_position = { path = "../corsair_position" }
+corsair_risk = { path = "../corsair_risk" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

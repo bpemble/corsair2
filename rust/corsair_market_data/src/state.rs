@@ -1,0 +1,242 @@
+//! Aggregate market data state — underlying + option book.
+
+use chrono::NaiveDate;
+use corsair_broker_api::{InstrumentId, Right};
+use std::collections::HashMap;
+
+use crate::option_state::OptionTick;
+
+/// Market data state for a single broker connection. Holds
+/// underlying price per product and the option book keyed by
+/// (product, strike_key, expiry, right_char).
+///
+/// The runtime drives this by consuming `Broker::subscribe_ticks_stream`
+/// and calling `update_*` methods. Risk / position / OMS read it
+/// via the [`MarketDataView`](crate::view::MarketDataView) trait.
+pub struct MarketDataState {
+    underlying: HashMap<String, f64>,
+    options: HashMap<OptionKey, OptionTick>,
+    /// Fast lookup from broker InstrumentId → option key.
+    by_instrument: HashMap<InstrumentId, OptionKey>,
+    /// Underlying instrument id → product (resolved via runtime
+    /// at qualification time).
+    underlying_instruments: HashMap<InstrumentId, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OptionKey {
+    product: String,
+    strike_key: i64,
+    expiry: NaiveDate,
+    right: Right,
+}
+
+fn strike_key(s: f64) -> i64 {
+    (s * 10_000.0).round() as i64
+}
+
+impl Default for MarketDataState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MarketDataState {
+    pub fn new() -> Self {
+        Self {
+            underlying: HashMap::new(),
+            options: HashMap::new(),
+            by_instrument: HashMap::new(),
+            underlying_instruments: HashMap::new(),
+        }
+    }
+
+    /// Register an option contract from the runtime's qualification.
+    /// After this, ticks for `instrument_id` route to the option
+    /// state at (product, strike, expiry, right).
+    pub fn register_option(
+        &mut self,
+        product: &str,
+        strike: f64,
+        expiry: NaiveDate,
+        right: Right,
+        instrument_id: InstrumentId,
+    ) {
+        let k = OptionKey {
+            product: product.to_string(),
+            strike_key: strike_key(strike),
+            expiry,
+            right,
+        };
+        self.options.entry(k.clone()).or_insert_with(|| {
+            let mut t = OptionTick::new(strike, expiry, right);
+            t.instrument_id = Some(instrument_id);
+            t
+        });
+        self.by_instrument.insert(instrument_id, k);
+    }
+
+    /// Register the underlying instrument for a product.
+    pub fn register_underlying(&mut self, product: &str, instrument_id: InstrumentId) {
+        self.underlying_instruments
+            .insert(instrument_id, product.to_string());
+    }
+
+    pub fn underlying_price(&self, product: &str) -> Option<f64> {
+        self.underlying.get(product).copied().filter(|&p| p > 0.0)
+    }
+
+    pub fn set_underlying(&mut self, product: &str, price: f64) {
+        if price > 0.0 {
+            self.underlying.insert(product.to_string(), price);
+        }
+    }
+
+    /// Update bid for an option keyed by instrument id (broker
+    /// stream path). No-op if the instrument isn't registered.
+    pub fn update_bid(&mut self, iid: InstrumentId, price: f64, size: u64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                if price > 0.0 {
+                    t.bid = price;
+                }
+                t.bid_size = size;
+                t.last_updated_ns = ts_ns;
+            }
+        } else if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
+            // Underlying tick.
+            if price > 0.0 {
+                self.underlying.insert(product, price);
+            }
+        }
+    }
+
+    pub fn update_ask(&mut self, iid: InstrumentId, price: f64, size: u64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                if price > 0.0 {
+                    t.ask = price;
+                }
+                t.ask_size = size;
+                t.last_updated_ns = ts_ns;
+            }
+        }
+    }
+
+    pub fn update_last(&mut self, iid: InstrumentId, price: f64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                if price > 0.0 {
+                    t.last = price;
+                }
+                t.last_updated_ns = ts_ns;
+            }
+        } else if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
+            if price > 0.0 {
+                self.underlying.insert(product, price);
+            }
+        }
+    }
+
+    /// Direct lookup for OptionTick.
+    pub fn option(
+        &self,
+        product: &str,
+        strike: f64,
+        expiry: NaiveDate,
+        right: Right,
+    ) -> Option<&OptionTick> {
+        self.options.get(&OptionKey {
+            product: product.to_string(),
+            strike_key: strike_key(strike),
+            expiry,
+            right,
+        })
+    }
+
+    /// All options for a product. Used by snapshot serialization
+    /// and SABR refit drivers.
+    pub fn options_for_product(&self, product: &str) -> Vec<&OptionTick> {
+        self.options
+            .iter()
+            .filter(|(k, _)| k.product == product)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    pub fn option_count(&self) -> usize {
+        self.options.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exp() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 6, 26).unwrap()
+    }
+
+    #[test]
+    fn register_and_lookup_option() {
+        let mut s = MarketDataState::new();
+        s.register_option("HG", 6.05, exp(), Right::Call, InstrumentId(100));
+        let t = s.option("HG", 6.05, exp(), Right::Call).unwrap();
+        assert_eq!(t.strike, 6.05);
+        assert_eq!(t.instrument_id, Some(InstrumentId(100)));
+    }
+
+    #[test]
+    fn update_bid_routes_via_instrument_id() {
+        let mut s = MarketDataState::new();
+        s.register_option("HG", 6.05, exp(), Right::Call, InstrumentId(100));
+        s.update_bid(InstrumentId(100), 0.025, 5, 1234);
+        let t = s.option("HG", 6.05, exp(), Right::Call).unwrap();
+        assert_eq!(t.bid, 0.025);
+        assert_eq!(t.bid_size, 5);
+    }
+
+    #[test]
+    fn update_underlying_via_registered_instrument() {
+        let mut s = MarketDataState::new();
+        s.register_underlying("HG", InstrumentId(50));
+        s.update_last(InstrumentId(50), 6.05, 1234);
+        assert_eq!(s.underlying_price("HG"), Some(6.05));
+    }
+
+    #[test]
+    fn options_for_product_isolates() {
+        let mut s = MarketDataState::new();
+        s.register_option("HG", 6.05, exp(), Right::Call, InstrumentId(100));
+        s.register_option("ETH", 3000.0, exp(), Right::Call, InstrumentId(101));
+        assert_eq!(s.options_for_product("HG").len(), 1);
+        assert_eq!(s.options_for_product("ETH").len(), 1);
+    }
+
+    #[test]
+    fn unregistered_instrument_is_silently_ignored() {
+        let mut s = MarketDataState::new();
+        s.update_bid(InstrumentId(999), 0.025, 5, 1234);
+        // No panic, no spurious option in the book.
+        assert_eq!(s.option_count(), 0);
+    }
+
+    #[test]
+    fn mid_returns_none_when_one_side_missing() {
+        let mut s = MarketDataState::new();
+        s.register_option("HG", 6.05, exp(), Right::Call, InstrumentId(100));
+        s.update_bid(InstrumentId(100), 0.025, 5, 0);
+        let t = s.option("HG", 6.05, exp(), Right::Call).unwrap();
+        assert!(t.mid().is_none());
+    }
+
+    #[test]
+    fn mid_returns_average_when_both_sides_present() {
+        let mut s = MarketDataState::new();
+        s.register_option("HG", 6.05, exp(), Right::Call, InstrumentId(100));
+        s.update_bid(InstrumentId(100), 0.024, 5, 0);
+        s.update_ask(InstrumentId(100), 0.026, 5, 0);
+        let t = s.option("HG", 6.05, exp(), Right::Call).unwrap();
+        assert_eq!(t.mid(), Some(0.025));
+    }
+}

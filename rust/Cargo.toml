@@ -4,9 +4,12 @@ members = [
     "corsair_broker_ibkr",
     "corsair_constraint",
     "corsair_hedge",
+    "corsair_market_data",
+    "corsair_oms",
     "corsair_position",
     "corsair_pricing",
     "corsair_risk",
+    "corsair_snapshot",
     "corsair_trader",
 ]
 resolver = "2"
