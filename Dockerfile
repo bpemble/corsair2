@@ -42,8 +42,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# tzdata + tzdata-legacy: ib_insync parses IBKR timestamps with deprecated
-# aliases like "US/Central" which only exist in the legacy zone DB.
+# tzdata + tzdata-legacy: needed by chrono-tz (US/Central rollover) and
+# (legacy) ib_insync — kept legacy DB even after ib_insync was retired
+# in Phase 6.7 because some Python parity tools still parse old aliases.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tzdata tzdata-legacy \
     && rm -rf /var/lib/apt/lists/*
@@ -51,9 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install the Rust hot-path wheel built in stage 1. If the import fails
-# at runtime for any reason, src/pricing.py falls back to the pure-Python
-# implementation transparently — see the _USE_RUST guard there.
+# Install the Rust hot-path wheel built in stage 1.
+# Production runtime is now the Rust broker + Rust trader binaries;
+# the Python wheel is here for parity tests and offline tools (e.g.
+# scripts/simulate_latency.py uses corsair_pricing.compute_greeks).
 COPY --from=rust-build /wheels/*.whl /wheels/
 RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 

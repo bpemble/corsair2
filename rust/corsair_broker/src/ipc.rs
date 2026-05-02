@@ -191,6 +191,12 @@ async fn dispatch_commands(
             "place_order" => handle_place(&runtime, &cmd.body).await,
             "cancel_order" => handle_cancel(&runtime, &cmd.body).await,
             "modify_order" => handle_modify(&runtime, &cmd.body).await,
+            // Trader emits a "telemetry" command every 10s with its
+            // own observed counters. The broker just acknowledges by
+            // dropping it — the trader logs the same numbers locally,
+            // so we don't need to surface them here. Logging at
+            // trace so it's silent under default filter.
+            "telemetry" => log::trace!("ipc: trader telemetry frame"),
             other => log::warn!("ipc: unknown command type: {other}"),
         }
     }

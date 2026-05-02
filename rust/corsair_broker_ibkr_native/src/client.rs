@@ -67,11 +67,20 @@ pub struct NativeClient {
     /// Managed accounts list reported by the server. Useful for FA.
     managed_accounts: Arc<Mutex<Vec<String>>>,
     /// Inbound message dispatch — Phase 6.5+ consumers subscribe.
-    msg_tx: mpsc::UnboundedSender<Vec<String>>,
-    /// Telemetry: number of messages sent / received.
+    msg_tx: mpsc::Sender<Vec<String>>,
+    /// Telemetry: number of messages sent / received / dropped.
     msgs_sent: Arc<std::sync::atomic::AtomicU64>,
     msgs_recv: Arc<std::sync::atomic::AtomicU64>,
+    msgs_dropped: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// Bounded dispatch channel capacity. IBKR streams a few-thousand
+/// messages at boot (positions, accountValues × N keys) and ~hundreds
+/// per second under busy market data. 16K accommodates burst without
+/// unbounded growth; on overflow we drop the oldest with a counter
+/// increment so the dispatcher is never stalled by a slow consumer
+/// (audit P0-5 follow-on).
+const DISPATCH_CHANNEL_CAP: usize = 16_384;
 
 impl NativeClient {
     /// Construct, but don't connect yet. Caller invokes
@@ -79,8 +88,8 @@ impl NativeClient {
     /// Returns the client handle plus an mpsc::Receiver of decoded
     /// inbound messages — the runtime spawns its own task that
     /// dispatches based on the first field (message type id).
-    pub fn new(cfg: NativeClientConfig) -> (Self, mpsc::UnboundedReceiver<Vec<String>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn new(cfg: NativeClientConfig) -> (Self, mpsc::Receiver<Vec<String>>) {
+        let (tx, rx) = mpsc::channel(DISPATCH_CHANNEL_CAP);
         let client = Self {
             cfg,
             writer: Arc::new(Mutex::new(None)),
@@ -91,6 +100,7 @@ impl NativeClient {
             msg_tx: tx,
             msgs_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             msgs_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            msgs_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         (client, rx)
     }
@@ -203,6 +213,7 @@ impl NativeClient {
             Arc::clone(&self.next_order_id),
             Arc::clone(&self.managed_accounts),
             Arc::clone(&self.msgs_recv),
+            Arc::clone(&self.msgs_dropped),
         );
         Ok(())
     }
@@ -340,10 +351,11 @@ async fn read_handshake_reply(
 /// the raw fields onto the msg_tx channel for general consumers.
 fn spawn_recv_task(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
-    msg_tx: mpsc::UnboundedSender<Vec<String>>,
+    msg_tx: mpsc::Sender<Vec<String>>,
     next_order_id: Arc<Mutex<i32>>,
     managed_accounts: Arc<Mutex<Vec<String>>>,
     msgs_recv: Arc<std::sync::atomic::AtomicU64>,
+    msgs_dropped: Arc<std::sync::atomic::AtomicU64>,
 ) {
     tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -401,11 +413,29 @@ fn spawn_recv_task(
                                 }
                             }
                         }
-                        // Forward to subscribers (Phase 6.5+ will
-                        // consume here).
-                        if msg_tx.send(fields).is_err() {
-                            log::info!("native recv: dispatch channel closed");
-                            return;
+                        // Forward to subscribers. Bounded channel:
+                        // try_send to avoid awaiting (which would
+                        // back up the recv loop). On Full we drop the
+                        // frame and increment the counter — better to
+                        // lose a tick than to block ingestion. On
+                        // Closed the channel went away (broker shut
+                        // down).
+                        match msg_tx.try_send(fields) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                let dropped = msgs_dropped
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                if dropped.is_power_of_two() {
+                                    log::warn!(
+                                        "native recv: dispatch channel full; dropped frames total={dropped}"
+                                    );
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                log::info!("native recv: dispatch channel closed");
+                                return;
+                            }
                         }
                     }
                 }

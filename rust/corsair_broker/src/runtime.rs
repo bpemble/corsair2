@@ -5,7 +5,6 @@
 //! `Mutex<...>` to read or mutate state.
 
 use corsair_broker_api::Broker;
-use corsair_broker_ibkr::{BridgeConfig, IbkrAdapter};
 use corsair_broker_ibkr_native::{
     client::NativeClientConfig, NativeBroker, NativeBrokerConfig,
 };
@@ -26,8 +25,6 @@ use crate::config::BrokerDaemonConfig;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    #[error("broker bridge error: {0}")]
-    Bridge(#[from] corsair_broker_ibkr::BridgeError),
     #[error("broker error: {0}")]
     Broker(#[from] corsair_broker_api::BrokerError),
     #[error("config error: {0}")]
@@ -466,28 +463,10 @@ impl Runtime {
 
 fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Box<dyn Broker>, RuntimeError> {
     match cfg.broker.kind.as_str() {
-        // PyO3-bridged adapter — uses ib_insync. Retired path; kept for
-        // emergency rollback only. Set CORSAIR_BROKER_KIND=ibkr_pyo3 (or
-        // broker.kind=ibkr_pyo3 in config) to use this.
-        "ibkr_pyo3" => {
-            let ibkr = cfg
-                .broker
-                .ibkr
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Internal("missing broker.ibkr".into()))?;
-            let bridge_cfg = BridgeConfig {
-                gateway_host: ibkr.gateway.host.clone(),
-                gateway_port: ibkr.gateway.port,
-                client_id: ibkr.client_id,
-                account: ibkr.account.clone(),
-                poll_interval_ms: 1,
-            };
-            corsair_broker_ibkr::init_python();
-            let adapter = IbkrAdapter::new(bridge_cfg)?;
-            Ok(Box::new(adapter))
-        }
-        // Native Rust IBKR client — Phase 6 default. Direct TCP wire
-        // protocol, no Python in the loop.
+        // Native Rust IBKR client. Phase 6.7 cutover retired the
+        // PyO3+ib_insync bridge; Phase 6.11 deleted the bridge crate
+        // entirely. To roll back to ib_insync the rollback path is
+        // git revert + rebuild, not a runtime config flip.
         "ibkr" | "ibkr_native" => {
             let ibkr = cfg
                 .broker

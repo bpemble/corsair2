@@ -160,7 +160,7 @@ pub struct NativeBroker {
     next_req_id: Arc<AtomicI32>,
     next_handle: Arc<AtomicI32>,
     connected: Arc<AtomicBool>,
-    rx_holder: Mutex<Option<mpsc::UnboundedReceiver<Vec<String>>>>,
+    rx_holder: Mutex<Option<mpsc::Receiver<Vec<String>>>>,
 }
 
 impl NativeBroker {
@@ -239,7 +239,7 @@ impl NativeBroker {
         }
     }
 
-    fn spawn_dispatcher(&self, mut rx: mpsc::UnboundedReceiver<Vec<String>>) {
+    fn spawn_dispatcher(&self, mut rx: mpsc::Receiver<Vec<String>>) {
         let state = Arc::clone(&self.state);
         let channels = self.channels.clone();
         let connected = Arc::clone(&self.connected);
