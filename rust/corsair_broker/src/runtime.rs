@@ -193,6 +193,16 @@ impl Runtime {
         // ── Connect ───────────────────────────────────────────────
         runtime.connect().await?;
 
+        // ── Wait for initial position/account/openOrder snapshot ──
+        //
+        // The native client streams Position / OpenOrder /
+        // AccountValue messages asynchronously after reqXxx is sent.
+        // We must wait for the matching "End" signals before seeding
+        // PortfolioState, otherwise a partial snapshot can mask short
+        // inventory at boot — the exact failure mode CLAUDE.md §10
+        // names as the live-deployment hard prerequisite.
+        runtime.wait_for_native_seeding().await;
+
         // ── Seed positions from broker ────────────────────────────
         runtime.seed_positions_from_broker().await?;
 
@@ -204,6 +214,23 @@ impl Runtime {
         let mut b = self.broker.lock().await;
         b.connect().await?;
         Ok(())
+    }
+
+    /// Wait for the broker's initial state snapshot (positions / open
+    /// orders / account values). Calls `Broker::wait_for_initial_snapshot`
+    /// which is a no-op for synchronously-bootstrapping adapters (PyO3
+    /// IbkrAdapter) and gates on PositionEnd / OpenOrderEnd /
+    /// AccountDownloadEnd for NativeBroker.
+    async fn wait_for_native_seeding(self: &Arc<Self>) {
+        let timeout = std::time::Duration::from_secs(15);
+        log::info!(
+            "waiting up to {}s for broker initial snapshot...",
+            timeout.as_secs()
+        );
+        let b = self.broker.lock().await;
+        if let Err(e) = b.wait_for_initial_snapshot(timeout).await {
+            log::warn!("broker initial snapshot wait failed: {e}");
+        }
     }
 
     /// Read positions from the broker, seed PortfolioState. Mirrors

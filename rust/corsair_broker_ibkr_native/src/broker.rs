@@ -98,6 +98,9 @@ struct BrokerState {
 
     /// handle → reqId for unsubscribe.
     handle_to_req_id: HashMap<TickStreamHandle, i32>,
+
+    /// Tracks bootstrap-time seeding.
+    seeding: SeedingProgress,
 }
 
 struct PendingContractRequest {
@@ -108,6 +111,16 @@ struct PendingContractRequest {
 struct PendingExecutionsRequest {
     accumulated: Vec<Fill>,
     sender: Option<oneshot::Sender<Result<Vec<Fill>, BrokerError>>>,
+}
+
+/// Tracks whether we've seen the initial PositionEnd / OpenOrderEnd /
+/// AccountDownloadEnd signals after connect. Lets callers gate
+/// `positions()` etc. on initial seeding being complete.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SeedingProgress {
+    pub positions_done: bool,
+    pub open_orders_done: bool,
+    pub account_done: bool,
 }
 
 #[derive(Clone)]
@@ -156,6 +169,33 @@ impl NativeBroker {
             next_handle: Arc::new(AtomicI32::new(1)),
             connected: Arc::new(AtomicBool::new(false)),
             rx_holder: Mutex::new(Some(rx)),
+        }
+    }
+
+    /// Snapshot the current bootstrap-seeding progress.
+    pub async fn seeding_progress(&self) -> SeedingProgress {
+        self.state.lock().await.seeding
+    }
+
+    /// Wait until positions, open orders, and account values have all
+    /// streamed their "End" signals — meaning the initial snapshot is
+    /// complete. Returns Ok even if the timeout elapses (caller
+    /// inspects `seeding_progress()` to decide what to do).
+    ///
+    /// Critical for clean cutover: don't seed PortfolioState until
+    /// positions_done, otherwise a partial snapshot can mask short
+    /// inventory.
+    pub async fn wait_for_seeding(&self, timeout: Duration) -> SeedingProgress {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let p = self.state.lock().await.seeding;
+            if p.positions_done && p.open_orders_done && p.account_done {
+                return p;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -220,6 +260,18 @@ impl NativeBroker {
                     let key = (p.account.clone(), p.contract.con_id);
                     s.positions.insert(key, pos);
                 }
+            }
+            InboundMsg::PositionEnd => {
+                let mut s = state.lock().await;
+                s.seeding.positions_done = true;
+            }
+            InboundMsg::OpenOrderEnd => {
+                let mut s = state.lock().await;
+                s.seeding.open_orders_done = true;
+            }
+            InboundMsg::AccountDownloadEnd(_) => {
+                let mut s = state.lock().await;
+                s.seeding.account_done = true;
             }
             InboundMsg::AccountValue(a) => {
                 let mut s = state.lock().await;
@@ -1082,5 +1134,16 @@ impl Broker for NativeBroker {
 
     fn capabilities(&self) -> &BrokerCapabilities {
         &self.capabilities
+    }
+
+    async fn wait_for_initial_snapshot(&self, timeout: Duration) -> BResult<()> {
+        let progress = self.wait_for_seeding(timeout).await;
+        log::info!(
+            "NativeBroker initial snapshot: positions={} open_orders={} account={}",
+            progress.positions_done,
+            progress.open_orders_done,
+            progress.account_done,
+        );
+        Ok(())
     }
 }

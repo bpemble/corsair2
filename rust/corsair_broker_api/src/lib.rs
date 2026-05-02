@@ -243,6 +243,31 @@ pub trait Broker: Send + Sync + 'static {
     /// startup to configure their behavior (FA-account field, drop-copy
     /// vs in-band fills, supported TIFs, etc.).
     fn capabilities(&self) -> &BrokerCapabilities;
+
+    // ── Lifecycle hooks (optional — default no-op) ─────────────────
+
+    /// Wait until the adapter's initial state snapshot has finished
+    /// streaming (positions, open orders, account values). Adapters
+    /// that bootstrap synchronously inside `connect()` (PyO3 IbkrAdapter
+    /// is one — ib_insync awaits all the bootstrap futures before
+    /// connect returns) can leave this as the default no-op. Adapters
+    /// that stream asynchronously after connect (NativeBroker's
+    /// reqPositions / reqOpenOrders / reqAccountUpdates) MUST override
+    /// to gate the runtime on PositionEnd / OpenOrderEnd /
+    /// AccountDownloadEnd.
+    ///
+    /// CLAUDE.md §10 names live-deployment position reconciliation as
+    /// a hard prerequisite — this method is the trait-level surface
+    /// for that.
+    ///
+    /// Returns `Ok(())` even on timeout — the caller decides whether
+    /// to proceed with a partial snapshot.
+    async fn wait_for_initial_snapshot(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
